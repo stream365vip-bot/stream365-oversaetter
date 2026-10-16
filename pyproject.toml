@@ -1,0 +1,19 @@
+[project]
+name = "stream365-oversaetter"
+version = "1.0.0"
+description = "Automatisk dansk oversættelse af undertekster via Bazarr, med korrektur af Claude"
+requires-python = ">=3.12"
+dependencies = ["anthropic==1.15.0"]
+
+[project.optional-dependencies]
+dev = ["pytest==9.1.1", "ruff==0.17.1"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

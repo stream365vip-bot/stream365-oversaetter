@@ -1,0 +1,2 @@
+# anthropic bringer selv httpx2 med, som også bruges til Bazarr/Radarr/Sonarr/Seerr.
+anthropic==1.15.0

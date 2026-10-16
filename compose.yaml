@@ -1,0 +1,21 @@
+# Placeres i /opt/oversaetter sammen med .env
+services:
+  oversaetter:
+    build: .
+    image: stream365-oversaetter:latest
+    container_name: oversaetter
+    restart: unless-stopped
+    user: "1000:1000"
+    env_file: .env
+    networks:
+      - saltbox
+    labels:
+      com.github.saltbox.saltbox_managed: "true"
+    volumes:
+      - /mnt/unionfs:/mnt/unionfs
+      - /opt/oversaetter/data:/data
+      - /opt/lingarr/secrets/anthropic_api_key.txt:/run/secrets/anthropic_api_key:ro
+
+networks:
+  saltbox:
+    external: true

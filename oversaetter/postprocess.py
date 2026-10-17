@@ -26,10 +26,12 @@ class PostResult:
     proofread: str  # "udført", "budget nået", "ingen nøgle", "slået fra"
     credit: str
     remaining: dict[int, list[str]]
+    model: str = ""
 
     def summary(self) -> str:
         return (
-            f"flag før: {self.flags_before}, flag efter: {self.flags_after}, rettelser: {self.fixes}, "
+            f"flag før: {self.flags_before}, flag efter: {self.flags_after}, rettelser fra korrektur: {self.fixes}, "
+            f"korrekturmodel: {self.model}, "
             f"kasserede rettelser: {self.rejected}, pris: {self.cost:.4f} USD, korrektur: {self.proofread}, "
             f"{self.credit}"
         )
@@ -52,7 +54,8 @@ def postprocess(
     en_body, _ = split_header(en_cues)
     en_index = EnglishIndex(en_body)
 
-    before = check_all(body, en_index, cfg.max_line_chars)
+    bad_words = cfg.bad_words()
+    before = check_all(body, en_index, cfg.max_line_chars, bad_words)
     log.info("Kontrol før korrektur: %d replikker flaget (%s)", len(before), _flag_summary(before))
 
     pr = ProofreadResult()
@@ -67,13 +70,14 @@ def postprocess(
             budget.spent(),
         )
     else:
+        log.info("Korrektur med %s (effort %s)", cfg.proofread_model, cfg.proofread_effort)
         pr = proofread(body, en_index, before, cfg, client, budget, item_key)
         status = "delvis (budget nået)" if pr.budget_stopped else "udført"
         if pr.batches_failed:
             status += f", {pr.batches_failed} bidder fejlede"
 
     fixed = [replace(c, text=pr.fixes.get(pos, c.text)) for pos, c in enumerate(body)]
-    after = check_all(fixed, en_index, cfg.max_line_chars)
+    after = check_all(fixed, en_index, cfg.max_line_chars, bad_words)
     if after:
         examples = "; ".join(f"#{p + 1} {','.join(f)}" for p, f in list(after.items())[:5])
         log.info("Stadig flaget efter korrektur: %d (%s) fx %s", len(after), _flag_summary(after), examples)
@@ -91,6 +95,7 @@ def postprocess(
         proofread=status,
         credit=credit,
         remaining=after,
+        model=cfg.proofread_model,
     )
 
 

@@ -13,14 +13,14 @@ Hvert kvarter gør programmet dette:
 3. Springer over, hvis der allerede findes danske undertekster (som fil eller inde i videoen).
 4. Finder de engelske undertekster og beder Bazarr oversætte dem til dansk (Bazarr bruger Lingarr og Claude Haiku).
 5. Når den danske fil er klar, bliver den tjekket:
-   - **Gratis kontrol** af hver replik (engelske rester, norske/svenske ord, for lange linjer, manglende tal osv.).
-   - **Korrektur med Claude Sonnet**, som kun retter rigtige fejl.
+   - **Gratis kontrol** af hver replik (engelske rester, norske/svenske ord, kendte forkerte ord som "bestie" og "please", for lange linjer, manglende tal osv.).
+   - **Korrektur med korrekturmodellen** (standard Claude Opus), som kun retter rigtige fejl.
    - Bazarrs linje "Subtitles translated with ..." erstattes med **"Oversat af Claude for ≋"**.
 6. Husker i en lille database, hvad der er lavet, så intet bliver oversat to gange.
 
 Programmet ændrer ingen indstillinger i Bazarr, Lingarr, Radarr, Sonarr eller Seerr, sletter aldrig filer og rører kun den nye danske undertekstfil.
 
-Udgifterne til Sonnet har et loft (standard 5 dollars om måneden). Når loftet er nået, bliver Haikus oversættelse gemt uden korrektur.
+Udgifterne til korrekturen har et loft (standard 5 dollars om måneden). Når loftet er nået, bliver Haikus oversættelse gemt uden korrektur.
 
 ## Installation
 
@@ -80,10 +80,20 @@ sudo docker logs -f oversaetter
 Tryk `Ctrl+C` for at stoppe visningen (programmet kører videre). Hver linje er én hændelse, fx:
 
 ```
+2026-10-16 20:15:00 INFO Bazarr melder 3 film og 9 afsnit på wanted-listen (heraf 2 film og 2 afsnit uden dansk)
+2026-10-16 20:15:00 INFO Eksempel: Filmnavn - valgt (Seerr) fra ekstern engelsk: Filmnavn.en.srt
+2026-10-16 20:15:00 INFO Eksempel: Anden film - venter på forsinkelse, 23 min tilbage
+2026-10-16 20:15:00 INFO Eksempel: Serie 1x02 - ikke Seerr-ønske og mangler mærket oversaet
 2026-10-16 20:15:00 INFO Runde: 4 mangler dansk, 1 kandidater, 2 venter på forsinkelse, 1 ikke valgt, ...
 2026-10-16 20:15:00 INFO Beder Bazarr oversætte Filmnavn (Seerr, forsøg 1) fra ekstern engelsk: Filmnavn.en.srt
-2026-10-16 20:31:12 INFO Færdig: Filmnavn - flag før: 23, flag efter: 2, rettelser: 41, pris: 0.3100 USD, ...
+2026-10-16 20:31:12 INFO Færdig: Filmnavn - flag før: 23, flag efter: 2, rettelser fra korrektur: 41, korrekturmodel: claude-opus-5-5, pris: 0.3100 USD, ...
 ```
+
+Hver runde viser først Bazarrs egne tal og op til 5 eksempler på, hvorfor noget blev valgt eller fravalgt. Ser du
+
+- `Bazarr melder ingen film eller afsnit, der mangler dansk` – tjek at dansk er med i sprogprofilen i Bazarr.
+- `Bazarr svarede med HTTP 401` (eller Radarr/Sonarr/Seerr) – API-nøglen i `.env` er forkert.
+- `Bazarr svarede ikke inden for ... (timeout)` eller `kunne ikke forbinde` – adressen i `.env` er forkert, eller tjenesten kører ikke.
 
 ## Prøvetilstand (DRY_RUN)
 
@@ -106,7 +116,20 @@ sudo docker exec oversaetter python -m oversaetter test \
   --out "/data/film-test.da.srt"
 ```
 
-Resultatet ligger derefter i `/opt/oversaetter/data/film-test.da.srt` og rapporten i `/opt/oversaetter/data/film-test.da.srt.rapport.txt`. Rapporten viser antal fejl før og efter, antal rettelser og prisen. Prisen tæller med i månedens budget.
+Resultatet ligger derefter i `/opt/oversaetter/data/film-test.da.srt` og rapporten i `/opt/oversaetter/data/film-test.da.srt.rapport.txt`. Rapporten viser korrekturmodellen, antal fejl før og efter, antal rettelser fra korrektur og prisen. Prisen tæller med i månedens budget.
+
+## Indstillinger og beslutninger
+
+- **Korrekturmodel: Claude Opus 5.5 med effort medium** (`PROOFREAD_MODEL=claude-opus-5-5`, `PROOFREAD_EFFORT=medium`, pris 4/20 USD pr. million tokens ind/ud). Valgt efter test på *Do Not Enter* (2026):
+
+  | Model | Rettelser | Pris | Vurdering |
+  |---|---|---|---|
+  | Sonnet, medium | 61 | 0,16 USD | ca. 8/10 |
+  | Sonnet, high | – | – | ikke bedre end medium |
+  | **Opus, medium** | 106 | 0,54 USD | ca. 8,5-9/10 |
+
+  Opus rettede negationer, "either way", manglende småord og engelske ord, som Sonnet lod stå. Vil du spare, kan du sætte `PROOFREAD_MODEL=claude-sonnet-5-5` og priserne til 2/10.
+- **Kendte forkerte ord**: Den gratis kontrol flager replikker med ord, der før er set forkert (bestie, bestien, menneskebestie, menneskebestien, uansett, please, sweetheart, prank, llige, here). Listen kan udvides med `KNOWN_BAD_WORDS` i `.env`. Låneordene okay, hey, wow, yo, cool, nice, shit, fuck og bro flages aldrig.
 
 ## Hvis noget går galt
 

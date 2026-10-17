@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import bisect
+import functools
 import re
 
 from .srt import Cue
@@ -165,6 +166,37 @@ MISSPELLINGS = [
     (re.compile(r"\bwill\b", re.IGNORECASE), "will"),
 ]
 
+# Ord der før er set forkert i Haikus oversættelser. Kan udvides med KNOWN_BAD_WORDS i .env.
+KNOWN_BAD_WORDS = (
+    "bestie",
+    "bestien",
+    "menneskebestie",
+    "menneskebestien",
+    "uansett",
+    "please",
+    "sweetheart",
+    "prank",
+    "llige",
+    "here",
+)
+# Almindelige låneord, som aldrig må flages som kendte fejl - heller ikke hvis de står i KNOWN_BAD_WORDS.
+ALLOWED_LOANWORDS = frozenset({"okay", "hey", "wow", "yo", "cool", "nice", "shit", "fuck", "bro"})
+
+
+def known_bad_words(extra: str = "") -> frozenset[str]:
+    """Startlisten plus kommaseparerede ord fra KNOWN_BAD_WORDS, uden de tilladte låneord."""
+    words = set(KNOWN_BAD_WORDS) | {w.strip().lower() for w in extra.split(",") if w.strip()}
+    return frozenset(words - ALLOWED_LOANWORDS)
+
+
+@functools.lru_cache(maxsize=8)
+def _bad_word_re(words: frozenset[str]) -> re.Pattern | None:
+    if not words:
+        return None
+    alternatives = "|".join(re.escape(w) for w in sorted(words, key=len, reverse=True))
+    return re.compile(rf"(?<!\w)(?:{alternatives})(?!\w)", re.IGNORECASE)
+
+
 INTERJECTIONS = {
     "oh",
     "ah",
@@ -263,6 +295,7 @@ FLAG_TEXT = {
     "missing_number": "a number from the English line is missing",
     "empty": "empty line",
     "identical_to_english": "identical to the English line (not translated)",
+    "known_bad_word": "contains a known wrong word (e.g. bestie, please, prank, sweetheart, uansett)",
 }
 
 
@@ -318,7 +351,12 @@ def has_english_note(text: str, en: str = "") -> bool:
     return False
 
 
-def check_cue(da: str, en: str, max_line_chars: int) -> list[str]:
+def has_known_bad_word(text: str, words: frozenset[str] | None = None) -> bool:
+    rx = _bad_word_re(known_bad_words() if words is None else words)
+    return bool(rx and rx.search(plain(text)))
+
+
+def check_cue(da: str, en: str, max_line_chars: int, bad_words: frozenset[str] | None = None) -> list[str]:
     flags: list[str] = []
     p = plain(da).strip()
     if not p:
@@ -339,6 +377,8 @@ def check_cue(da: str, en: str, max_line_chars: int) -> list[str]:
         flags.append("nordic_word")
     if any(rx.search(p) for rx, _ in MISSPELLINGS):
         flags.append("english_misspelling")
+    if has_known_bad_word(da, bad_words):
+        flags.append("known_bad_word")
     if en:
         da_nums = _numbers(da)
         da_digits = re.sub(r"\D", "", plain(da))
@@ -375,11 +415,13 @@ class EnglishIndex:
         return "\n".join(found)
 
 
-def check_all(da_cues: list[Cue], en_index: EnglishIndex, max_line_chars: int) -> dict[int, list[str]]:
+def check_all(
+    da_cues: list[Cue], en_index: EnglishIndex, max_line_chars: int, bad_words: frozenset[str] | None = None
+) -> dict[int, list[str]]:
     """Returnerer {position (0-baseret): [flag]} for replikker med fejl."""
     result: dict[int, list[str]] = {}
     for pos, cue in enumerate(da_cues):
-        flags = check_cue(cue.text, en_index.text_for(cue), max_line_chars)
+        flags = check_cue(cue.text, en_index.text_for(cue), max_line_chars, bad_words)
         if flags:
             result[pos] = flags
     return result

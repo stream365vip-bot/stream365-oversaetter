@@ -10,16 +10,18 @@ import time
 
 import httpx2 as httpx
 
-from .clients import Bazarr, Radarr, Seerr, SeerrIndex, Sonarr, parse_date
+from .clients import ApiError, Bazarr, Radarr, Seerr, SeerrIndex, Sonarr, parse_date
 from .config import Config
 from .db import Database, iso
 from .postprocess import make_client, postprocess
 from .proofread import DbBudget
-from .selection import Candidate, Selector, choose_source
+from .selection import Candidate, Selector, Stats, choose_source
 from .srt import read_file, write_file_atomic
 from .translate import request_translation
 
 log = logging.getLogger("oversaetter")
+
+PROFILE_HINT = "Tjek at dansk er med i sprogprofilen i Bazarr."
 
 
 class Runner:
@@ -42,10 +44,15 @@ class Runner:
         try:
             seerr_index = SeerrIndex(self.seerr.requests())
         except Exception as e:
-            log.warning("Kunne ikke hente ønsker fra Seerr (%s) - kun mærkede serier behandles i denne runde", e)
+            log.warning("Kunne ikke hente ønsker fra Seerr: %s - kun mærkede serier behandles i denne runde", e)
             seerr_index = SeerrIndex([])
         selector = Selector(self.cfg, self.bazarr, self.radarr, self.sonarr, seerr_index, self.db)
-        candidates, stats = selector.find()
+        try:
+            candidates, stats = selector.find()
+        except ApiError as e:
+            log.error("Runden er afbrudt: %s", e)
+            return []
+        self._log_round(stats)
         log.info(
             "Runde: %d mangler dansk, %d kandidater, %d venter på forsinkelse, %d ikke valgt, "
             "%d allerede behandlet, %d sprunget over",
@@ -61,6 +68,31 @@ class Runner:
                 break
             self.process(cand)
         return candidates
+
+    def _log_round(self, stats: Stats) -> None:
+        """Forklar runden: Bazarrs rå tal, eksempler på valg/fravalg og fejl."""
+        if stats.bazarr_movies == 0 and stats.bazarr_episodes == 0:
+            log.info("Bazarr melder ingen film eller afsnit, der mangler dansk. %s", PROFILE_HINT)
+            return
+        log.info(
+            "Bazarr melder %d film og %d afsnit på wanted-listen (heraf %d film og %d afsnit uden dansk)",
+            stats.bazarr_movies,
+            stats.bazarr_episodes,
+            stats.wanted_movies,
+            stats.wanted_episodes,
+        )
+        if stats.wanted == 0:
+            log.info("Ingen af dem mangler dansk ifølge Bazarr. %s", PROFILE_HINT)
+        examples = stats.pick_examples()
+        for text in examples:
+            log.info("Eksempel: %s", text)
+        if len(stats.examples) > len(examples):
+            log.info("... og %d flere (se DEBUG-loggen)", len(stats.examples) - len(examples))
+            for _, text in stats.examples:
+                log.debug("Valg: %s", text)
+        for msg, count in stats.errors.items():
+            if count > 1:
+                log.warning("Samme fejl ramte %d emner: %s", count, msg)
 
     def process(self, cand: Candidate) -> None:
         if self.cfg.dry_run:

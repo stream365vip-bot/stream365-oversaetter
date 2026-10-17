@@ -1,6 +1,7 @@
 import pytest
 
-from oversaetter.checks import EnglishIndex, check_all, check_cue
+from oversaetter.checks import EnglishIndex, check_all, check_cue, known_bad_words
+from oversaetter.config import Config
 from tests.helpers import cue
 
 
@@ -104,3 +105,66 @@ def test_match_on_overlap_when_times_differ():
     da = [cue(10.5, 12.2, "Vi skal bruge 3 biler.")]
     assert EnglishIndex(en).text_for(da[0]) == "We need 3 cars."
     assert check_all(da, EnglishIndex(en), 42) == {}
+
+
+# --- kendte forkerte ord -------------------------------------------------------------
+@pytest.mark.parametrize(
+    "da",
+    [
+        "Han er en bestie.",
+        "Bestien kommer!",
+        "Menneskebestien er løs.",
+        "Hvad er det for en MENNESKEBESTIE?",
+        "Uansett hvad.",
+        "Kom nu, please.",
+        "Tak, sweetheart.",
+        "Det var bare en prank.",
+        "<i>Vent llige.</i>",
+        "Kom here.",
+    ],
+)
+def test_known_bad_word_found(da):
+    assert "known_bad_word" in flags(da)
+
+
+@pytest.mark.parametrize(
+    "da",
+    [
+        "Jeg har lavet en bestilling.",
+        "Han er bestyrer af den bedste.",
+        "Pleasen var lige ved.",
+        "Uhyret kommer.",
+        "Hvor er menneskeuhyret?",
+        "Jeg kommer i morgen.",
+    ],
+)
+def test_known_bad_word_not_found(da):
+    assert "known_bad_word" not in flags(da)
+
+
+@pytest.mark.parametrize("word", ["okay", "hey", "wow", "yo", "cool", "nice", "shit", "fuck", "bro"])
+def test_allowed_loanwords_are_never_bad_words(word):
+    da = f"{word.capitalize()}, det er {word}."
+    assert "known_bad_word" not in flags(da)
+    # heller ikke hvis nogen skriver dem i KNOWN_BAD_WORDS
+    words = Config.from_env({"KNOWN_BAD_WORDS": f"{word}, bestie"}).bad_words()
+    assert word not in words and "bestie" in words
+    assert "known_bad_word" not in check_cue(da, "", 42, words)
+
+
+def test_extra_bad_words_from_env():
+    words = Config.from_env({"KNOWN_BAD_WORDS": " Darling ,honey,, "}).bad_words()
+    assert words == known_bad_words() | {"darling", "honey"}
+    assert "known_bad_word" in check_cue("Hej, darling.", "", 42, words)
+    assert "known_bad_word" in check_cue("HONEY!", "", 42, words)
+    assert "known_bad_word" not in check_cue("Hej, darling.", "", 42)  # ikke i startlisten
+    assert "known_bad_word" not in check_cue("Honeymoon.", "", 42, words)  # del af andet ord
+    # startlisten gælder stadig
+    assert "known_bad_word" in check_cue("Kom nu, please.", "", 42, words)
+
+
+def test_check_all_uses_bad_words():
+    da = [cue(1, 2, "Hej, darling."), cue(3, 4, "Hej, please.")]
+    words = known_bad_words("darling")
+    assert check_all(da, EnglishIndex([]), 42, words) == {0: ["known_bad_word"], 1: ["known_bad_word"]}
+    assert check_all(da, EnglishIndex([]), 42) == {1: ["known_bad_word"]}

@@ -30,11 +30,11 @@ def test_batches_with_overlap_and_applies_fixes():
     assert third[-1]["i"] == 120
     assert set(first[0]) == {"i", "en", "da", "flag"}
     assert res.fixes == {2: "Rettet tre", 119: "Sidste"}
-    # pris: 1000 input * 2 USD/M + 500 output * 10 USD/M = 0,007 pr. kald
-    assert abs(res.cost - 3 * 0.007) < 1e-9
+    # pris: 1000 input * 4 USD/M + 500 output * 20 USD/M = 0,014 pr. kald
+    assert abs(res.cost - 3 * 0.014) < 1e-9
     assert budget.calls == 3
     req = claude.requests[0]
-    assert req["model"] == "claude-sonnet-5-5"
+    assert req["model"] == "claude-opus-5-5"
     assert req["output_config"]["format"]["type"] == "json_schema"
 
 
@@ -115,7 +115,7 @@ def test_postprocess_reports_flags_before_and_after():
 
 
 def test_with_real_sdk_and_fake_http():
-    """Sonnet-kaldet gennem den rigtige anthropic-SDK, men med et falsk HTTP-svar."""
+    """Korrektur-kaldet gennem den rigtige anthropic-SDK, men med et falsk HTTP-svar."""
     seen = {}
 
     def handler(request):
@@ -127,7 +127,7 @@ def test_with_real_sdk_and_fake_http():
                 "id": "msg_1",
                 "type": "message",
                 "role": "assistant",
-                "model": "claude-sonnet-5-5",
+                "model": "claude-opus-5-5",
                 "content": [{"type": "text", "text": json.dumps({"fixes": [{"i": 1, "da": "Hej, min ven."}]})}],
                 "stop_reason": "end_turn",
                 "stop_sequence": None,
@@ -142,7 +142,22 @@ def test_with_real_sdk_and_fake_http():
     da = [cue(10, 12, "Hi, min ven.")]
     res = proofread(da, EnglishIndex(en), {}, cfg(), client, FakeBudget())
     assert res.fixes == {0: "Hej, min ven."}
-    assert abs(res.cost - (2000 * 2 + 1000 * 10) / 1_000_000) < 1e-12
+    assert abs(res.cost - (2000 * 4 + 1000 * 20) / 1_000_000) < 1e-12
     assert seen["key"] == "test-nøgle"
-    assert seen["body"]["model"] == "claude-sonnet-5-5"
+    assert seen["body"]["model"] == "claude-opus-5-5"
     assert "tool_choice" not in seen["body"]
+
+
+def test_known_bad_words_go_to_proofreading_with_instructions():
+    en = [cue(10, 12, "The human beast is loose."), cue(13, 15, "Please, sweetheart.")]
+    da = [cue(10, 12, "Menneskebestien er løs."), cue(13, 15, "Please, sweetheart.")]
+    claude = FakeClaude([response([{"i": 1, "da": "Menneskeuhyret er løs."}, {"i": 2, "da": "Vær nu sød, skat."}])])
+    res = postprocess(da, en, cfg(known_bad_words="darling"), claude, FakeBudget())
+    sent = claude.lines()
+    assert all(any("known wrong word" in f for f in line["flag"]) for line in sent)
+    system = claude.requests[0]["system"]
+    assert '"uhyre"' in system and "menneskeuhyret" in system
+    assert "please, prank and sweetheart must be translated" in system
+    assert res.flags_before == 2 and res.flags_after == 0 and res.fixes == 2
+    assert res.model == "claude-opus-5-5" and "rettelser fra korrektur: 2" in res.summary()
+    assert "korrekturmodel: claude-opus-5-5" in res.summary()

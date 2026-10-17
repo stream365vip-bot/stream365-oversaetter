@@ -1,4 +1,4 @@
-"""Korrektur B: Claude Sonnet retter reelle fejl i den danske oversættelse."""
+"""Korrektur B: korrekturmodellen (PROOFREAD_MODEL) retter reelle fejl i den danske oversættelse."""
 
 from __future__ import annotations
 
@@ -24,7 +24,10 @@ Your job is to correct only real errors and leave good lines untouched:
 - Danish spelling and grammar mistakes
 - Norwegian, Swedish or German words or spellings (e.g. "uansett", "ikkje", "bara", "inte", letters ö/ä/ü)
 - English words that are neither names nor common Danish loanwords. Allowed loanwords include okay, hey, \
-wow, yo, cool, nice, shit, fuck and bro.
+wow, yo, cool, nice, shit, fuck and bro. Other English words such as please, prank and sweetheart must be \
+translated into Danish.
+- "beast" (and the wrong Danish forms "bestie"/"bestien") means "uhyre" in Danish, e.g. "menneskebestien" \
+becomes "menneskeuhyret". Never use "bestie" or "bestien".
 - English notes, reasoning or comments left by the translator (e.g. "Wait", "Hmm, let's see", "translation", \
 "output", "Line 1", character counts). Remove them so only the Danish subtitle remains.
 - literal word-for-word phrasing, idioms and slang that do not make sense in Danish: rewrite them so they \
@@ -199,7 +202,7 @@ def proofread(
                 raise ValueError("fixes er ikke en liste")
         except (ValueError, KeyError, TypeError) as e:
             result.batches_failed += 1
-            log.error("Ugyldigt svar fra Sonnet for replik %d-%d (%s) - bidden kasseres", start + 1, end, e)
+            log.error("Ugyldigt svar fra korrekturmodellen for replik %d-%d (%s) - bidden kasseres", start + 1, end, e)
             continue
 
         result.batches_ok += 1

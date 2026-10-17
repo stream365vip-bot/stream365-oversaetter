@@ -10,7 +10,19 @@ from .config import Config
 
 
 class ApiError(Exception):
-    pass
+    """Fejl fra en tjeneste. Teksten er dansk og indeholder aldrig API-nøgler."""
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+HINTS = {
+    401: "forkert API-nøgle i .env",
+    403: "forkert API-nøgle i .env",
+    404: "forkert adresse i .env, eller en for gammel version",
+}
+GET_TIMEOUT = 60.0
 
 
 def parse_date(value: str | None) -> datetime | None:
@@ -24,19 +36,43 @@ def parse_date(value: str | None) -> datetime | None:
 
 
 class _Api:
+    name = "Tjenesten"
+
     def __init__(self, base_url: str, headers: dict[str, str], http: httpx.Client):
         self.base = base_url.rstrip("/")
         self.headers = headers
         self.http = http
 
     def get(self, path: str, params=None):
-        r = self.http.get(self.base + path, params=params, headers=self.headers, timeout=60.0)
+        # Fejlteksterne bygges selv, så hverken headers (nøgler) eller httpx' egne beskeder kommer i loggen.
+        try:
+            r = self.http.get(self.base + path, params=params, headers=self.headers, timeout=GET_TIMEOUT)
+        except httpx.TimeoutException:
+            raise ApiError(
+                f"{self.name} svarede ikke inden for {GET_TIMEOUT:g} sekunder (timeout) på {self.base}{path} - "
+                "tjek adressen i .env, og at tjenesten kører"
+            ) from None
+        except httpx.HTTPError as e:
+            raise ApiError(
+                f"{self.name}: kunne ikke forbinde til {self.base}{path} ({type(e).__name__}) - "
+                "tjek adressen i .env, og at tjenesten kører"
+            ) from None
         if r.status_code >= 400:
-            raise ApiError(f"GET {path} gav {r.status_code}")
-        return r.json()
+            hint = HINTS.get(r.status_code, "fejl i tjenesten" if r.status_code >= 500 else "uventet svar")
+            raise ApiError(f"{self.name} svarede med HTTP {r.status_code} på {path} ({hint})", r.status_code)
+        try:
+            return r.json()
+        except ValueError:
+            raise ApiError(
+                f"{self.name} svarede med HTTP {r.status_code} på {path}, men ikke med gyldige data - "
+                "tjek adressen i .env",
+                r.status_code,
+            ) from None
 
 
 class Bazarr(_Api):
+    name = "Bazarr"
+
     def __init__(self, cfg: Config, http: httpx.Client):
         super().__init__(cfg.bazarr_url, {"X-API-KEY": cfg.bazarr_api_key}, http)
 
@@ -82,6 +118,8 @@ class Bazarr(_Api):
 
 
 class Radarr(_Api):
+    name = "Radarr"
+
     def __init__(self, cfg: Config, http: httpx.Client):
         super().__init__(cfg.radarr_url, {"X-Api-Key": cfg.radarr_api_key}, http)
 
@@ -93,6 +131,8 @@ class Radarr(_Api):
 
 
 class Sonarr(_Api):
+    name = "Sonarr"
+
     def __init__(self, cfg: Config, http: httpx.Client):
         super().__init__(cfg.sonarr_url, {"X-Api-Key": cfg.sonarr_api_key}, http)
 
@@ -110,6 +150,8 @@ class Sonarr(_Api):
 
 
 class Seerr(_Api):
+    name = "Seerr"
+
     def __init__(self, cfg: Config, http: httpx.Client):
         super().__init__(cfg.seerr_url, {"X-Api-Key": cfg.seerr_api_key}, http)
         self.enabled = bool(cfg.seerr_url)

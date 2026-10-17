@@ -5,6 +5,9 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+# Nøgler fra ældre versioner. Står de i .env, ignoreres de (og det logges én gang ved start).
+OLD_KEYS = ("SEERR_DELAY_MINUTES", "TAG_DELAY_HOURS", "FIRST_SEEN_DELAY_HOURS")
+
 
 def _bool(value: str) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "ja", "on")
@@ -23,9 +26,9 @@ class Config:
     anthropic_api_key_file: str = "/run/secrets/anthropic_api_key"
 
     poll_minutes: float = 15.0
-    seerr_delay_minutes: float = 60.0
     translate_tag: str = "oversaet"
-    tag_delay_hours: float = 48.0
+    search_timeout_minutes: float = 10.0
+    max_searches_per_round: int = 10
     translate_timeout_minutes: float = 45.0
 
     max_line_chars: int = 42
@@ -42,12 +45,16 @@ class Config:
     dry_run: bool = True
     data_dir: str = "/data"
     log_level: str = "INFO"
+    ignored_keys: tuple[str, ...] = ()  # gamle nøgler fra .env, der ikke bruges længere
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Config:
         env = dict(os.environ if env is None else env)
         cfg = cls()
+        cfg.ignored_keys = tuple(k for k in OLD_KEYS if env.get(k, "").strip())
         for field in cls.__dataclass_fields__:
+            if field == "ignored_keys":
+                continue
             raw = env.get(field.upper())
             if raw is None or raw == "":
                 continue

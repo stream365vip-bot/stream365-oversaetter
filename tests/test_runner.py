@@ -68,11 +68,13 @@ def runner(arr, tmp_path, claude=None, **kw):
 def test_dry_run_calls_nothing_and_writes_nothing(arr, tmp_path):
     video, _ = movie_with_english(arr)
     arr.on_translate = write_haiku(video)
+    arr.add_movie(2, 102, {"days": 2}, [], requested=False, tags=[3])
+    arr.bazarr_unknown.add("movie:2")  # nyt mærke, som Bazarr ikke kender endnu -> ville synkronisere
     before = snapshot(arr.media_dir)
     r, db = runner(arr, tmp_path, claude=FakeClaude([]), dry_run=True)
     cands = r.run_once()
-    assert len(cands) == 1
-    assert arr.translate_calls == [] and arr.writes == []
+    assert cands == []
+    assert arr.translate_calls == [] and arr.search_calls == [] and arr.sync_calls == [] and arr.writes == []
     assert snapshot(arr.media_dir) == before
     assert db.get("movie:1") is None
 
@@ -92,7 +94,11 @@ def test_full_flow_translates_proofreads_and_writes(arr, tmp_path):
             "path": arr.movies[1]["subtitles"][0]["path"],
         }
     ]
-    assert arr.writes == [("PATCH", "bazarr/api/subtitles")]  # det eneste ændrende kald
+    # søgningen efter dansk og oversættelsen er de eneste ændrende kald
+    assert arr.writes == [("PATCH", "bazarr/api/movies/subtitles"), ("PATCH", "bazarr/api/subtitles")]
+    assert arr.search_calls == [
+        {"path": "/api/movies/subtitles", "language": "da", "forced": "False", "hi": "False", "radarrid": "1"}
+    ]
     da_path = os.path.splitext(video)[0] + ".da.srt"
     text = open(da_path, encoding="utf-8").read()
     assert text.startswith("1\n00:00:01,000 --> 00:00:06,000\nOversat af Claude for ≋\n")
@@ -104,10 +110,11 @@ def test_full_flow_translates_proofreads_and_writes(arr, tmp_path):
     assert sorted(os.listdir(os.path.dirname(video))) == sorted(
         [os.path.basename(video), os.path.basename(da_path), os.path.basename(video)[:-4] + ".en.srt"]
     )
+    assert row["search_at"]
     # Anden runde: intet sker
     arr.translate_calls.clear()
     r.run_once()
-    assert arr.translate_calls == []
+    assert arr.translate_calls == [] and len(arr.search_calls) == 1
 
 
 def test_budget_reached_keeps_haiku_text(arr, tmp_path):
@@ -322,31 +329,37 @@ def test_round_log_empty_wanted_list(arr, tmp_path, caplog):
 
 
 def test_round_log_raw_numbers_and_reasons(arr, tmp_path, caplog):
-    # valgt
+    # ville søge nu
     movie_with_english(arr)
-    # ikke Seerr-ønske
+    # ikke Seerr-ønske og intet mærke
     arr.add_movie(2, 102, {"days": 2}, [embedded("en", 5)], requested=False, title="Uønsket film")
-    # venter på forsinkelse (60 min - 37 min = 23 min)
-    arr.add_movie(3, 103, {"minutes": 37}, [embedded("en", 6)], title="Ny film")
-    # ingen engelsk tekst
+    # gyldig søgning før - mangler stadig dansk -> ville oversætte
+    arr.add_movie(3, 103, {"minutes": 37}, [embedded("en", 6)], title="Søgt film")
+    # gyldig søgning før - ingen engelsk tekst
     arr.add_movie(4, 104, {"days": 2}, [embedded("sv", 7)], title="Svensk film")
-    # kun PGS
+    # gyldig søgning før - kun PGS
     pgs = os.path.join(arr.media_dir, "Film 5", "Film 5.en.sup")
     arr.add_movie(5, 105, {"days": 2}, [en_sub(pgs)], title="PGS-film")
     # afsnit uden mærke og uden Seerr-ønske
     arr.add_episode(6, 60, 6000, {"days": 9}, [], tags=[1])
+    db = Database(os.path.join(make_cfg(tmp_path).data_dir, "oversaetter.db"))
+    for i in (3, 4, 5):
+        db.upsert(f"movie:{i}", media_type="movie", media_id=i, status="soegt", search_at="2026-10-17T10:00:00+00:00")
     cands, text = round_log(arr, tmp_path, caplog)
-    assert [c.media_id for c in cands] == [1]
+    assert [c.media_id for c in cands] == [3]
     assert "Bazarr melder 5 film og 1 afsnit på wanted-listen (heraf 5 film og 1 afsnit uden dansk)" in text
     examples = [line for line in text.splitlines() if "Eksempel:" in line]
     assert len(examples) == 5
-    assert "Film 1 - valgt (Seerr) fra ekstern engelsk: Film 1.en.srt" in text
-    assert "Uønsket film - ikke Seerr-ønske" in text
-    assert "Ny film - venter på forsinkelse, 23 min tilbage" in text
+    assert "Film 1 - ville søge nu (Seerr, ingen gyldig søgning endnu)" in text
+    assert "Uønsket film - ikke Seerr-ønske og mangler mærket oversaet" in text
+    assert "Søgt film - gyldig søgning fandt ikke dansk - oversætter (Seerr, indlejret engelsk spor" in text
     assert "Svensk film - ingen engelsk tekstkilde" in text
     assert "PGS-film - kun PGS/VobSub" in text
     assert "Serie 60 1x06 - ikke Seerr-ønske og mangler mærket oversaet" in text
     assert "... og 1 flere" in text
+    assert "DRY_RUN: ville søge nu efter dansk til Film 1 (Seerr, ingen gyldig søgning endnu)" in text
+    assert "DRY_RUN: ville oversætte nu: Søgt film (Seerr, gyldig søgning fandt ikke dansk)" in text
+    assert arr.search_calls == [] and arr.translate_calls == []
 
 
 def test_round_log_bazarr_wanted_without_danish(arr, tmp_path, caplog):

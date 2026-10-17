@@ -12,7 +12,8 @@ CREATE TABLE IF NOT EXISTS items (
     media_type TEXT NOT NULL,
     media_id INTEGER NOT NULL,
     title TEXT,
-    status TEXT NOT NULL,          -- soeger, soegt, i_gang, faerdig, forsoeg_igen, fejlet, sprunget_over, ikke_muligt
+    status TEXT NOT NULL,          -- soeger, soegt, mangler_engelsk, i_gang, faerdig, forsoeg_igen, fejlet,
+                                   -- sprunget_over, ikke_muligt
     attempts INTEGER NOT NULL DEFAULT 0,
     reason TEXT,
     video_path TEXT,
@@ -26,7 +27,8 @@ CREATE TABLE IF NOT EXISTS items (
     fixes INTEGER,
     search_started_at TEXT,        -- Bazarr er bedt om at søge efter dansk (søgningen er ikke vurderet endnu)
     search_jobs TEXT,              -- id'er på Bazarrs søgejob, kommasepareret
-    search_at TEXT                 -- tidspunkt for en gyldig søgning (ingen tjeneste på pause før og efter)
+    search_at TEXT,                -- tidspunkt for en gyldig søgning (ingen tjeneste på pause før og efter)
+    en_search_at TEXT              -- tidspunkt for seneste gyldige søgning efter engelsk (ingen dansk, ingen kilde)
 );
 CREATE TABLE IF NOT EXISTS spend (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -44,7 +46,9 @@ CREATE TABLE IF NOT EXISTS providers (
 """
 
 # Kolonner tilføjet efter første version. Ældre databaser får dem automatisk, uden at miste rækker.
-NEW_COLUMNS = {"items": {"search_started_at": "TEXT", "search_jobs": "TEXT", "search_at": "TEXT"}}
+NEW_COLUMNS = {
+    "items": {"search_started_at": "TEXT", "search_jobs": "TEXT", "search_at": "TEXT", "en_search_at": "TEXT"}
+}
 
 
 def now() -> datetime:

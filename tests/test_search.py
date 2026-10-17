@@ -10,7 +10,7 @@ from oversaetter.db import Database, iso, now
 from oversaetter.runner import Runner
 from oversaetter.search import Paused
 from oversaetter.translate import request_translation
-from tests.fakes import FakeArr
+from tests.fakes import FakeArr, en_sub
 from tests.helpers import FakeClaude, response
 from tests.test_runner import EN, Clock, movie_with_english, write_haiku
 from tests.test_selection import make_cfg
@@ -223,6 +223,134 @@ def test_paused_until_text():
     assert Paused("podnapisi", "x", "tomorrow").until(at) == "til ca. 18.10. kl. 12:30"
     assert Paused("podnapisi", "x", "-").until(at) == ""
     assert Paused("subdl", "x", "later").describe(at) == "SubDL er sat på pause (Bazarr: later)"
+
+
+# --- søgning efter engelsk (beslutning 17.10.2026) ----------------------------------------------
+def movie_without_english(arr):
+    return arr.add_movie(1, 101, {"days": 2}, [])
+
+
+def add_english(arr, video):
+    en = os.path.splitext(video)[0] + ".en.srt"
+    with open(en, "w", encoding="utf-8") as f:
+        f.write(EN)
+    arr.movies[1]["subtitles"] = [*arr.movies[1]["subtitles"], en_sub(en)]
+
+
+def languages(arr):
+    return [c["language"] for c in arr.search_calls]
+
+
+def test_danish_found_means_no_english_search(arr, tmp_path, caplog):
+    movie_without_english(arr)
+    arr.search_finds_danish.add("movie:1")
+    r, db, _ = runner(arr, tmp_path)
+    _, text = run(r, caplog)
+    assert languages(arr) == ["da"] and arr.translate_calls == []
+    assert "Søger nu efter engelsk" not in text and db.get("movie:1")["status"] == "faerdig"
+
+
+def test_no_danish_but_english_exists_translates_without_english_search(arr, tmp_path, caplog):
+    video, _ = movie_with_english(arr)
+    arr.on_translate = write_haiku(video)
+    r, db, _ = runner(arr, tmp_path)
+    _, text = run(r, caplog)
+    assert languages(arr) == ["da"] and len(arr.translate_calls) == 1
+    assert "Søger nu efter engelsk" not in text and "Engelsk fundet" not in text
+    assert db.get("movie:1")["status"] == "faerdig"
+
+
+def test_english_search_finds_english_and_translates_same_round(arr, tmp_path, caplog):
+    video = movie_without_english(arr)
+    arr.on_search = lambda params: add_english(arr, video) if params["language"] == "en" else None
+    arr.on_translate = write_haiku(video)
+    r, db, _ = runner(arr, tmp_path)
+    _, text = run(r, caplog)
+    assert languages(arr) == ["da", "en"] and len(arr.translate_calls) == 1
+    assert arr.search_calls[1]["hi"] == "False" and arr.search_calls[1]["radarrid"] == "1"
+    assert "Søger nu efter engelsk til Film 1 (ingen dansk og ingen engelsk kilde)" in text
+    assert "Engelsk fundet til Film 1 - oversætter" in text
+    row = db.get("movie:1")
+    assert row["status"] == "faerdig" and row["search_at"] and row["en_search_at"]
+
+
+def test_english_search_finds_nothing_skips_and_waits_24_hours(arr, tmp_path, caplog):
+    movie_without_english(arr)
+    r, db, _ = runner(arr, tmp_path)
+    _, text = run(r, caplog)
+    assert languages(arr) == ["da", "en"] and arr.translate_calls == []
+    assert "Springer over: Film 1 - ingen engelsk tekstkilde (søgning efter engelsk fandt intet" in text
+    row = db.get("movie:1")
+    assert row["status"] == "mangler_engelsk" and row["en_search_at"]
+    # næste runde: ingen ny søgning, ingen ny INFO-linje
+    _, text = run(r, caplog)
+    assert languages(arr) == ["da", "en"] and arr.translate_calls == []
+    assert "INFO" not in [rec.levelname for rec in caplog.records if "Springer over: Film 1" in rec.message]
+    # over 24 timer efter den forrige søgning: ny søgning efter engelsk (ikke dansk)
+    db.upsert("movie:1", en_search_at=iso(now() - timedelta(hours=25)))
+    run(r, caplog)
+    assert languages(arr) == ["da", "en", "en"]
+
+
+def test_english_appears_later_is_translated_without_new_search(arr, tmp_path, caplog):
+    video = movie_without_english(arr)
+    r, db, _ = runner(arr, tmp_path)
+    run(r, caplog)
+    assert languages(arr) == ["da", "en"] and arr.translate_calls == []
+    # Bazarr eller Jesper har hentet en engelsk tekst
+    add_english(arr, video)
+    arr.on_translate = write_haiku(video)
+    _, text = run(r, caplog)
+    assert languages(arr) == ["da", "en"] and len(arr.translate_calls) == 1
+    assert "Engelsk fundet til Film 1 - oversætter" in text
+    assert db.get("movie:1")["status"] == "faerdig"
+
+
+def test_provider_paused_during_english_search_makes_it_invalid(arr, tmp_path, caplog):
+    video = movie_without_english(arr)
+
+    def on_search(params):
+        if params["language"] == "en":
+            pause(arr, "podnapisi", "ServiceUnavailable", "in 25 minutes")
+
+    arr.on_search = on_search
+    r, db, _ = runner(arr, tmp_path)
+    _, text = run(r, caplog)
+    assert languages(arr) == ["da", "en"] and arr.translate_calls == []
+    assert "Engelsk-søgningen for Film 1 tæller ikke: venter: Podnapisi er sat på pause" in text
+    row = db.get("movie:1")
+    assert row["search_at"] and row["en_search_at"] is None and row["search_started_at"] is None
+    # stadig på pause: ingen ny søgning
+    arr.on_search = None
+    _, text = run(r, caplog)
+    assert languages(arr) == ["da", "en"]
+    assert "der søges ikke efter engelsk til 1 emner" in text
+    # tilbage: ny, gyldig søgning efter engelsk, som finder engelsk -> oversættes
+    unpause(arr)
+    arr.on_search = lambda params: add_english(arr, video)
+    arr.on_translate = write_haiku(video)
+    run(r, caplog)
+    assert languages(arr) == ["da", "en", "en"] and len(arr.translate_calls) == 1
+
+
+def test_english_searches_count_towards_max_per_round(arr, tmp_path, caplog):
+    movie_without_english(arr)
+    r, db, _ = runner(arr, tmp_path, max_searches_per_round=1)
+    _, text = run(r, caplog)
+    assert languages(arr) == ["da"]
+    assert "Film 1 - venter: højst 1 søgninger pr. runde" in text
+    run(r, caplog)
+    assert languages(arr) == ["da", "en"]
+
+
+def test_dry_run_starts_no_english_search(arr, tmp_path, caplog):
+    movie_without_english(arr)
+    r, db, _ = runner(arr, tmp_path, dry_run=True)
+    db.upsert("movie:1", media_type="movie", media_id=1, status="soegt", search_at=iso())
+    _, text = run(r, caplog)
+    assert arr.search_calls == [] and arr.translate_calls == [] and arr.writes == []
+    assert "DRY_RUN: ville søge nu efter engelsk til Film 1 (ingen dansk og ingen engelsk kilde)" in text
+    assert db.get("movie:1")["status"] == "soegt"
 
 
 # --- mærker -------------------------------------------------------------------------------

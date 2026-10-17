@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 # Nøgler fra ældre versioner. Står de i .env, ignoreres de (og det logges én gang ved start).
 OLD_KEYS = ("SEERR_DELAY_MINUTES", "TAG_DELAY_HOURS", "FIRST_SEEN_DELAY_HOURS")
+# Felter hvor en tom værdi i .env betyder "slået fra" i stedet for "brug standard".
+EMPTY_ALLOWED = ("credit_text",)
 
 
 def _bool(value: str) -> bool:
@@ -41,7 +43,10 @@ class Config:
     price_output_per_m: float = 20.0
     known_bad_words: str = ""  # kommaseparerede ord, lægges oven i startlisten i checks.py
 
-    credit_text: str = "Oversat af Claude for ≋"
+    # \n (backslash + n) bliver til et linjeskift i kreditlinjen. Valgt af Jesper 17.10.2026.
+    credit_text: str = (
+        'Oversat til dig af\\n<font color="#58D9AE">≋ </font><b>Stream<font color="#58D9AE">365</font></b>'
+    )
     dry_run: bool = True
     data_dir: str = "/data"
     log_level: str = "INFO"
@@ -56,7 +61,7 @@ class Config:
             if field == "ignored_keys":
                 continue
             raw = env.get(field.upper())
-            if raw is None or raw == "":
+            if raw is None or (raw == "" and field not in EMPTY_ALLOWED):
                 continue
             kind = type(getattr(cfg, field))
             if kind is bool:

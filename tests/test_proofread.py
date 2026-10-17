@@ -102,7 +102,10 @@ def test_postprocess_skips_proofread_when_budget_is_reached():
     res = postprocess(da, en, cfg(monthly_budget_usd=5.0), claude, FakeBudget(spent=5.0))
     assert claude.requests == []
     assert res.proofread == "budget nået"
-    assert [c.text for c in res.cues] == ["Oversat af Claude for ≋", "Hej med dig, min ven."]
+    assert [c.text for c in res.cues] == [
+        'Oversat til dig af\n<font color="#58D9AE">≋ </font><b>Stream<font color="#58D9AE">365</font></b>',
+        "Hej med dig, min ven.",
+    ]
 
 
 def test_postprocess_reports_flags_before_and_after():

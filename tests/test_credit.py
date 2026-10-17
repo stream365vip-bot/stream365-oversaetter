@@ -1,6 +1,9 @@
+from oversaetter.checks import EnglishIndex, check_all
+from oversaetter.config import Config
 from oversaetter.credit import apply_credit
+from oversaetter.postprocess import postprocess
 from oversaetter.srt import compose, parse
-from tests.helpers import cue
+from tests.helpers import FakeBudget, FakeClaude, cfg, cue, response
 
 CREDIT = "Oversat af Claude for ≋"
 HEADER = "# Subtitles translated with Lingarr # "
@@ -49,3 +52,48 @@ def test_exactly_two_seconds_is_enough():
     cues = [cue(3.5, 5, "Hej")]  # 1,0 -> 3,0 = 2 sek.
     out, _ = apply_credit(cues, CREDIT)
     assert out[0].text == CREDIT and out[0].end == 3000
+
+
+TWO_LINES = 'Oversat til dig af\\n<font color="#58D9AE">≋ </font><b>Stream<font color="#58D9AE">365</font></b>'
+TWO_LINES_OUT = 'Oversat til dig af\n<font color="#58D9AE">≋ </font><b>Stream<font color="#58D9AE">365</font></b>'
+
+
+def test_backslash_n_gives_two_lines_in_finished_srt():
+    out, _ = apply_credit([cue(8, 9, "Hej")], TWO_LINES)
+    text = compose(out)
+    assert text.startswith("1\n00:00:01,000 --> 00:00:06,000\n" + TWO_LINES_OUT + "\n\n2\n")
+    again = parse(text)
+    assert again[0].text.split("\n") == ["Oversat til dig af", TWO_LINES_OUT.split("\n")[1]]
+    assert [c.text for c in again[1:]] == ["Hej"]
+
+
+def test_default_from_env_gives_two_lines():
+    out, _ = apply_credit([cue(8, 9, "Hej")], Config.from_env({}).credit_text)
+    assert out[0].text == TWO_LINES_OUT
+
+
+def test_text_without_backslash_n_works_as_before():
+    out, _ = apply_credit([cue(8, 9, "Hej")], CREDIT)
+    assert out[0].text == CREDIT and "\n" not in out[0].text
+
+
+def test_empty_credit_text_turns_credit_off():
+    c = Config.from_env({"CREDIT_TEXT": ""})
+    out, what = apply_credit([cue(1, 5, HEADER), cue(8, 9, "Hej")], c.credit_text)
+    assert [x.text for x in out] == ["Hej"]
+    assert what == "kreditlinje slået fra"
+    assert apply_credit([cue(8, 9, "Hej")], "  \\n ")[0][0].text == "Hej"
+
+
+def test_check_and_proofread_never_see_credit():
+    en = [cue(1, 5, "Hello there, my friend."), cue(10, 12, "Where are you going?")]
+    # En fil, der allerede har vores kreditlinje (fx kørt to gange), og en med Bazarrs header.
+    for first in (TWO_LINES_OUT, HEADER):
+        da = [cue(1, 5, first), cue(10, 12, "Hvor skal du ikkje hen?")]
+        claude = FakeClaude([response([{"i": 1, "da": "Hvor skal du hen?"}])])
+        res = postprocess(da, en, cfg(credit_text=TWO_LINES), claude, FakeBudget())
+        assert res.flags_before == 1 and res.flags_after == 0 and res.remaining == {}
+        assert [line["da"] for line in claude.lines()] == ["Hvor skal du ikkje hen?"]
+        assert [c.text for c in res.cues] == [TWO_LINES_OUT, "Hvor skal du hen?"]
+    # Den gratis kontrol flager heller ikke selve kreditlinjen
+    assert check_all([cue(1, 5, TWO_LINES_OUT)], EnglishIndex(en), 42) == {}

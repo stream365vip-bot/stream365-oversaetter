@@ -120,13 +120,19 @@ class Bazarr(_Api):
         return self.get("/api/providers").get("data", [])
 
     def search(
-        self, media_type: str, media_id: int, series_id: int | None = None, hi: bool = False, timeout_s: float = 600
+        self,
+        media_type: str,
+        media_id: int,
+        series_id: int | None = None,
+        hi: bool = False,
+        timeout_s: float = 600,
+        language: str = "da",
     ) -> None:
-        """Bed Bazarr søge efter dansk til netop dette emne (samme kald som søgeknappen i Bazarrs wanted-liste).
+        """Bed Bazarr søge efter dansk (eller engelsk) til netop dette emne (samme kald som søgeknappen i Bazarr).
 
         I nyere versioner lægges søgningen i Bazarrs jobkø, og kaldet svarer med det samme.
         """
-        params = {"language": "da", "forced": "False", "hi": "True" if hi else "False"}
+        params = {"language": language, "forced": "False", "hi": "True" if hi else "False"}
         if media_type == "movie":
             path = "/api/movies/subtitles"
             params["radarrid"] = media_id

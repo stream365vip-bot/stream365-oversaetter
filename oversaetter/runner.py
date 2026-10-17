@@ -26,6 +26,7 @@ log = logging.getLogger("oversaetter")
 PROFILE_HINT = "Tjek at dansk er med i sprogprofilen i Bazarr."
 # En søgning, der ikke er blevet færdig efter så lang tid (over flere runder), opgives og startes forfra.
 STALE_SEARCH = timedelta(hours=2)
+LANGUAGES = {"da": "dansk", "en": "engelsk"}
 
 
 class Runner:
@@ -50,6 +51,7 @@ class Runner:
         self.translate = translate
         self.sleep, self.clock = sleep, clock
         self.stopping = False
+        self.searches_left = max(0, cfg.max_searches_per_round)
 
     # --- én runde -----------------------------------------------------------------
     def run_once(self) -> list[Candidate]:
@@ -68,7 +70,9 @@ class Runner:
         except ApiError as e:
             log.error("Runden er afbrudt: %s", e)
             return []
+        self.searches_left = max(0, self.cfg.max_searches_per_round)  # fælles for dansk og engelsk
         candidates += self.search_round(selector, to_search, stats)
+        candidates += self.search_round(selector, selector.need_english, stats, language="en")
         self._log_round(stats)
         log.info(
             "Runde: %d mangler dansk, %d oversættes, %d søgt nu, %d venter, %d fandt dansk ved søgning, "
@@ -163,7 +167,7 @@ class Runner:
         if self.db.get(cand.key) is not None:
             self.db.upsert(cand.key, search_started_at=None, search_jobs=None)
 
-    def _start_search(self, cand: Candidate) -> list[int] | None:
+    def _start_search(self, cand: Candidate, language: str = "da") -> list[int] | None:
         """Bed Bazarr søge. Returnerer id'er på nye søgejob ([] hvis Bazarr søgte med det samme), None ved fejl."""
         before = search_jobs(self.bazarr.jobs())
         try:
@@ -171,17 +175,29 @@ class Runner:
                 cand.media_type,
                 cand.media_id,
                 series_id=cand.series_id,
-                hi=cand.hi,
+                hi=cand.hi and language == "da",
                 timeout_s=self.cfg.search_timeout_minutes * 60,
+                language=language,
             )
         except ApiError as e:
-            log.warning("Kunne ikke bede Bazarr søge efter dansk til %s: %s", cand.title, e)
+            log.warning("Kunne ikke bede Bazarr søge efter %s til %s: %s", LANGUAGES[language], cand.title, e)
             return None
         return [i for i in search_jobs(self.bazarr.jobs()) if i not in before]
 
-    def search_round(self, selector: Selector, items: list[Candidate], stats: Stats) -> list[Candidate]:
-        """Sørg for gyldige søgninger. Returnerer de emner, der efter en gyldig søgning skal oversættes."""
-        paused = self.provider_status()
+    def search_round(
+        self, selector: Selector, items: list[Candidate], stats: Stats, language: str = "da"
+    ) -> list[Candidate]:
+        """Sørg for gyldige søgninger. Returnerer de emner, der efter en gyldig søgning skal oversættes.
+
+        language "da": søgning efter dansk (emner uden gyldig søgning). "en": søgning efter engelsk (en gyldig
+        søgning fandt ikke dansk, og der er ingen brugbar engelsk kilde). Samme regler om tjenestestatus.
+        """
+        english = language == "en"
+        if english and not items:
+            return []
+        lang = LANGUAGES[language]
+        label = "Engelsk-søgningen" if english else "Søgningen"
+        paused = self.provider_status(warn=not english)
         now = datetime.now(UTC)
         finished: list[Candidate] = []
         fresh: list[Candidate] = []
@@ -195,7 +211,7 @@ class Runner:
             left = unfinished(self.bazarr, jobs) if jobs else []
             if left is None or left:
                 if now - started > STALE_SEARCH:
-                    log.info("Søgningen for %s blev aldrig færdig - starter en ny", cand.title)
+                    log.info("%s for %s blev aldrig færdig - starter en ny", label, cand.title)
                     self._clear_search(cand)
                     fresh.append(cand)
                 else:
@@ -210,30 +226,34 @@ class Runner:
             why = waiting_text(paused)
             for cand in fresh:
                 self._wait(cand, why, stats)
-            log.info("%s - der søges ikke efter dansk til %d emner i denne runde", why[0].upper() + why[1:], len(fresh))
+            log.info(
+                "%s - der søges ikke efter %s til %d emner i denne runde", why[0].upper() + why[1:], lang, len(fresh)
+            )
         elif fresh:
             started: list[tuple[Candidate, list[int]]] = []
             limit = max(0, self.cfg.max_searches_per_round)
-            for cand in fresh[limit:]:
+            allowed = self.searches_left
+            for cand in fresh[allowed:]:
                 self._wait(cand, f"venter: højst {limit} søgninger pr. runde", stats)
-            for cand in fresh[:limit]:
+            for cand in fresh[:allowed]:
                 if self.stopping:
                     break
+                why = "ingen dansk og ingen engelsk kilde" if english else f"{cand.reason}, ingen gyldig søgning endnu"
                 if self.cfg.dry_run:
-                    stats.example("søger nu", cand.title, f"ville søge nu ({cand.reason}, ingen gyldig søgning endnu)")
-                    log.info(
-                        "DRY_RUN: ville søge nu efter dansk til %s (%s, ingen gyldig søgning endnu)",
-                        cand.title,
-                        cand.reason,
-                    )
+                    if not english:
+                        stats.example("søger nu", cand.title, f"ville søge nu ({why})")
+                    log.info("DRY_RUN: ville søge nu efter %s til %s (%s)", lang, cand.title, why)
+                    self.searches_left -= 1
                     continue
-                log.info("Søger nu efter dansk til %s (%s, ingen gyldig søgning endnu)", cand.title, cand.reason)
-                jobs = self._start_search(cand)
+                log.info("Søger nu efter %s til %s (%s)", lang, cand.title, why)
+                jobs = self._start_search(cand, language)
                 if jobs is None:
                     stats.example("fejl", cand.title, "Bazarr kunne ikke starte søgningen")
                     continue
                 stats.searched += 1
-                stats.example("søger nu", cand.title, f"søger nu ({cand.reason})")
+                self.searches_left -= 1
+                if not english:
+                    stats.example("søger nu", cand.title, f"søger nu ({cand.reason})")
                 self.db.upsert(
                     cand.key,
                     media_type=cand.media_type,
@@ -255,7 +275,8 @@ class Runner:
                 if left & set(jobs):
                     self._wait(cand, "venter på at søgning bliver færdig", stats)
                     log.info(
-                        "Søgningen for %s er ikke færdig efter %g minutter - ser på den igen i næste runde",
+                        "%s for %s er ikke færdig efter %g minutter - ser på den igen i næste runde",
+                        label,
                         cand.title,
                         self.cfg.search_timeout_minutes,
                     )
@@ -270,11 +291,12 @@ class Runner:
             for cand in finished:
                 self._clear_search(cand)
                 self._wait(cand, why + " (søgningen tæller ikke)", stats)
-                log.info("Søgningen for %s tæller ikke: %s - prøver igen senere", cand.title, why)
+                log.info("%s for %s tæller ikke: %s - prøver igen senere", label, cand.title, why)
             return []
         ready: list[Candidate] = []
         for cand in finished:
-            self.db.upsert(cand.key, search_at=iso(), search_started_at=None, search_jobs=None)
+            when = {"en_search_at": iso()} if english else {"search_at": iso()}
+            self.db.upsert(cand.key, **when, search_started_at=None, search_jobs=None)
             if self.db.get(cand.key)["status"] == "soeger":
                 self.db.upsert(cand.key, status="soegt")
             try:

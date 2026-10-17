@@ -144,7 +144,9 @@ def test_already_has_danish_file_on_disk(arr, tmp_path):
 def test_no_english_source(arr, tmp_path):
     arr.add_movie(1, 101, {"days": 2}, [embedded("sv", 3)])
     cands, stats = find(arr, tmp_path, searched=["movie:1"])
-    assert cands == [] and "ingen engelsk" in stats.skipped[0]
+    # ingen dansk og ingen engelsk kilde: ikke sprunget over, men Bazarr skal søge efter engelsk
+    assert cands == [] and stats.skipped == []
+    assert "Film 1 - ingen engelsk tekstkilde - søger efter engelsk" in [t for _, t in stats.examples]
 
 
 def test_embedded_english_is_used_when_no_external(arr, tmp_path):

@@ -19,6 +19,7 @@ IMAGE_FORMATS = {"pgs", "hdmv_pgs_subtitle", "vobsub", "dvd_subtitle", "dvdsub"}
 MAX_EXAMPLES = 5
 DANISH_TAGS = {"da", "dan", "danish", "dansk"}
 SKIP_RECHECK = timedelta(hours=24)
+EN_SEARCH_AGAIN = timedelta(hours=24)  # mindste tid mellem to søgninger efter engelsk til samme emne
 
 
 @dataclass
@@ -147,6 +148,7 @@ class Selector:
         self._series: dict[int, dict] = {}
         self._movies: dict[int, dict] | None = None
         self._tag_ids: dict[str, int | None] = {}  # "radarr"/"sonarr" -> id på mærket (None = findes ikke)
+        self.need_english: list[Candidate] = []  # ingen dansk og ingen engelsk kilde: Bazarr skal søge efter engelsk
 
     def _tag(self, name: str, api) -> int | None:
         if name not in self._tag_ids:
@@ -238,6 +240,36 @@ class Selector:
         if not self.cfg.dry_run:
             self.db.upsert(cand.key, status="faerdig", reason="gyldig søgning fandt dansk")
 
+    def no_english(self, cand: Candidate, why: str, stats: Stats) -> None:
+        """Ingen dansk og ingen brugbar engelsk kilde: søg efter engelsk, eller spring over til næste runde.
+
+        En ny søgning efter engelsk startes tidligst EN_SEARCH_AGAIN efter den forrige gyldige. Indtil da tjekkes
+        der billigt hver runde (uden søgning), om der er dukket en engelsk tekst op.
+        """
+        row = self.db.get(cand.key)
+        en_at = parse_date(row["en_search_at"]) if row is not None else None
+        now = datetime.now(UTC)
+        searching = row is not None and bool(row["search_started_at"])
+        if searching or en_at is None or now - en_at >= EN_SEARCH_AGAIN:
+            self.need_english.append(cand)
+            stats.example("mangler engelsk", cand.title, f"{why} - søger efter engelsk")
+            if not self.cfg.dry_run:
+                self.db.upsert(cand.key, status="mangler_engelsk", reason=why, video_path=cand.video_path)
+            return
+        next_at = (en_at + EN_SEARCH_AGAIN).astimezone()
+        full = (
+            f"{why} (søgning efter engelsk fandt intet - tjekker hver runde, "
+            f"ny søgning tidligst {next_at:%d.%m. kl. %H:%M})"
+        )
+        stats.skipped.append(f"{cand.title}: {full}")
+        stats.example("sprunget over: ingen engelsk", cand.title, full)
+        if row["status"] == "mangler_engelsk" and row["reason"] == full:
+            log.debug("Springer over: %s - %s", cand.title, full)
+            return
+        log.info("Springer over: %s - %s", cand.title, full)
+        if not self.cfg.dry_run:
+            self.db.upsert(cand.key, status="mangler_engelsk", reason=full)
+
     def after_search(self, cand: Candidate, item: dict | None, stats: Stats) -> Candidate | None:
         """Efter en gyldig søgning: mangler emnet stadig dansk, og er der en engelsk kilde?"""
         if not item:
@@ -252,9 +284,12 @@ class Selector:
             return None
         path, sub_id, desc = choose_source(subtitles)
         if not path and sub_id is None:
-            self.skip(cand, no_source_reason(subtitles), stats)
+            self.no_english(cand, no_source_reason(subtitles), stats)
             return None
         cand.source_path, cand.subtitles_id, cand.source_desc = path, sub_id, desc
+        row = self.db.get(cand.key)
+        if row is not None and row["status"] == "mangler_engelsk":
+            log.info("Engelsk fundet til %s - oversætter", cand.title)
         stats.example("oversætter", cand.title, f"gyldig søgning fandt ikke dansk - oversætter ({cand.reason}, {desc})")
         return cand
 

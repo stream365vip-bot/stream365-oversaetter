@@ -12,14 +12,14 @@ Hvert kvarter gør programmet dette:
    - film med mærket **oversaet** i Radarr og afsnit af serier med mærket **oversaet** i Sonarr.
 3. Springer over, hvis der allerede findes danske undertekster (som fil eller inde i videoen).
 4. Sørger for en **gyldig søgning**: beder Bazarr søge efter dansk til netop det emne og tjekker, at ingen af Bazarrs undertekst-tjenester var sat på pause lige før eller lige efter. Fandt søgningen dansk, er der intet at gøre.
-5. Fandt en gyldig søgning ikke dansk, findes de engelske undertekster, og Bazarr bedes oversætte dem til dansk med det samme (Bazarr bruger Lingarr og Claude Haiku).
+5. Fandt en gyldig søgning ikke dansk, findes de engelske undertekster, og Bazarr bedes oversætte dem til dansk med det samme (Bazarr bruger Lingarr og Claude Haiku). Er der heller ingen engelsk tekst, beder programmet Bazarr søge efter engelsk (se "Ingen engelsk tekst" nedenfor).
 6. Når den danske fil er klar, bliver den tjekket:
    - **Gratis kontrol** af hver replik (engelske rester, norske/svenske ord, kendte forkerte ord som "bestie" og "please", for lange linjer, manglende tal osv.).
    - **Korrektur med korrekturmodellen** (standard Claude Opus), som kun retter rigtige fejl.
    - Bazarrs linje "Subtitles translated with ..." erstattes med **"Oversat af Claude for ≋"**.
 7. Husker i en lille database, hvad der er lavet, så intet bliver søgt eller oversat to gange.
 
-Programmet ændrer ingen indstillinger i Bazarr, Lingarr, Radarr, Sonarr eller Seerr, sletter aldrig filer og rører kun den nye danske undertekstfil. Ud over oversættelsen beder det kun Bazarr om to ting: at søge efter dansk til et bestemt emne, og at synkronisere med Radarr/Sonarr, når der er kommet noget nyt med mærket **oversaet**, som Bazarr ikke kender endnu (højst én gang pr. runde).
+Programmet ændrer ingen indstillinger i Bazarr, Lingarr, Radarr, Sonarr eller Seerr, sletter aldrig filer og rører kun den nye danske undertekstfil. Ud over oversættelsen beder det kun Bazarr om to ting: at søge efter dansk (eller engelsk, når der hverken er dansk eller engelsk) til et bestemt emne, og at synkronisere med Radarr/Sonarr, når der er kommet noget nyt med mærket **oversaet**, som Bazarr ikke kender endnu (højst én gang pr. runde).
 
 Udgifterne til korrekturen har et loft (standard 5 dollars om måneden). Når loftet er nået, bliver Haikus oversættelse gemt uden korrektur.
 
@@ -133,6 +133,13 @@ Resultatet ligger derefter i `/opt/oversaetter/data/film-test.da.srt` og rapport
   4. Der oversættes **aldrig** uden en gyldig søgning. En søgning er kun gyldig, hvis ingen af Bazarrs aktiverede undertekst-tjenester var sat på pause (throttled, nede, kvote overskredet) hverken lige før eller lige efter søgningen.
 
   Har en tjeneste været sat på pause i over 24 timer i træk, skrives en advarsel i hver runde. Der oversættes stadig ikke. `SEERR_DELAY_MINUTES`, `TAG_DELAY_HOURS` og `FIRST_SEEN_DELAY_HOURS` bruges ikke længere. Står de i `.env`, ignoreres de (med én INFO-linje ved start).
+- **Ingen engelsk tekst** (besluttet af Jesper 17.10.2026):
+  1. Som før: først en gyldig søgning efter dansk. Finder den dansk, er emnet færdigt.
+  2. Finder den ikke dansk, og der er ingen brugbar engelsk tekstkilde (ekstern .srt eller indlejret tekstspor), beder programmet Bazarr søge efter **engelsk** (samme kald, `language=en`) med de samme regler om tjenester på pause før og efter søgningen.
+  3. Findes der engelsk efter søgningen, oversættes der straks.
+  4. Findes der stadig ikke engelsk, springes emnet over. Programmet tjekker dog hver runde (uden ny søgning), om der er dukket en engelsk tekst op, fx fordi Bazarr selv har hentet en, eller du har hentet en manuelt. Gør der det, oversættes der straks. En ny søgning efter engelsk startes tidligst 24 timer efter den forrige.
+
+  I loggen ser det fx sådan ud: `Søger nu efter engelsk til X (ingen dansk og ingen engelsk kilde)` og `Engelsk fundet til X - oversætter`. Søgninger efter engelsk tæller med i `MAX_SEARCHES_PER_ROUND`. I prøvetilstand søges der heller ikke efter engelsk.
 - **Søgninger**: Programmet venter højst `SEARCH_TIMEOUT_MINUTES` (standard 10) på Bazarrs søgning. Bliver den ikke færdig, ses der på den igen i næste runde. Der startes højst `MAX_SEARCHES_PER_ROUND` (standard 10) nye søgninger pr. runde, så tjenesterne ikke bliver overbelastet, når mange emner kommer på én gang.
 
 - **Korrekturmodel: Claude Opus 5.5 med effort medium** (`PROOFREAD_MODEL=claude-opus-5-5`, `PROOFREAD_EFFORT=medium`, pris 4/20 USD pr. million tokens ind/ud). Valgt efter test på *Do Not Enter* (2026):

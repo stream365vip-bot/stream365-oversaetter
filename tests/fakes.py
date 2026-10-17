@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs
 
@@ -28,7 +29,8 @@ class FakeArr:
         self.on_translate = None  # funktion(form) der fx skriver den danske fil
         self.jobs: list[dict] | None = []
         self.writes: list[tuple[str, str]] = []  # (metode, sti) for alt der ikke er GET
-        self.fail: dict[str, int | str] = {}  # vært -> HTTP-kode eller "timeout"
+        self.fail: dict[str, int | str] = {}  # vært -> HTTP-kode, "timeout" eller "hang" (svarer aldrig)
+        self.release = threading.Event()  # sættes for at slippe kald, der "hænger"
         # Bazarrs tjenester, søgninger og synkronisering
         self.providers = [
             {"name": "opensubtitlescom", "status": "Good", "retry": "-"},
@@ -92,6 +94,9 @@ class FakeArr:
         if host in self.fail:
             if self.fail[host] == "timeout":
                 raise httpx2.ReadTimeout("timed out", request=req)
+            if self.fail[host] == "hang":
+                self.release.wait(30)
+                return httpx2.Response(503)
             return httpx2.Response(self.fail[host], json={"error": "nej"})
         if host == "bazarr":
             assert req.headers.get("X-API-KEY") == "bazarr-key"

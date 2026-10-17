@@ -11,8 +11,9 @@ from datetime import UTC, datetime, timedelta
 
 import httpx2 as httpx
 
-from .clients import ApiError, Bazarr, Radarr, Seerr, SeerrIndex, Sonarr, parse_date
+from .clients import GET_TIMEOUT, ApiError, Bazarr, Radarr, Seerr, SeerrIndex, Sonarr, parse_date
 from .config import Config
+from .credit import apply_credit
 from .db import Database, iso
 from .postprocess import make_client, postprocess
 from .proofread import DbBudget
@@ -27,6 +28,8 @@ PROFILE_HINT = "Tjek at dansk er med i sprogprofilen i Bazarr."
 # En søgning, der ikke er blevet færdig efter så lang tid (over flere runder), opgives og startes forfra.
 STALE_SEARCH = timedelta(hours=2)
 LANGUAGES = {"da": "dansk", "en": "engelsk"}
+# Emner, der har stået som i_gang så længe, nævnes særskilt i loggen ved opstart.
+STUCK_AFTER = timedelta(hours=1)
 
 
 class Runner:
@@ -42,7 +45,7 @@ class Runner:
     ):
         self.cfg = cfg
         self.db = db
-        self.http = http or httpx.Client()
+        self.http = http or httpx.Client(timeout=httpx.Timeout(GET_TIMEOUT))
         self.bazarr = Bazarr(cfg, self.http)
         self.radarr = Radarr(cfg, self.http)
         self.sonarr = Sonarr(cfg, self.http)
@@ -52,6 +55,7 @@ class Runner:
         self.sleep, self.clock = sleep, clock
         self.stopping = False
         self.searches_left = max(0, cfg.max_searches_per_round)
+        self.current: tuple[str, str] | None = None  # (key, titel) på emnet, der behandles lige nu
 
     # --- én runde -----------------------------------------------------------------
     def run_once(self) -> list[Candidate]:
@@ -344,6 +348,7 @@ class Runner:
                 cand.da_path,
             )
             return
+        self.current = (cand.key, cand.title)
         row = self.db.get(cand.key)
         attempts = (row["attempts"] if row else 0) + 1
         source = cand.source_path or f"subtitles_id:{cand.subtitles_id}"
@@ -370,11 +375,13 @@ class Runner:
         outcome = self.translate(self.bazarr, cand, self.cfg.translate_timeout_minutes)
         if not outcome.ok:
             self._failed(cand.key, cand.title, attempts, outcome.reason, outcome.permanent)
+            self.current = None
             return
         log.info("Bazarr har skrevet %s", cand.da_path)
         self.finish(
             cand.key, cand.title, cand.media_type, cand.media_id, cand.video_path, cand.da_path, cand.source_path
         )
+        self.current = None
 
     def _failed(self, key: str, title: str, attempts: int, reason: str, permanent: bool = False) -> None:
         if permanent:
@@ -405,17 +412,19 @@ class Runner:
         return found[0] if found else None
 
     def finish(self, key, title, media_type, media_id, video_path, da_path, source_path) -> None:
+        da = None
         try:
             da = read_file(da_path)
             en_path = self._english_path(media_type, media_id, video_path, source_path)
             en = read_file(en_path) if en_path else []
             if not en:
                 log.warning("Fandt ingen engelsk fil til sammenligning for %s - kontrollen bliver begrænset", title)
-            result = postprocess(da, en, self.cfg, self.claude, DbBudget(self.db), key)
+            result = postprocess(da, en, self.cfg, self.claude, DbBudget(self.db), key, clock=self.clock)
             write_file_atomic(da_path, result.cues)
         except Exception as e:
-            log.error("Efterbehandling af %s fejlede (%s) - Bazarrs danske fil er ladt urørt", title, e)
+            log.exception("Efterbehandling af %s fejlede (%s)", title, e)
             self.db.upsert(key, status="faerdig", reason=f"efterbehandling fejlede: {e}")
+            self._credit_only(title, da, da_path)
             return
         self.db.upsert(
             key,
@@ -428,38 +437,85 @@ class Runner:
         )
         log.info("Færdig: %s - %s", title, result.summary())
 
+    def _credit_only(self, title: str, da, da_path: str) -> None:
+        """Nødløsning: gem Bazarrs danske tekst med kreditlinjen, når efterbehandlingen fejlede."""
+        if not da:
+            log.error("Bazarrs danske fil for %s kunne ikke læses - den er ladt urørt", title)
+            return
+        try:
+            cues, credit = apply_credit(da, self.cfg.credit_text)
+            write_file_atomic(da_path, cues)
+            log.warning("Bazarrs danske tekst for %s er gemt uden korrektur (%s)", title, credit)
+        except Exception as e:
+            log.error("Kunne heller ikke gemme %s med kreditlinje (%s) - Bazarrs danske fil er ladt urørt", title, e)
+
     def resume(self) -> None:
-        """Emner der stod 'i_gang' da programmet stoppede."""
+        """Emner der stod 'i_gang' da programmet stoppede (ved opstart kører intet andet, så de er alle forladt)."""
         if self.cfg.dry_run:
             return
-        for row in self.db.with_status("i_gang"):
-            started = parse_date(row["started_at"])
-            da_path = row["da_path"] or ""
-            mtime = os.path.getmtime(da_path) if da_path and os.path.exists(da_path) else None
-            if mtime and started and mtime > started.timestamp():
-                log.info("Genoptager efterbehandling af %s", row["title"])
-                source = row["source"] if row["source"] and not row["source"].startswith("subtitles_id:") else None
-                self.finish(
-                    row["key"], row["title"], row["media_type"], row["media_id"], row["video_path"], da_path, source
-                )
+        rows = self.db.with_status("i_gang")
+        now = datetime.now(UTC)
+        for row in rows:
+            changed = parse_date(row["updated_at"]) or parse_date(row["started_at"])
+            age = now - changed if changed else None
+            how_long = f"{age.total_seconds() / 3600:.1f} timer" if age else "ukendt tid"
+            if age is None or age > STUCK_AFTER:
+                log.warning("%s har stået som i_gang i over 1 time (%s) - genoptages nu", row["title"], how_long)
             else:
-                self._failed(row["key"], row["title"], row["attempts"], "programmet blev stoppet undervejs")
+                log.info("%s stod som i_gang, da programmet stoppede (%s) - genoptages nu", row["title"], how_long)
+        for row in rows:
+            try:
+                self._resume_one(row)
+            except Exception as e:
+                log.exception("Kunne ikke genoptage %s", row["title"])
+                self.db.upsert(row["key"], status="forsoeg_igen", reason=f"uventet fejl ved genoptagelse: {e}")
+            self.current = None
+
+    def _resume_one(self, row) -> None:
+        self.current = (row["key"], row["title"])
+        started = parse_date(row["started_at"])
+        da_path = row["da_path"] or ""
+        mtime = os.path.getmtime(da_path) if da_path and os.path.exists(da_path) else None
+        if mtime and started and mtime > started.timestamp():
+            log.info("Genoptager efterbehandling af %s", row["title"])
+            source = row["source"] if row["source"] and not row["source"].startswith("subtitles_id:") else None
+            self.finish(
+                row["key"], row["title"], row["media_type"], row["media_id"], row["video_path"], da_path, source
+            )
+        else:
+            self._failed(row["key"], row["title"], row["attempts"], "programmet blev stoppet undervejs")
 
     # --- løkken ---------------------------------------------------------------------
     def loop(self) -> None:
         signal.signal(signal.SIGTERM, self._stop)
         signal.signal(signal.SIGINT, self._stop)
         self.log_start()
-        self.resume()
+        try:
+            self.resume()
+        except Exception as e:
+            self._unexpected(e)
         while not self.stopping:
             try:
                 self.run_once()
             except Exception as e:
-                log.error("Runden fejlede: %s", e)
+                self._unexpected(e)
             deadline = time.monotonic() + self.cfg.poll_minutes * 60
             while not self.stopping and time.monotonic() < deadline:
                 time.sleep(1)
         log.info("Oversætter stoppet")
+
+    def _unexpected(self, e: Exception) -> None:
+        """Uventet fejl i løkken: log hele fejlen, markér emnet til nyt forsøg, og fortsæt med næste runde."""
+        log.exception("Uventet fejl i hovedløkken: %s: %s - fortsætter med næste runde", type(e).__name__, e)
+        if self.current is None:
+            return
+        key, title = self.current
+        self.current = None
+        try:
+            self.db.upsert(key, status="forsoeg_igen", reason=f"uventet fejl: {type(e).__name__}: {e}")
+            log.warning("%s er markeret som forsoeg_igen og prøves igen i næste runde", title)
+        except Exception:
+            log.exception("Kunne ikke markere %s som forsoeg_igen", title)
 
     def log_start(self) -> None:
         log.info(

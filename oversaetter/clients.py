@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 import httpx2 as httpx
 
 from .config import Config
+from .deadline import call_with_timeout
 
 
 class ApiError(Exception):
@@ -27,6 +28,9 @@ HINTS = {
     404: "forkert adresse i .env, eller en for gammel version",
 }
 GET_TIMEOUT = 60.0
+JOBS_TIMEOUT = 30.0
+# Ekstra sekunder oven i httpx' timeout, før kaldet opgives helt (httpx' timeout gælder kun hver enkelt læsning).
+HARD_MARGIN = 5.0
 
 
 def parse_date(value: str | None) -> datetime | None:
@@ -61,10 +65,16 @@ class _Api:
     def _request(self, method: str, path: str, params, timeout: float) -> httpx.Response:
         # Fejlteksterne bygges selv, så hverken headers (nøgler) eller httpx' egne beskeder kommer i loggen.
         try:
-            r = self.http.request(
-                method, self.base + path, params=params, headers=self.headers, timeout=httpx.Timeout(timeout)
+            r = call_with_timeout(
+                self.http.request,
+                timeout + HARD_MARGIN,
+                method,
+                self.base + path,
+                params=params,
+                headers=self.headers,
+                timeout=httpx.Timeout(timeout),
             )
-        except httpx.TimeoutException:
+        except (httpx.TimeoutException, TimeoutError):
             raise ApiError(
                 f"{self.name} svarede ikke inden for {timeout:g} sekunder (timeout) på {self.base}{path} - "
                 "tjek adressen i .env, og at tjenesten kører"
@@ -148,12 +158,18 @@ class Bazarr(_Api):
     def jobs(self) -> list[dict] | None:
         """Bazarrs jobkø (findes kun i nyere versioner). None hvis den ikke kan læses."""
         try:
-            r = self.http.get(self.base + "/api/system/jobs", headers=self.headers, timeout=30.0)
+            r = call_with_timeout(
+                self.http.get,
+                JOBS_TIMEOUT + HARD_MARGIN,
+                self.base + "/api/system/jobs",
+                headers=self.headers,
+                timeout=JOBS_TIMEOUT,
+            )
             if r.status_code != 200:
                 return None
             data = r.json()
             return data.get("data", data) if isinstance(data, dict) else data
-        except (httpx.HTTPError, ValueError):
+        except (httpx.HTTPError, ValueError, TimeoutError):
             return None
 
     def translate(
@@ -166,7 +182,18 @@ class Bazarr(_Api):
         if subtitles_id is not None:
             form["subtitles_id"] = str(subtitles_id)
         timeout = httpx.Timeout(timeout_s, connect=30.0)
-        return self.http.patch(self.base + "/api/subtitles", data=form, headers=self.headers, timeout=timeout)
+        try:
+            return call_with_timeout(
+                self.http.patch,
+                timeout_s + HARD_MARGIN,
+                self.base + "/api/subtitles",
+                data=form,
+                headers=self.headers,
+                timeout=timeout,
+            )
+        except TimeoutError:
+            # Samme vej som httpx' egen timeout: request_translation tjekker, om filen alligevel er kommet.
+            raise httpx.ReadTimeout(f"Bazarr svarede ikke inden for {timeout_s:g} sekunder") from None
 
 
 class Radarr(_Api):

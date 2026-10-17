@@ -293,7 +293,8 @@ def test_cli_test_mode(tmp_path, capsys):
     assert "Jeg har 3 søstre." in out.read_text(encoding="utf-8")
     report = (tmp_path / "ny.srt.rapport.txt").read_text(encoding="utf-8")
     assert "Flag før korrektur: 1" in report and "Flag efter korrektur: 0" in report
-    assert "Rettelser fra Sonnet: 1" in report and "Pris: 0.0070 USD" in report
+    assert "Rettelser fra korrektur: 1" in report and "Pris: 0.0140 USD" in report
+    assert "Korrekturmodel: claude-opus-5-5 (effort medium)" in report and "Sonnet" not in report
     assert "Kreditlinje: Bazarrs kreditlinje erstattet" in report
     assert "Testrapport" in capsys.readouterr().out
     # nægter at overskrive
@@ -303,3 +304,95 @@ def test_cli_test_mode(tmp_path, capsys):
 
 def test_outcome_defaults():
     assert Outcome(True).permanent is False
+
+
+# --- forklarende log i hver runde -----------------------------------------------------
+def round_log(arr, tmp_path, caplog, **kw):
+    r, _ = runner(arr, tmp_path, claude=FakeClaude([]), dry_run=True, **kw)
+    caplog.clear()
+    with caplog.at_level("DEBUG", logger="oversaetter"):
+        cands = r.run_once()
+    return cands, caplog.text
+
+
+def test_round_log_empty_wanted_list(arr, tmp_path, caplog):
+    cands, text = round_log(arr, tmp_path, caplog)
+    assert cands == []
+    assert "Bazarr melder ingen film eller afsnit, der mangler dansk. Tjek at dansk er med i sprogprofilen" in text
+
+
+def test_round_log_raw_numbers_and_reasons(arr, tmp_path, caplog):
+    # valgt
+    movie_with_english(arr)
+    # ikke Seerr-ønske
+    arr.add_movie(2, 102, {"days": 2}, [embedded("en", 5)], requested=False, title="Uønsket film")
+    # venter på forsinkelse (60 min - 37 min = 23 min)
+    arr.add_movie(3, 103, {"minutes": 37}, [embedded("en", 6)], title="Ny film")
+    # ingen engelsk tekst
+    arr.add_movie(4, 104, {"days": 2}, [embedded("sv", 7)], title="Svensk film")
+    # kun PGS
+    pgs = os.path.join(arr.media_dir, "Film 5", "Film 5.en.sup")
+    arr.add_movie(5, 105, {"days": 2}, [en_sub(pgs)], title="PGS-film")
+    # afsnit uden mærke og uden Seerr-ønske
+    arr.add_episode(6, 60, 6000, {"days": 9}, [], tags=[1])
+    cands, text = round_log(arr, tmp_path, caplog)
+    assert [c.media_id for c in cands] == [1]
+    assert "Bazarr melder 5 film og 1 afsnit på wanted-listen (heraf 5 film og 1 afsnit uden dansk)" in text
+    examples = [line for line in text.splitlines() if "Eksempel:" in line]
+    assert len(examples) == 5
+    assert "Film 1 - valgt (Seerr) fra ekstern engelsk: Film 1.en.srt" in text
+    assert "Uønsket film - ikke Seerr-ønske" in text
+    assert "Ny film - venter på forsinkelse, 23 min tilbage" in text
+    assert "Svensk film - ingen engelsk tekstkilde" in text
+    assert "PGS-film - kun PGS/VobSub" in text
+    assert "Serie 60 1x06 - ikke Seerr-ønske og mangler mærket oversaet" in text
+    assert "... og 1 flere" in text
+
+
+def test_round_log_bazarr_wanted_without_danish(arr, tmp_path, caplog):
+    movie_with_english(arr)
+    r, _ = runner(arr, tmp_path, dry_run=True)
+    orig = arr.bazarr
+
+    def no_danish(req, path, q):
+        resp = orig(req, path, q)
+        if path == "/api/movies/wanted":
+            data = resp.json()["data"]
+            for d in data:
+                d["missing_subtitles"] = [{"code2": "sv", "forced": False}]
+            return httpx2.Response(200, json={"data": data})
+        return resp
+
+    arr.bazarr = no_danish
+    with caplog.at_level("INFO", logger="oversaetter"):
+        assert r.run_once() == []
+    assert "Bazarr melder 1 film og 0 afsnit på wanted-listen (heraf 0 film og 0 afsnit uden dansk)" in caplog.text
+    assert "Ingen af dem mangler dansk ifølge Bazarr. Tjek at dansk er med i sprogprofilen i Bazarr." in caplog.text
+
+
+@pytest.mark.parametrize(
+    "service, failure, expected",
+    [
+        ("bazarr", 401, "Runden er afbrudt: Bazarr svarede med HTTP 401 på /api/movies/wanted (forkert API-nøgle"),
+        ("bazarr", "timeout", "Runden er afbrudt: Bazarr svarede ikke inden for 60 sekunder (timeout)"),
+        ("seerr", 401, "Kunne ikke hente ønsker fra Seerr: Seerr svarede med HTTP 401 på /api/v1/request"),
+        ("seerr", "timeout", "Seerr svarede ikke inden for 60 sekunder (timeout) på http://seerr/api/v1/request"),
+        ("radarr", 401, "Radarr svarede med HTTP 401 på /api/v3/movie (forkert API-nøgle i .env)"),
+        ("radarr", "timeout", "Radarr svarede ikke inden for 60 sekunder (timeout)"),
+        ("sonarr", 404, "Sonarr svarede med HTTP 404 på /api/v3/series/60 (forkert adresse i .env"),
+        ("sonarr", 500, "Sonarr svarede med HTTP 500 på /api/v3/series/60 (fejl i tjenesten)"),
+    ],
+)
+def test_round_log_service_errors(arr, tmp_path, caplog, service, failure, expected):
+    movie_with_english(arr)
+    arr.add_movie(2, 102, {"days": 2}, [embedded("en", 5)])
+    arr.add_episode(6, 60, 6000, {"days": 9}, [], tags=[7])
+    arr.fail[service] = failure
+    keys = dict(radarr_api_key="radarr-hemmelig", sonarr_api_key="sonarr-hemmelig", seerr_api_key="seerr-hemmelig")
+    _, text = round_log(arr, tmp_path, caplog, **keys)
+    assert expected in text
+    for secret in ("bazarr-key", *keys.values()):
+        assert secret not in text
+    if service == "radarr":
+        # samme fejl for flere film logges én gang og tælles
+        assert text.count("Kunne ikke slå") == 1 and "Samme fejl ramte 2 emner" in text

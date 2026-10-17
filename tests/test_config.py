@@ -6,7 +6,7 @@ def test_defaults_are_safe():
     assert cfg.dry_run is True
     assert cfg.poll_minutes == 15 and cfg.seerr_delay_minutes == 60 and cfg.tag_delay_hours == 48
     assert cfg.translate_timeout_minutes == 45 and cfg.max_line_chars == 42 and cfg.proofread_batch == 50
-    assert cfg.monthly_budget_usd == 5 and cfg.proofread_model == "claude-sonnet-5-5"
+    assert cfg.monthly_budget_usd == 5 and cfg.proofread_model == "claude-opus-5-5"
     assert cfg.translate_tag == "oversaet" and cfg.credit_text == "Oversat af Claude for ≋"
 
 
@@ -35,4 +35,4 @@ def test_missing_key_file():
 
 def test_price():
     cfg = Config()
-    assert abs(cfg.price(1_000_000, 1_000_000) - 12.0) < 1e-9
+    assert abs(cfg.price(1_000_000, 1_000_000) - 24.0) < 1e-9

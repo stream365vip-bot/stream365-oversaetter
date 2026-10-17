@@ -28,6 +28,7 @@ class FakeArr:
         self.on_translate = None  # funktion(form) der fx skriver den danske fil
         self.jobs: list[dict] | None = []
         self.writes: list[tuple[str, str]] = []  # (metode, sti) for alt der ikke er GET
+        self.fail: dict[str, int | str] = {}  # vært -> HTTP-kode eller "timeout"
 
     # --- opsætning ----------------------------------------------------------------
     def video(self, name: str) -> str:
@@ -74,6 +75,10 @@ class FakeArr:
         q = parse_qs(str(req.url.query, "ascii") if isinstance(req.url.query, bytes) else str(req.url.query))
         if req.method != "GET":
             self.writes.append((req.method, f"{host}{path}"))
+        if host in self.fail:
+            if self.fail[host] == "timeout":
+                raise httpx2.ReadTimeout("timed out", request=req)
+            return httpx2.Response(self.fail[host], json={"error": "nej"})
         if host == "bazarr":
             assert req.headers.get("X-API-KEY") == "bazarr-key"
             return self.bazarr(req, path, q)

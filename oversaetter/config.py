@@ -31,11 +31,12 @@ class Config:
     max_line_chars: int = 42
     proofread_batch: int = 50
     proofread_overlap: int = 5
-    proofread_model: str = "claude-sonnet-5-5"
+    proofread_model: str = "claude-opus-5-5"
     proofread_effort: str = "medium"
     monthly_budget_usd: float = 5.0
-    price_input_per_m: float = 2.0
-    price_output_per_m: float = 10.0
+    price_input_per_m: float = 4.0
+    price_output_per_m: float = 20.0
+    known_bad_words: str = ""  # kommaseparerede ord, lægges oven i startlisten i checks.py
 
     credit_text: str = "Oversat af Claude for ≋"
     dry_run: bool = True
@@ -70,6 +71,11 @@ class Config:
                 return f.read().strip()
         except OSError:
             return ""
+
+    def bad_words(self) -> frozenset[str]:
+        from .checks import known_bad_words
+
+        return known_bad_words(self.known_bad_words)
 
     def price(self, input_tokens: int, output_tokens: int, cache_read: int = 0, cache_write: int = 0) -> float:
         inp = self.price_input_per_m / 1_000_000

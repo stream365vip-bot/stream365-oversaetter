@@ -8,7 +8,14 @@ def test_defaults_are_safe():
     assert cfg.ignored_keys == ()
     assert cfg.translate_timeout_minutes == 45 and cfg.max_line_chars == 42 and cfg.proofread_batch == 50
     assert cfg.monthly_budget_usd == 5 and cfg.proofread_model == "claude-opus-5-5"
-    assert cfg.translate_tag == "oversaet" and cfg.credit_text == "Oversat af Claude for ≋"
+    assert cfg.translate_tag == "oversaet"
+    assert cfg.credit_text == (
+        'Oversat til dig af\\n<font color="#58D9AE">≋ </font><b>Stream<font color="#58D9AE">365</font></b>'
+    )
+
+
+def test_empty_credit_text_turns_credit_off():
+    assert Config.from_env({"CREDIT_TEXT": ""}).credit_text == ""
 
 
 def test_env_values(tmp_path):

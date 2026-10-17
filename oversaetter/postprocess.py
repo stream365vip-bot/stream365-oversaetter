@@ -50,7 +50,7 @@ def postprocess(
     budget: Budget,
     item_key: str | None = None,
 ) -> PostResult:
-    body, had_header = split_header(da_cues)
+    body, had_header = split_header(da_cues, cfg.credit_text)
     en_body, _ = split_header(en_cues)
     en_index = EnglishIndex(en_body)
 

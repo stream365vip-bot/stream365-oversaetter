@@ -101,7 +101,7 @@ def test_full_flow_translates_proofreads_and_writes(arr, tmp_path):
     ]
     da_path = os.path.splitext(video)[0] + ".da.srt"
     text = open(da_path, encoding="utf-8").read()
-    assert text.startswith("1\n00:00:01,000 --> 00:00:06,000\nOversat af Claude for ≋\n")
+    assert text.startswith('1\n00:00:01,000 --> 00:00:06,000\nOversat til dig af\n<font color="#58D9AE">≋ </font>')
     assert "Jeg har 3 søstre." in text and "Lingarr" not in text
     row = db.get("movie:1")
     assert row["status"] == "faerdig" and row["fixes"] == 1 and row["flags_before"] == 1 and row["flags_after"] == 0
@@ -126,7 +126,7 @@ def test_budget_reached_keeps_haiku_text(arr, tmp_path):
     r.run_once()
     assert claude.requests == []
     text = open(os.path.splitext(video)[0] + ".da.srt", encoding="utf-8").read()
-    assert "Jeg har tre søstre." in text and "Oversat af Claude for ≋" in text
+    assert "Jeg har tre søstre." in text and "Oversat til dig af\n<font" in text
     assert db.get("movie:1")["reason"] == "budget nået"
 
 
@@ -268,7 +268,7 @@ def test_resume_after_restart(arr, tmp_path):
         f.write(HAIKU)
     r.resume()
     assert db.get("movie:1")["status"] == "faerdig"
-    assert "Oversat af Claude" in open(da, encoding="utf-8").read()
+    assert "Oversat til dig af\n<font" in open(da, encoding="utf-8").read()
 
 
 def test_resume_without_file_counts_as_failed_attempt(arr, tmp_path):

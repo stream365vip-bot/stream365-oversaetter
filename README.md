@@ -164,6 +164,11 @@ Resultatet ligger derefter i `/opt/oversaetter/data/film-test.da.srt` og rapport
 
 - Mislykkes en oversættelse, prøves den igen ved næste runde. Går det galt igen, markeres den som "fejlet" og prøves ikke igen automatisk.
 - Billedbaserede undertekster (PGS/VobSub) kan ikke oversættes og springes over.
+- Alle kald til Anthropic, Bazarr, Radarr, Sonarr og Seerr har en fast tidsgrænse, så intet kan vente for evigt.
+- Afviser korrekturmodellen en bid (refusal), prøves den én gang mere delt i to halvdele. Afvises en halvdel igen, eller giver en bid et ugyldigt svar eller timeout, springes den over (Haikus tekst beholdes), og der fortsættes med næste bid.
+- Efterbehandlingen af ét emne må højst tage `POSTPROCESS_TIMEOUT_MINUTES` (standard 30) minutter. Derefter gemmes filen med de rettelser, der er nået, og loggen skriver en advarsel. Kreditlinjen sættes altid ind, og filen gemmes altid.
+- Rammer hovedløkken en uventet fejl, logges hele fejlen, emnet markeres som "forsoeg_igen", og løkken fortsætter med næste runde.
+- Ved opstart genoptages emner, der stod som "i_gang" (fx efter genstart), og loggen skriver hvilke.
 
 ## For udviklere
 

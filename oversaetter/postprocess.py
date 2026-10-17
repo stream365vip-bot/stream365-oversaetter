@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections import Counter
 from dataclasses import dataclass, replace
 
@@ -49,7 +50,10 @@ def postprocess(
     client,
     budget: Budget,
     item_key: str | None = None,
+    clock=time.monotonic,
 ) -> PostResult:
+    """Kreditlinjen sættes altid ind - også når korrekturen fejler, afvises eller stoppes af tidsgrænsen."""
+    deadline = clock() + cfg.postprocess_timeout_minutes * 60
     body, had_header = split_header(da_cues, cfg.credit_text)
     en_body, _ = split_header(en_cues)
     en_index = EnglishIndex(en_body)
@@ -71,10 +75,17 @@ def postprocess(
         )
     else:
         log.info("Korrektur med %s (effort %s)", cfg.proofread_model, cfg.proofread_effort)
-        pr = proofread(body, en_index, before, cfg, client, budget, item_key)
-        status = "delvis (budget nået)" if pr.budget_stopped else "udført"
-        if pr.batches_failed:
-            status += f", {pr.batches_failed} bidder fejlede"
+        try:
+            pr = proofread(body, en_index, before, cfg, client, budget, item_key, deadline=deadline, clock=clock)
+            if pr.timed_out:
+                status = f"delvis (tidsgrænsen på {cfg.postprocess_timeout_minutes:g} minutter nået)"
+            else:
+                status = "delvis (budget nået)" if pr.budget_stopped else "udført"
+            if pr.batches_failed:
+                status += f", {pr.batches_failed} bidder fejlede (replik {', '.join(pr.failed_ranges)})"
+        except Exception:
+            log.exception("Korrekturen fejlede uventet - filen gemmes uden korrektur, men med kreditlinje")
+            status = "fejlede uventet"
 
     fixed = [replace(c, text=pr.fixes.get(pos, c.text)) for pos, c in enumerate(body)]
     after = check_all(fixed, en_index, cfg.max_line_chars, bad_words)
@@ -106,4 +117,6 @@ def make_client(cfg: Config):
         return None
     import anthropic
 
-    return anthropic.Anthropic(api_key=key, timeout=600.0, max_retries=2)
+    # SDK'ens timeout gælder hver læsning; den hårde grænse for hele kaldet ligger i proofread (call_with_timeout).
+    timeout = max(1.0, cfg.proofread_call_timeout_minutes * 60)
+    return anthropic.Anthropic(api_key=key, timeout=anthropic.Timeout(timeout, connect=30.0), max_retries=2)

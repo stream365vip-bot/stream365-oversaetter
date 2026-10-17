@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Protocol
 
 from .checks import FLAG_TEXT, EnglishIndex, has_english_note, plain
 from .config import Config
+from .deadline import call_with_timeout
 from .srt import Cue
 
 log = logging.getLogger("oversaetter")
@@ -44,7 +46,16 @@ Rules:
 - Use "\\n" for a line break inside a subtitle. Never more than 2 lines.
 - Every line that has one or more flags MUST be included in your fixes with a corrected Danish text.
 - Do not change lines that are already good. Do not make stylistic rewrites of correct lines.
-- Never write explanations, notes or English text inside "da". Return only the finished Danish subtitle.
+- "da" is shown on screen exactly as you write it. It must contain ONLY the finished Danish subtitle: no \
+notes, no explanations, no reasoning, no comments, no alternatives, no quotes of the English, no text in \
+brackets about your choices and no English words such as "Note", "Wait", "Hmm", "translation", "translated", \
+"output", "final", "line 3" or "chars" (unless that exact word is spoken in the English line).
+- If you want to explain a fix, don't. Put nothing but the Danish subtitle in "da".
+
+Example. English: "Hold on, I'll be right back."
+Wrong: {{"i": 12, "da": "Vent, jeg er straks tilbage. (Note: 'hold on' translated as 'vent')"}}
+Wrong: {{"i": 12, "da": "Wait - final translation: Vent, jeg er straks tilbage."}}
+Right: {{"i": 12, "da": "Vent, jeg er straks tilbage."}}
 
 Answer only with JSON of the form {{"fixes": [{{"i": <line number>, "da": "<corrected Danish text>"}}]}}. \
 If nothing needs fixing, answer {{"fixes": []}}."""
@@ -93,6 +104,8 @@ class ProofreadResult:
     batches_ok: int = 0
     batches_failed: int = 0
     budget_stopped: bool = False
+    timed_out: bool = False  # den samlede tidsgrænse for efterbehandlingen blev nået
+    failed_ranges: list[str] = field(default_factory=list)  # fx "1401-1425"
 
 
 def validate_fix(fix, allowed: set[int], en_by_i: dict[int, str], max_lines: int = 2) -> tuple[bool, str]:
@@ -141,13 +154,22 @@ def proofread(
     client,
     budget: Budget,
     item_key: str | None = None,
+    deadline: float | None = None,
+    clock=time.monotonic,
 ) -> ProofreadResult:
+    """Korrektur i bidder. Fejler eller afvises en bid, springes den over - resten rettes stadig.
+
+    deadline: tidspunkt (efter clock) hvor korrekturen skal stoppe, så filen kan gemmes med det, der er nået.
+    """
     result = ProofreadResult()
     system = SYSTEM_PROMPT.format(max_chars=min(40, cfg.max_line_chars))
     earlier: list[dict] = []
     en_text = [en_index.text_for(c) for c in cues]
+    call_limit = max(1.0, cfg.proofread_call_timeout_minutes * 60)
 
-    for ctx_start, start, end in _batches(len(cues), max(1, cfg.proofread_batch), cfg.proofread_overlap):
+    def must_stop(at: int) -> bool:
+        if result.budget_stopped or result.timed_out:
+            return True
         if budget.spent() >= cfg.monthly_budget_usd:
             result.budget_stopped = True
             log.warning(
@@ -155,7 +177,26 @@ def proofread(
                 cfg.monthly_budget_usd,
                 budget.spent(),
             )
-            break
+            return True
+        if deadline is not None and clock() >= deadline:
+            result.timed_out = True
+            log.warning(
+                "ADVARSEL: Efterbehandlingen har brugt over %g minutter - korrekturen stoppes ved replik %d af %d. "
+                "Filen gemmes med de %d rettelser, der er nået, og kreditlinjen sættes ind",
+                cfg.postprocess_timeout_minutes,
+                at + 1,
+                len(cues),
+                len(result.fixes),
+            )
+            return True
+        return False
+
+    def failed(start: int, end: int) -> None:
+        result.batches_failed += 1
+        result.failed_ranges.append(f"{start + 1}-{end}")
+
+    def ask(ctx_start: int, start: int, end: int) -> str:
+        """Korrektur af replik start..end-1. Returnerer "ok", "refusal" eller "fejl" (fejl er allerede logget)."""
         lines = []
         for pos in range(ctx_start, end):
             text = result.fixes.get(pos, cues[pos].text)
@@ -170,8 +211,11 @@ def proofread(
         )
         allowed = set(range(start + 1, end + 1))
         en_by_i = {pos + 1: en_text[pos] for pos in range(start, end)}
+        timeout = call_limit if deadline is None else max(1.0, min(call_limit, deadline - clock()))
         try:
-            response = client.messages.create(
+            response = call_with_timeout(
+                client.messages.create,
+                timeout,
                 model=cfg.proofread_model,
                 max_tokens=MAX_TOKENS,
                 system=system,
@@ -181,10 +225,18 @@ def proofread(
                     "format": {"type": "json_schema", "schema": OUTPUT_SCHEMA},
                 },
             )
+        except TimeoutError:
+            log.error(
+                "Korrekturmodellen svarede ikke inden for %g sekunder for replik %d-%d (timeout) - "
+                "bidden springes over",
+                timeout,
+                start + 1,
+                end,
+            )
+            return "fejl"
         except Exception as e:  # netværk, API-fejl osv.
-            result.batches_failed += 1
             log.error("Korrektur af replik %d-%d fejlede (%s) - bidden springes over", start + 1, end, e)
-            continue
+            return "fejl"
 
         inp, out, cache_read, cache_write = _usage_numbers(getattr(response, "usage", None))
         cost = cfg.price(inp, out, cache_read, cache_write)
@@ -192,29 +244,70 @@ def proofread(
         budget.record(item_key, inp + cache_read + cache_write, out, cost)
 
         stop = getattr(response, "stop_reason", None)
+        if stop == "refusal":
+            return "refusal"
         text = next((b.text for b in getattr(response, "content", []) if getattr(b, "type", "") == "text"), "")
         try:
-            if stop in ("refusal", "max_tokens"):
+            if stop == "max_tokens":
                 raise ValueError(f"stop_reason={stop}")
             data = json.loads(text)
             fixes = data["fixes"]
             if not isinstance(fixes, list):
                 raise ValueError("fixes er ikke en liste")
         except (ValueError, KeyError, TypeError) as e:
-            result.batches_failed += 1
-            log.error("Ugyldigt svar fra korrekturmodellen for replik %d-%d (%s) - bidden kasseres", start + 1, end, e)
-            continue
+            log.error(
+                "Ugyldigt svar fra korrekturmodellen for replik %d-%d (%s) - bidden springes over", start + 1, end, e
+            )
+            return "fejl"
 
-        result.batches_ok += 1
         for fix in fixes:
             ok, why = validate_fix(fix, allowed, en_by_i)
             if not ok:
                 result.rejected += 1
-                log.warning("Rettelse kasseret: %s", why)
+                shown = fix.get("da") if isinstance(fix, dict) else fix
+                log.warning("Rettelse kasseret: %s: %r", why, str(shown)[:120])
                 continue
             pos = fix["i"] - 1
             new = fix["da"].replace("\r\n", "\n").strip()
             if new != cues[pos].text:
                 result.fixes[pos] = new
                 earlier.append({"en": en_text[pos], "da": new})
+        return "ok"
+
+    def run(ctx_start: int, start: int, end: int, retry_refusal: bool) -> None:
+        try:
+            outcome = ask(ctx_start, start, end)
+        except Exception:  # aldrig lade én bid stoppe resten
+            log.exception("Uventet fejl i korrekturen af replik %d-%d - bidden springes over", start + 1, end)
+            outcome = "fejl"
+        if outcome == "ok":
+            result.batches_ok += 1
+            return
+        if outcome == "refusal" and retry_refusal and end - start >= 2:
+            mid = (start + end + 1) // 2
+            log.warning(
+                "Korrekturmodellen afviste replik %d-%d (stop_reason=refusal) - prøver igen delt i to: %d-%d og %d-%d",
+                start + 1,
+                end,
+                start + 1,
+                mid,
+                mid + 1,
+                end,
+            )
+            run(ctx_start, start, mid, retry_refusal=False)
+            if not must_stop(mid):
+                run(max(0, mid - cfg.proofread_overlap), mid, end, retry_refusal=False)
+            return
+        if outcome == "refusal":
+            log.error(
+                "Korrekturmodellen afviste replik %d-%d (stop_reason=refusal) - bidden kasseres, Haikus tekst beholdes",
+                start + 1,
+                end,
+            )
+        failed(start, end)
+
+    for ctx_start, start, end in _batches(len(cues), max(1, cfg.proofread_batch), cfg.proofread_overlap):
+        if must_stop(start):
+            break
+        run(ctx_start, start, end, retry_refusal=True)
     return result

@@ -38,6 +38,8 @@ class Config:
     proofread_overlap: int = 5
     proofread_model: str = "claude-opus-5-5"
     proofread_effort: str = "medium"
+    proofread_call_timeout_minutes: float = 10.0  # højst så længe på ét svar fra korrekturmodellen
+    postprocess_timeout_minutes: float = 30.0  # højst så længe på efterbehandlingen af ét emne i alt
     monthly_budget_usd: float = 5.0
     price_input_per_m: float = 4.0
     price_output_per_m: float = 20.0

@@ -1,4 +1,8 @@
-"""Små klienter til Bazarr, Radarr, Sonarr og Seerr. Kun læsning - bortset fra Bazarrs translate."""
+"""Små klienter til Bazarr, Radarr, Sonarr og Seerr.
+
+Kun læsning - bortset fra tre kald til Bazarr: translate, søg efter dansk til ét emne og synkronisér
+med Radarr/Sonarr. Ingen af dem ændrer indstillinger.
+"""
 
 from __future__ import annotations
 
@@ -44,12 +48,25 @@ class _Api:
         self.http = http
 
     def get(self, path: str, params=None):
+        r = self._request("GET", path, params, GET_TIMEOUT)
+        try:
+            return r.json()
+        except ValueError:
+            raise ApiError(
+                f"{self.name} svarede med HTTP {r.status_code} på {path}, men ikke med gyldige data - "
+                "tjek adressen i .env",
+                r.status_code,
+            ) from None
+
+    def _request(self, method: str, path: str, params, timeout: float) -> httpx.Response:
         # Fejlteksterne bygges selv, så hverken headers (nøgler) eller httpx' egne beskeder kommer i loggen.
         try:
-            r = self.http.get(self.base + path, params=params, headers=self.headers, timeout=GET_TIMEOUT)
+            r = self.http.request(
+                method, self.base + path, params=params, headers=self.headers, timeout=httpx.Timeout(timeout)
+            )
         except httpx.TimeoutException:
             raise ApiError(
-                f"{self.name} svarede ikke inden for {GET_TIMEOUT:g} sekunder (timeout) på {self.base}{path} - "
+                f"{self.name} svarede ikke inden for {timeout:g} sekunder (timeout) på {self.base}{path} - "
                 "tjek adressen i .env, og at tjenesten kører"
             ) from None
         except httpx.HTTPError as e:
@@ -60,14 +77,7 @@ class _Api:
         if r.status_code >= 400:
             hint = HINTS.get(r.status_code, "fejl i tjenesten" if r.status_code >= 500 else "uventet svar")
             raise ApiError(f"{self.name} svarede med HTTP {r.status_code} på {path} ({hint})", r.status_code)
-        try:
-            return r.json()
-        except ValueError:
-            raise ApiError(
-                f"{self.name} svarede med HTTP {r.status_code} på {path}, men ikke med gyldige data - "
-                "tjek adressen i .env",
-                r.status_code,
-            ) from None
+        return r
 
 
 class Bazarr(_Api):
@@ -92,6 +102,42 @@ class Bazarr(_Api):
 
     def item(self, media_type: str, media_id: int) -> dict | None:
         return self.movie(media_id) if media_type == "movie" else self.episode(media_id)
+
+    def movies_by_ids(self, radarr_ids: list[int]) -> list[dict]:
+        out = []
+        for i in range(0, len(radarr_ids), 50):
+            out += self.get("/api/movies", {"radarrid[]": radarr_ids[i : i + 50]}).get("data", [])
+        return out
+
+    def series_by_ids(self, series_ids: list[int]) -> list[dict]:
+        out = []
+        for i in range(0, len(series_ids), 50):
+            out += self.get("/api/series", {"seriesid[]": series_ids[i : i + 50]}).get("data", [])
+        return out
+
+    def providers(self) -> list[dict]:
+        """Status for Bazarrs aktiverede undertekst-tjenester: name, status ("Good" eller grunden) og retry."""
+        return self.get("/api/providers").get("data", [])
+
+    def search(
+        self, media_type: str, media_id: int, series_id: int | None = None, hi: bool = False, timeout_s: float = 600
+    ) -> None:
+        """Bed Bazarr søge efter dansk til netop dette emne (samme kald som søgeknappen i Bazarrs wanted-liste).
+
+        I nyere versioner lægges søgningen i Bazarrs jobkø, og kaldet svarer med det samme.
+        """
+        params = {"language": "da", "forced": "False", "hi": "True" if hi else "False"}
+        if media_type == "movie":
+            path = "/api/movies/subtitles"
+            params["radarrid"] = media_id
+        else:
+            path = "/api/episodes/subtitles"
+            params.update(seriesid=series_id, episodeid=media_id)
+        self._request("PATCH", path, params, timeout_s)
+
+    def sync(self, task_id: str) -> None:
+        """Start Bazarrs opgave "Sync with Radarr" (update_movies) eller "Sync with Sonarr" (update_series)."""
+        self._request("POST", "/api/system/tasks", {"taskid": task_id}, GET_TIMEOUT)
 
     def jobs(self) -> list[dict] | None:
         """Bazarrs jobkø (findes kun i nyere versioner). None hvis den ikke kan læses."""
@@ -129,6 +175,9 @@ class Radarr(_Api):
     def movies(self) -> list[dict]:
         return self.get("/api/v3/movie")
 
+    def tags(self) -> list[dict]:
+        return self.get("/api/v3/tag")
+
 
 class Sonarr(_Api):
     name = "Sonarr"
@@ -144,6 +193,9 @@ class Sonarr(_Api):
 
     def series(self, series_id: int) -> dict:
         return self.get(f"/api/v3/series/{series_id}")
+
+    def all_series(self) -> list[dict]:
+        return self.get("/api/v3/series")
 
     def tags(self) -> list[dict]:
         return self.get("/api/v3/tag")

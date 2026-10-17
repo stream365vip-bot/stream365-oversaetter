@@ -1,9 +1,8 @@
-"""Valg af kandidater: hvad mangler dansk, er ønsket/mærket, og har en engelsk kilde."""
+"""Valg af emner: hvad mangler dansk, er ønsket/mærket, har haft en gyldig søgning og har en engelsk kilde."""
 
 from __future__ import annotations
 
 import logging
-import math
 import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -29,6 +28,8 @@ class Candidate:
     title: str
     reason: str  # "Seerr" eller "mærke"
     video_path: str = ""
+    series_id: int | None = None  # sonarrSeriesId (kun afsnit)
+    hi: bool = False  # Bazarr mangler den danske tekst som HI
     source_path: str | None = None
     subtitles_id: int | None = None
     source_desc: str = ""
@@ -47,6 +48,8 @@ class Stats:
     wanted: int = 0
     not_selected: int = 0
     waiting: int = 0
+    searched: int = 0
+    found_danish: int = 0
     done_before: int = 0
     skipped: list[str] = field(default_factory=list)
     # Bazarrs rå tal (hele wanted-listen) og hvor mange af dem der mangler dansk.
@@ -132,19 +135,10 @@ def no_source_reason(subtitles: list[dict]) -> str:
     return "ingen engelsk tekstkilde, der kan bruges (engelsk findes, men ikke som .srt eller indlejret spor)"
 
 
-def format_wait(left: timedelta) -> str:
-    minutes = max(1, math.ceil(left.total_seconds() / 60))
-    if minutes < 120:
-        return f"{minutes} min"
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours} t {minutes} min" if minutes else f"{hours} t"
-
-
-def _age(date_added: str | None, video_path: str, now: datetime) -> timedelta | None:
-    dt = parse_date(date_added)
-    if dt is None and video_path and os.path.exists(video_path):
-        dt = datetime.fromtimestamp(os.path.getmtime(video_path), tz=UTC)
-    return None if dt is None else now - dt
+def missing_hi(entry: dict) -> bool:
+    return any(
+        m.get("code2") == "da" and not m.get("forced") and m.get("hi") for m in entry.get("missing_subtitles") or []
+    )
 
 
 class Selector:
@@ -152,20 +146,30 @@ class Selector:
         self.cfg, self.bazarr, self.radarr, self.sonarr, self.seerr, self.db = cfg, bazarr, radarr, sonarr, seerr, db
         self._series: dict[int, dict] = {}
         self._movies: dict[int, dict] | None = None
-        self._tag_id: int | None | bool = False  # False = ikke slået op endnu
+        self._tag_ids: dict[str, int | None] = {}  # "radarr"/"sonarr" -> id på mærket (None = findes ikke)
+
+    def _tag(self, name: str, api) -> int | None:
+        if name not in self._tag_ids:
+            wanted = self.cfg.translate_tag.strip().lower()
+            self._tag_ids[name] = next(
+                (int(t["id"]) for t in api.tags() if str(t.get("label", "")).lower() == wanted), None
+            )
+        return self._tag_ids[name]
 
     def tag_id(self) -> int | None:
-        if self._tag_id is False:
-            wanted = self.cfg.translate_tag.strip().lower()
-            self._tag_id = next(
-                (int(t["id"]) for t in self.sonarr.tags() if str(t.get("label", "")).lower() == wanted), None
-            )
-        return self._tag_id
+        """Mærket i Sonarr."""
+        return self._tag("sonarr", self.sonarr)
 
-    def movie(self, radarr_id: int) -> dict:
+    def radarr_tag_id(self) -> int | None:
+        return self._tag("radarr", self.radarr)
+
+    def all_movies(self) -> dict[int, dict]:
         if self._movies is None:
             self._movies = {int(m["id"]): m for m in self.radarr.movies()}
-        return self._movies.get(radarr_id) or self.radarr.movie(radarr_id)
+        return self._movies
+
+    def movie(self, radarr_id: int) -> dict:
+        return self.all_movies().get(radarr_id) or self.radarr.movie(radarr_id)
 
     def series(self, series_id: int) -> dict:
         if series_id not in self._series:
@@ -186,46 +190,30 @@ class Selector:
                 return True
         return False
 
-    def eligibility_movie(self, entry: dict, now: datetime) -> tuple[str | None, bool, str]:
-        """(grund, venter, forklaring). grund er None hvis filmen ikke skal oversættes nu."""
+    def eligibility_movie(self, entry: dict) -> tuple[str | None, str]:
+        """(grund, forklaring). grund er None hvis filmen hverken er Seerr-ønske eller har mærket i Radarr."""
         movie = self.movie(int(entry["radarrId"]))
-        if not self.seerr.movie_wanted(movie.get("tmdbId")):
-            return None, False, "ikke Seerr-ønske"
-        movie_file = movie.get("movieFile") or {}
-        age = _age(movie_file.get("dateAdded"), movie_file.get("path", ""), now)
-        delay = timedelta(minutes=self.cfg.seerr_delay_minutes)
-        if age is None:
-            return None, True, "venter på forsinkelse (filens tidspunkt er ukendt)"
-        if age < delay:
-            return None, True, f"venter på forsinkelse, {format_wait(delay - age)} tilbage"
-        return "Seerr", False, ""
+        if self.seerr.movie_wanted(movie.get("tmdbId")):
+            return "Seerr", ""
+        tag = self.radarr_tag_id()
+        if tag is not None and tag in (movie.get("tags") or []):
+            return "mærke", ""
+        return None, f"ikke Seerr-ønske og mangler mærket {self.cfg.translate_tag}"
 
-    def eligibility_episode(self, entry: dict, now: datetime) -> tuple[str | None, bool, str]:
+    def eligibility_episode(self, entry: dict) -> tuple[str | None, str]:
         # Først serien (gemmes mellem afsnit), så afsnittet kun slås op når serien er relevant.
         series = self.series(int(entry["sonarrSeriesId"]))
         tag = self.tag_id()
         via_tag = tag is not None and tag in (series.get("tags") or [])
         no_tag = f"mangler mærket {self.cfg.translate_tag}"
         if not via_tag and not self.seerr.series_maybe_wanted(series.get("tvdbId"), series.get("tmdbId")):
-            return None, False, f"ikke Seerr-ønske og {no_tag}"
+            return None, f"ikke Seerr-ønske og {no_tag}"
+        if via_tag:
+            return "mærke", ""
         ep = self.sonarr.episode(int(entry["sonarrEpisodeId"]))
-        via_seerr = self.seerr.episode_wanted(series.get("tvdbId"), series.get("tmdbId"), ep.get("seasonNumber"))
-        if not via_seerr and not via_tag:
-            return None, False, f"sæson {ep.get('seasonNumber')} er ikke Seerr-ønske og {no_tag}"
-        file_info = ep.get("episodeFile") or {}
-        if not file_info and ep.get("episodeFileId"):
-            file_info = self.sonarr.episode_file(int(ep["episodeFileId"]))
-        age = _age(file_info.get("dateAdded"), file_info.get("path", ""), now)
-        if age is None:
-            return None, True, "venter på forsinkelse (filens tidspunkt er ukendt)"
-        seerr_delay = timedelta(minutes=self.cfg.seerr_delay_minutes)
-        tag_delay = timedelta(hours=self.cfg.tag_delay_hours)
-        if via_seerr and age >= seerr_delay:
-            return "Seerr", False, ""
-        if via_tag and age >= tag_delay:
-            return "mærke", False, ""
-        left = min(d - age for ok, d in ((via_seerr, seerr_delay), (via_tag, tag_delay)) if ok)
-        return None, True, f"venter på forsinkelse, {format_wait(left)} tilbage"
+        if self.seerr.episode_wanted(series.get("tvdbId"), series.get("tmdbId"), ep.get("seasonNumber")):
+            return "Seerr", ""
+        return None, f"sæson {ep.get('seasonNumber')} er ikke Seerr-ønske og {no_tag}"
 
     def skip(self, cand: Candidate, why: str, stats: Stats) -> None:
         stats.skipped.append(f"{cand.title}: {why}")
@@ -242,10 +230,40 @@ class Selector:
                 video_path=cand.video_path,
             )
 
-    def find(self, now: datetime | None = None) -> tuple[list[Candidate], Stats]:
+    def found_danish(self, cand: Candidate, stats: Stats) -> None:
+        why = "gyldig søgning fandt dansk - intet at gøre"
+        stats.found_danish += 1
+        stats.example("fandt dansk", cand.title, why)
+        log.info("%s: %s", cand.title, why)
+        if not self.cfg.dry_run:
+            self.db.upsert(cand.key, status="faerdig", reason="gyldig søgning fandt dansk")
+
+    def after_search(self, cand: Candidate, item: dict | None, stats: Stats) -> Candidate | None:
+        """Efter en gyldig søgning: mangler emnet stadig dansk, og er der en engelsk kilde?"""
+        if not item:
+            log.warning("Bazarr kender ikke %s", cand.title)
+            stats.example("fejl", cand.title, "Bazarr kender den ikke")
+            return None
+        cand.video_path = item.get("path") or cand.video_path
+        subtitles = item.get("subtitles") or []
+        on_disk = danish_on_disk(cand.video_path) if cand.video_path else None
+        if not wants_danish(item) or has_danish(subtitles) or on_disk:
+            self.found_danish(cand, stats)
+            return None
+        path, sub_id, desc = choose_source(subtitles)
+        if not path and sub_id is None:
+            self.skip(cand, no_source_reason(subtitles), stats)
+            return None
+        cand.source_path, cand.subtitles_id, cand.source_desc = path, sub_id, desc
+        stats.example("oversætter", cand.title, f"gyldig søgning fandt ikke dansk - oversætter ({cand.reason}, {desc})")
+        return cand
+
+    def find(self, now: datetime | None = None) -> tuple[list[Candidate], list[Candidate], Stats]:
+        """(klar til oversættelse, mangler gyldig søgning, tal til loggen)."""
         now = now or datetime.now(UTC)
         stats = Stats()
         candidates: list[Candidate] = []
+        to_search: list[Candidate] = []
         movies, episodes = self.bazarr.wanted_movies(), self.bazarr.wanted_episodes()
         stats.bazarr_movies, stats.bazarr_episodes = len(movies), len(episodes)
         entries = [("movie", e) for e in movies] + [("episode", e) for e in episodes]
@@ -255,24 +273,24 @@ class Selector:
             stats.wanted += 1
             if media_type == "movie":
                 stats.wanted_movies += 1
-            else:
-                stats.wanted_episodes += 1
-            if media_type == "movie":
                 media_id = int(entry["radarrId"])
                 title = entry.get("title") or f"film {media_id}"
+                series_id = None
             else:
+                stats.wanted_episodes += 1
                 media_id = int(entry["sonarrEpisodeId"])
                 title = f"{entry.get('seriesTitle', 'serie')} {entry.get('episode_number', '')}".strip()
-            cand = Candidate(media_type, media_id, title, reason="")
+                series_id = int(entry["sonarrSeriesId"])
+            cand = Candidate(media_type, media_id, title, reason="", series_id=series_id, hi=missing_hi(entry))
             if self._db_blocks(cand.key, now, stats):
                 row = self.db.get(cand.key)
                 stats.example("allerede behandlet", title, f"allerede behandlet (status {row['status']})")
                 continue
             try:
                 if media_type == "movie":
-                    reason, waiting, why = self.eligibility_movie(entry, now)
+                    reason, why = self.eligibility_movie(entry)
                 else:
-                    reason, waiting, why = self.eligibility_episode(entry, now)
+                    reason, why = self.eligibility_episode(entry)
             except Exception as e:
                 msg = str(e) if isinstance(e, ApiError) else f"{type(e).__name__}: {e}"
                 if msg not in stats.errors:
@@ -281,12 +299,8 @@ class Selector:
                 stats.example("fejl", title, f"fejl ved opslag: {msg}")
                 continue
             if reason is None:
-                if waiting:
-                    stats.waiting += 1
-                    stats.example("venter", title, why)
-                else:
-                    stats.not_selected += 1
-                    stats.example("ikke valgt: " + why, title, why)
+                stats.not_selected += 1
+                stats.example("ikke valgt: " + why, title, why)
                 continue
             cand.reason = reason
             item = self.bazarr.item(media_type, media_id)
@@ -295,8 +309,7 @@ class Selector:
                 stats.example("fejl", title, "Bazarr kender den ikke")
                 continue
             cand.video_path = item.get("path") or ""
-            subtitles = item.get("subtitles") or []
-            da = has_danish(subtitles)
+            da = has_danish(item.get("subtitles") or [])
             if da:
                 kind = "ekstern" if da.get("path") else "indlejret"
                 self.skip(cand, f"har allerede dansk ({kind}{', forced' if da.get('forced') else ''})", stats)
@@ -305,11 +318,11 @@ class Selector:
             if on_disk:
                 self.skip(cand, f"har allerede dansk fil: {os.path.basename(on_disk)}", stats)
                 continue
-            path, sub_id, desc = choose_source(subtitles)
-            if not path and sub_id is None:
-                self.skip(cand, no_source_reason(subtitles), stats)
+            row = self.db.get(cand.key)
+            if row is None or not row["search_at"]:
+                to_search.append(cand)  # regel: aldrig oversættelse uden en gyldig søgning
                 continue
-            cand.source_path, cand.subtitles_id, cand.source_desc = path, sub_id, desc
-            stats.example("valgt", title, f"valgt ({reason}) fra {desc}")
-            candidates.append(cand)
-        return candidates, stats
+            ready = self.after_search(cand, item, stats)
+            if ready:
+                candidates.append(ready)
+        return candidates, to_search, stats

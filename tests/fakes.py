@@ -29,6 +29,19 @@ class FakeArr:
         self.jobs: list[dict] | None = []
         self.writes: list[tuple[str, str]] = []  # (metode, sti) for alt der ikke er GET
         self.fail: dict[str, int | str] = {}  # vært -> HTTP-kode eller "timeout"
+        # Bazarrs tjenester, søgninger og synkronisering
+        self.providers = [
+            {"name": "opensubtitlescom", "status": "Good", "retry": "-"},
+            {"name": "podnapisi", "status": "Good", "retry": "-"},
+        ]
+        self.search_calls: list[dict] = []
+        self.search_job_status: str | None = "completed"  # status på søgejobbet; None = gammel Bazarr uden jobkø
+        self.search_finds_danish: set[str] = set()  # "movie:1" / "episode:5" -> søgningen henter dansk
+        self.on_search = None  # funktion(params) der fx sætter en tjeneste på pause
+        self.sync_calls: list[str] = []
+        self.bazarr_unknown: set[str] = set()  # "movie:1" / "series:50" -> Bazarr kender den ikke endnu
+        self.radarr_tags = [{"id": 3, "label": "oversaet"}]
+        self._job_id = 100
 
     # --- opsætning ----------------------------------------------------------------
     def video(self, name: str) -> str:
@@ -38,7 +51,7 @@ class FakeArr:
             f.write(b"video")
         return path
 
-    def add_movie(self, radarr_id, tmdb_id, added_ago, subtitles, requested=True, title=None):
+    def add_movie(self, radarr_id, tmdb_id, added_ago, subtitles, requested=True, title=None, tags=()):
         path = self.video(f"Film {radarr_id}/Film {radarr_id}.mkv")
         self.movies[radarr_id] = {
             "title": title or f"Film {radarr_id}",
@@ -46,6 +59,7 @@ class FakeArr:
             "path": path,
             "subtitles": subtitles,
             "dateAdded": ago(**added_ago),
+            "tags": list(tags),
         }
         if requested:
             self.seerr_requests.append(
@@ -90,10 +104,20 @@ class FakeArr:
             return httpx2.Response(200, json={"pageInfo": {"pages": 1}, "results": self.seerr_requests})
         return httpx2.Response(404)
 
+    @staticmethod
+    def missing(item) -> list[dict]:
+        # Indlejret dansk tæller ikke her (som når Bazarr er sat til at ignorere indlejrede spor).
+        if any(s.get("code2") == "da" and s.get("path") for s in item["subtitles"]):
+            return []
+        return [{"code2": "da", "forced": False, "hi": False}]
+
     def bazarr(self, req, path, q):
-        missing = [{"code2": "da", "forced": False, "hi": False}]
         if path == "/api/movies/wanted":
-            data = [{"radarrId": i, "title": m["title"], "missing_subtitles": missing} for i, m in self.movies.items()]
+            data = [
+                {"radarrId": i, "title": m["title"], "missing_subtitles": self.missing(m)}
+                for i, m in self.movies.items()
+                if self.missing(m) and f"movie:{i}" not in self.bazarr_unknown
+            ]
             return httpx2.Response(200, json={"data": data, "total": len(data)})
         if path == "/api/episodes/wanted":
             data = [
@@ -102,17 +126,56 @@ class FakeArr:
                     "sonarrSeriesId": e["seriesId"],
                     "seriesTitle": e["title"],
                     "episode_number": f"{e['season']}x{i:02d}",
-                    "missing_subtitles": missing,
+                    "missing_subtitles": self.missing(e),
                 }
                 for i, e in self.episodes.items()
+                if self.missing(e) and f"series:{e['seriesId']}" not in self.bazarr_unknown and not e.get("new")
             ]
             return httpx2.Response(200, json={"data": data, "total": len(data)})
-        if path == "/api/movies":
-            m = self.movies[int(q["radarrid[]"][0])]
-            return httpx2.Response(200, json={"data": [{"path": m["path"], "subtitles": m["subtitles"]}]})
+        if path == "/api/movies" and req.method == "GET":
+            data = [
+                {"radarrId": i, "path": m["path"], "subtitles": m["subtitles"], "missing_subtitles": self.missing(m)}
+                for i, m in ((int(x), self.movies.get(int(x))) for x in q.get("radarrid[]", []))
+                if m is not None and f"movie:{i}" not in self.bazarr_unknown
+            ]
+            return httpx2.Response(200, json={"data": data})
         if path == "/api/episodes":
             e = self.episodes[int(q["episodeid[]"][0])]
-            return httpx2.Response(200, json={"data": [{"path": e["path"], "subtitles": e["subtitles"]}]})
+            data = {"path": e["path"], "subtitles": e["subtitles"], "missing_subtitles": self.missing(e)}
+            return httpx2.Response(200, json={"data": [data]})
+        if path == "/api/series":
+            data = []
+            for x in q.get("seriesid[]", []):
+                sid = int(x)
+                if sid in self.series and f"series:{sid}" not in self.bazarr_unknown:
+                    count = sum(1 for e in self.episodes.values() if e["seriesId"] == sid and not e.get("new"))
+                    data.append({"sonarrSeriesId": sid, "episodeFileCount": count})
+            return httpx2.Response(200, json={"data": data})
+        if path == "/api/providers":
+            return httpx2.Response(200, json={"data": self.providers})
+        if path in ("/api/movies/subtitles", "/api/episodes/subtitles") and req.method == "PATCH":
+            params = {k: v[0] for k, v in q.items()}
+            self.search_calls.append({"path": path, **params})
+            if path == "/api/movies/subtitles":
+                key, item = f"movie:{params['radarrid']}", self.movies[int(params["radarrid"])]
+            else:
+                key, item = f"episode:{params['episodeid']}", self.episodes[int(params["episodeid"])]
+            if key in self.search_finds_danish:
+                da = os.path.splitext(item["path"])[0] + ".da.srt"
+                with open(da, "w", encoding="utf-8") as f:
+                    f.write("1\n00:00:01,000 --> 00:00:02,000\nHej\n")
+                item["subtitles"] = [*item["subtitles"], {"code2": "da", "code3": "dan", "path": da, "forced": False}]
+            if self.search_job_status is not None and self.jobs is not None:
+                self._job_id += 1
+                self.jobs.append(
+                    {"job_id": self._job_id, "job_name": "Searching subtitles", "status": self.search_job_status}
+                )
+            if self.on_search:
+                self.on_search(params)
+            return httpx2.Response(204, text="")
+        if path == "/api/system/tasks" and req.method == "POST":
+            self.sync_calls.append(q["taskid"][0])
+            return httpx2.Response(204, text="")
         if path == "/api/system/jobs":
             if self.jobs is None:
                 return httpx2.Response(404)
@@ -132,11 +195,15 @@ class FakeArr:
             m = self.movies[rid]
             return {
                 "id": rid,
+                "title": m["title"],
                 "tmdbId": m["tmdbId"],
+                "tags": m["tags"],
                 "hasFile": True,
                 "movieFile": {"path": m["path"], "dateAdded": m["dateAdded"]},
             }
 
+        if path == "/api/v3/tag":
+            return httpx2.Response(200, json=self.radarr_tags)
         if path == "/api/v3/movie":
             return httpx2.Response(200, json=[one(rid) for rid in self.movies])
         return httpx2.Response(200, json=one(int(path.rsplit("/", 1)[1])))
@@ -144,6 +211,12 @@ class FakeArr:
     def sonarr(self, path):
         if path == "/api/v3/tag":
             return httpx2.Response(200, json=self.tags)
+        if path == "/api/v3/series":
+            out = []
+            for sid, s in self.series.items():
+                count = sum(1 for e in self.episodes.values() if e["seriesId"] == sid)
+                out.append({**s, "title": f"Serie {sid}", "statistics": {"episodeFileCount": count}})
+            return httpx2.Response(200, json=out)
         kind, ident = path.split("/")[-2:]
         ident = int(ident)
         if kind == "episode":

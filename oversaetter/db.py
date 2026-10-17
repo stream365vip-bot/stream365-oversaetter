@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS items (
     media_type TEXT NOT NULL,
     media_id INTEGER NOT NULL,
     title TEXT,
-    status TEXT NOT NULL,          -- i_gang, faerdig, forsoeg_igen, fejlet, sprunget_over
+    status TEXT NOT NULL,          -- soeger, soegt, i_gang, faerdig, forsoeg_igen, fejlet, sprunget_over, ikke_muligt
     attempts INTEGER NOT NULL DEFAULT 0,
     reason TEXT,
     video_path TEXT,
@@ -23,7 +23,10 @@ CREATE TABLE IF NOT EXISTS items (
     cost_usd REAL NOT NULL DEFAULT 0,
     flags_before INTEGER,
     flags_after INTEGER,
-    fixes INTEGER
+    fixes INTEGER,
+    search_started_at TEXT,        -- Bazarr er bedt om at søge efter dansk (søgningen er ikke vurderet endnu)
+    search_jobs TEXT,              -- id'er på Bazarrs søgejob, kommasepareret
+    search_at TEXT                 -- tidspunkt for en gyldig søgning (ingen tjeneste på pause før og efter)
 );
 CREATE TABLE IF NOT EXISTS spend (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -34,7 +37,14 @@ CREATE TABLE IF NOT EXISTS spend (
     output_tokens INTEGER,
     cost_usd REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS providers (
+    name TEXT PRIMARY KEY,         -- Bazarrs navn på tjenesten, fx "opensubtitlescom"
+    paused_since TEXT NOT NULL     -- første gang vi så den sat på pause (i træk)
+);
 """
+
+# Kolonner tilføjet efter første version. Ældre databaser får dem automatisk, uden at miste rækker.
+NEW_COLUMNS = {"items": {"search_started_at": "TEXT", "search_jobs": "TEXT", "search_at": "TEXT"}}
 
 
 def now() -> datetime:
@@ -57,7 +67,15 @@ class Database:
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._upgrade()
         self.conn.commit()
+
+    def _upgrade(self) -> None:
+        for table, columns in NEW_COLUMNS.items():
+            existing = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+            for name, kind in columns.items():
+                if name not in existing:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
 
     def get(self, key: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM items WHERE key = ?", (key,)).fetchone()
@@ -78,6 +96,16 @@ class Database:
 
     def with_status(self, status: str) -> list[sqlite3.Row]:
         return list(self.conn.execute("SELECT * FROM items WHERE status = ?", (status,)))
+
+    def track_paused(self, paused: list[str], when: datetime | None = None) -> dict[str, datetime]:
+        """Husk hvornår hver tjeneste blev sat på pause. Returnerer navn -> siden hvornår (kun dem på pause nu)."""
+        when = when or now()
+        self.conn.execute(f"DELETE FROM providers WHERE name NOT IN ({', '.join('?' for _ in paused)})", tuple(paused))
+        for name in paused:
+            self.conn.execute("INSERT OR IGNORE INTO providers (name, paused_since) VALUES (?, ?)", (name, iso(when)))
+        self.conn.commit()
+        rows = self.conn.execute("SELECT name, paused_since FROM providers").fetchall()
+        return {r["name"]: datetime.fromisoformat(r["paused_since"]) for r in rows}
 
     def add_spend(self, item_key: str | None, input_tokens: int, output_tokens: int, cost: float) -> None:
         self.conn.execute(

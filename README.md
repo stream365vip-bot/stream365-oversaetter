@@ -8,17 +8,18 @@ Hvert kvarter gør programmet dette:
 
 1. Spørger Bazarr, hvilke film og afsnit der mangler danske undertekster.
 2. Vælger kun:
-   - film og serier, som nogen har ønsket via **Seerr** – når filen har ligget i mindst 1 time (så Bazarr selv har haft tid til at finde danske undertekster), og
-   - afsnit af serier, der har mærket **oversaet** i Sonarr – når afsnittet har ligget i mindst 48 timer.
+   - film og serier/sæsoner, som nogen har ønsket via **Seerr** (programmet spørger Seerr direkte), og
+   - film med mærket **oversaet** i Radarr og afsnit af serier med mærket **oversaet** i Sonarr.
 3. Springer over, hvis der allerede findes danske undertekster (som fil eller inde i videoen).
-4. Finder de engelske undertekster og beder Bazarr oversætte dem til dansk (Bazarr bruger Lingarr og Claude Haiku).
-5. Når den danske fil er klar, bliver den tjekket:
+4. Sørger for en **gyldig søgning**: beder Bazarr søge efter dansk til netop det emne og tjekker, at ingen af Bazarrs undertekst-tjenester var sat på pause lige før eller lige efter. Fandt søgningen dansk, er der intet at gøre.
+5. Fandt en gyldig søgning ikke dansk, findes de engelske undertekster, og Bazarr bedes oversætte dem til dansk med det samme (Bazarr bruger Lingarr og Claude Haiku).
+6. Når den danske fil er klar, bliver den tjekket:
    - **Gratis kontrol** af hver replik (engelske rester, norske/svenske ord, kendte forkerte ord som "bestie" og "please", for lange linjer, manglende tal osv.).
    - **Korrektur med korrekturmodellen** (standard Claude Opus), som kun retter rigtige fejl.
    - Bazarrs linje "Subtitles translated with ..." erstattes med **"Oversat af Claude for ≋"**.
-6. Husker i en lille database, hvad der er lavet, så intet bliver oversat to gange.
+7. Husker i en lille database, hvad der er lavet, så intet bliver søgt eller oversat to gange.
 
-Programmet ændrer ingen indstillinger i Bazarr, Lingarr, Radarr, Sonarr eller Seerr, sletter aldrig filer og rører kun den nye danske undertekstfil.
+Programmet ændrer ingen indstillinger i Bazarr, Lingarr, Radarr, Sonarr eller Seerr, sletter aldrig filer og rører kun den nye danske undertekstfil. Ud over oversættelsen beder det kun Bazarr om to ting: at søge efter dansk til et bestemt emne, og at synkronisere med Radarr/Sonarr, når der er kommet noget nyt med mærket **oversaet**, som Bazarr ikke kender endnu (højst én gang pr. runde).
 
 Udgifterne til korrekturen har et loft (standard 5 dollars om måneden). Når loftet er nået, bliver Haikus oversættelse gemt uden korrektur.
 
@@ -80,13 +81,16 @@ sudo docker logs -f oversaetter
 Tryk `Ctrl+C` for at stoppe visningen (programmet kører videre). Hver linje er én hændelse, fx:
 
 ```
-2026-10-16 20:15:00 INFO Bazarr melder 3 film og 9 afsnit på wanted-listen (heraf 2 film og 2 afsnit uden dansk)
-2026-10-16 20:15:00 INFO Eksempel: Filmnavn - valgt (Seerr) fra ekstern engelsk: Filmnavn.en.srt
-2026-10-16 20:15:00 INFO Eksempel: Anden film - venter på forsinkelse, 23 min tilbage
-2026-10-16 20:15:00 INFO Eksempel: Serie 1x02 - ikke Seerr-ønske og mangler mærket oversaet
-2026-10-16 20:15:00 INFO Runde: 4 mangler dansk, 1 kandidater, 2 venter på forsinkelse, 1 ikke valgt, ...
-2026-10-16 20:15:00 INFO Beder Bazarr oversætte Filmnavn (Seerr, forsøg 1) fra ekstern engelsk: Filmnavn.en.srt
-2026-10-16 20:31:12 INFO Færdig: Filmnavn - flag før: 23, flag efter: 2, rettelser fra korrektur: 41, korrekturmodel: claude-opus-5-5, pris: 0.3100 USD, ...
+2026-10-17 20:15:00 INFO Søger nu efter dansk til Ny film (Seerr, ingen gyldig søgning endnu)
+2026-10-17 20:15:40 INFO Bazarr melder 4 film og 9 afsnit på wanted-listen (heraf 4 film og 2 afsnit uden dansk)
+2026-10-17 20:15:40 INFO Eksempel: Ny film - søger nu (Seerr)
+2026-10-17 20:15:40 INFO Eksempel: Filmnavn - gyldig søgning fandt ikke dansk - oversætter (Seerr, ekstern engelsk: Filmnavn.en.srt)
+2026-10-17 20:15:40 INFO Eksempel: Anden film - gyldig søgning fandt dansk - intet at gøre
+2026-10-17 20:15:40 INFO Eksempel: Tredje film - venter: OpenSubtitles er sat på pause til ca. kl. 22:30
+2026-10-17 20:15:40 INFO Eksempel: Serie 1x02 - ikke Seerr-ønske og mangler mærket oversaet
+2026-10-17 20:15:40 INFO Runde: 6 mangler dansk, 1 oversættes, 1 søgt nu, 1 venter, 1 fandt dansk ved søgning, 1 ikke valgt, ...
+2026-10-17 20:15:40 INFO Gyldig søgning fandt ikke dansk - beder Bazarr oversætte Filmnavn (Seerr, forsøg 1) fra ekstern engelsk: Filmnavn.en.srt
+2026-10-17 20:31:12 INFO Færdig: Filmnavn - flag før: 23, flag efter: 2, rettelser fra korrektur: 41, korrekturmodel: claude-opus-5-5, pris: 0.3100 USD, ...
 ```
 
 Hver runde viser først Bazarrs egne tal og op til 5 eksempler på, hvorfor noget blev valgt eller fravalgt. Ser du
@@ -94,10 +98,12 @@ Hver runde viser først Bazarrs egne tal og op til 5 eksempler på, hvorfor noge
 - `Bazarr melder ingen film eller afsnit, der mangler dansk` – tjek at dansk er med i sprogprofilen i Bazarr.
 - `Bazarr svarede med HTTP 401` (eller Radarr/Sonarr/Seerr) – API-nøglen i `.env` er forkert.
 - `Bazarr svarede ikke inden for ... (timeout)` eller `kunne ikke forbinde` – adressen i `.env` er forkert, eller tjenesten kører ikke.
+- `venter: OpenSubtitles er sat på pause til ca. kl. 22:30` – Bazarr har sat en undertekst-tjeneste på pause (for mange kald, nede eller kvote brugt). Der søges og oversættes ikke, før alle aktiverede tjenester er tilbage. Andre grunde i loggen: `venter på at søgning bliver færdig` (Bazarr arbejder stadig på søgningen) og `søgningen tæller ikke` (en tjeneste blev sat på pause under søgningen).
+- `OpenSubtitles har været sat på pause i over 24 timer - overvej at slå den fra i Bazarr` – tjenesten blokerer alle nye oversættelser. Slå den fra i Bazarr under Settings → Providers, eller ret årsagen (fx login eller kvote).
 
 ## Prøvetilstand (DRY_RUN)
 
-Programmet starter i prøvetilstand (`DRY_RUN=true`). Så skriver det kun i loggen, hvad det **ville** gøre – det beder ikke Bazarr oversætte og skriver ingen filer.
+Programmet starter i prøvetilstand (`DRY_RUN=true`). Så læser det kun (tjenestestatus, wanted-listen, Seerr og mærker) og skriver i loggen, hvad det **ville** gøre ("ville søge nu", "ville oversætte nu", "ville bede Bazarr synkronisere") – det beder ikke Bazarr søge, synkronisere eller oversætte og skriver ingen filer.
 
 Når loggen ser rigtig ud, slår du prøvetilstanden fra:
 
@@ -119,6 +125,15 @@ sudo docker exec oversaetter python -m oversaetter test \
 Resultatet ligger derefter i `/opt/oversaetter/data/film-test.da.srt` og rapporten i `/opt/oversaetter/data/film-test.da.srt.rapport.txt`. Rapporten viser korrekturmodellen, antal fejl før og efter, antal rettelser fra korrektur og prisen. Prisen tæller med i månedens budget.
 
 ## Indstillinger og beslutninger
+
+- **Hvornår der oversættes** (besluttet af Jesper 17.10.2026). Erstatter de gamle regler med ventetider på 30 min (Seerr), 48 t (mærket) og 24 t (første gang set):
+  1. Kunder ønsker film og serier i Seerr. Seerr sætter kundens Plex-brugernavn som mærke i Radarr/Sonarr, men det mærke bruges ikke af programmet. Programmet spørger Seerr direkte, om noget er ønsket.
+  2. Seerr-ønsker (film og serier/sæsoner): Bazarr søger først efter dansk tekst. Finder en gyldig søgning ingen dansk tekst, oversættes der straks.
+  3. Film med Radarr-mærket **oversaet** og serier med Sonarr-mærket **oversaet**: samme regel. Der søges straks og oversættes straks, hvis en gyldig søgning ikke finder dansk. Ingen ventetid på 48 timer.
+  4. Der oversættes **aldrig** uden en gyldig søgning. En søgning er kun gyldig, hvis ingen af Bazarrs aktiverede undertekst-tjenester var sat på pause (throttled, nede, kvote overskredet) hverken lige før eller lige efter søgningen.
+
+  Har en tjeneste været sat på pause i over 24 timer i træk, skrives en advarsel i hver runde. Der oversættes stadig ikke. `SEERR_DELAY_MINUTES`, `TAG_DELAY_HOURS` og `FIRST_SEEN_DELAY_HOURS` bruges ikke længere. Står de i `.env`, ignoreres de (med én INFO-linje ved start).
+- **Søgninger**: Programmet venter højst `SEARCH_TIMEOUT_MINUTES` (standard 10) på Bazarrs søgning. Bliver den ikke færdig, ses der på den igen i næste runde. Der startes højst `MAX_SEARCHES_PER_ROUND` (standard 10) nye søgninger pr. runde, så tjenesterne ikke bliver overbelastet, når mange emner kommer på én gang.
 
 - **Korrekturmodel: Claude Opus 5.5 med effort medium** (`PROOFREAD_MODEL=claude-opus-5-5`, `PROOFREAD_EFFORT=medium`, pris 4/20 USD pr. million tokens ind/ud). Valgt efter test på *Do Not Enter* (2026):
 

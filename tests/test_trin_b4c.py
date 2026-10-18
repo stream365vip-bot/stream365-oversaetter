@@ -63,7 +63,7 @@ def test_lyrics_are_dropped():
 
 def test_lyrics_line_in_mixed_cue():
     r = cleaned("♪ Oh say can you see\n- Where are we?")
-    assert [c.text for c in r.cues] == ["Where are we?"]
+    assert [c.text for c in r.cues] == []  # trin B4d: én sanglinje dropper hele replikken
 
 
 def test_lyrics_kept_with_drop_lyrics_false():

@@ -216,7 +216,7 @@ def _is_music(line: str, drop_lyrics: bool = True) -> bool:
     """Linjen består kun af ♪/# eller er en sanglinje markeret med ♪ ... ♪ (eller # ... #).
 
     drop_lyrics (DROP_LYRICS, trin B4c): også linjer, der kun starter eller kun slutter med ♪/#
-    ("♪ Oh say can you see").
+    ("♪ Oh say can you see"). Har én linje i en replik det, droppes hele replikken (trin B4d).
     """
     p = _plain(line).strip()
     p = re.sub(r"^-\s*", "", p)
@@ -240,9 +240,22 @@ def _name(raw: str) -> str:
     return raw.capitalize()  # "MAN ON RADIO" -> "Man on radio"
 
 
+def _two_speakers(lines: list[str], speakers: list[str | None]) -> bool:
+    """To eller flere forskellige talernavne (trin B4c) - eller to linjer, hvor kun den ene har et talernavn: så er
+    den anden linje en anden taler (trin B4d). Står navnet på første linje, og fortsætter sætningen på anden linje
+    (ingen . ! ? … til sidst), er det samme taler."""
+    if len(lines) < 2:
+        return False
+    if len({s for s in speakers if s}) >= 2:
+        return True
+    if len(lines) != 2 or (speakers[0] is None) == (speakers[1] is None):
+        return False
+    return speakers[1] is not None or _plain(lines[0]).rstrip().endswith((".", "!", "?", "…", '"'))
+
+
 def _add_dashes(lines: list[str], speakers: list[str | None]) -> list[str]:
-    """To eller flere forskellige talernavne i replikken: "- " foran hver linje uden streg (trin B4c)."""
-    if len(lines) < 2 or len({s for s in speakers if s}) < 2:
+    """Flere talere i replikken (se _two_speakers): "- " foran hver linje uden streg (trin B4c/B4d)."""
+    if not _two_speakers(lines, speakers):
         return lines
     out = []
     for line in lines:
@@ -260,6 +273,9 @@ def _clean_cue(text: str, stats: HiStats, drop_lyrics: bool = True) -> tuple[lis
     if len(lines) > 1 and whole and whole[0] in MUSIC and whole[-1] in MUSIC:
         stats.music += len([x for x in lines if _plain(x).strip()])
         lines = []  # sang over flere linjer: ♪ første linje / anden linje ♪
+    elif drop_lyrics and any(_is_music(x) for x in lines):
+        stats.music += len([x for x in lines if _plain(x).strip()])
+        lines = []  # én sanglinje i replikken: hele replikken er sang ("♪ Twinkle, twinkle / og klare stjerner", B4d)
     out: list[str] = []
     speakers: list[str | None] = []
     carry = ""  # tags fra en droppet linje (fx "<i>"), der flyttes til næste linje
@@ -310,6 +326,7 @@ def clean(cues: list[Cue], quiet: bool = False, drop_lyrics: bool = True) -> HiR
     """Rens den engelske kilde. Logger tallene én gang, hvis der blev fjernet noget (ikke med quiet=True).
 
     drop_lyrics=False (DROP_LYRICS=false): kun linjer med kun ♪/# eller ♪ ... ♪ fjernes, som før trin B4c.
+    drop_lyrics=True: har én linje i en replik ♪/# i starten eller slutningen, droppes hele replikken (trin B4d).
     """
     stats = HiStats()
     out: list[Cue] = []

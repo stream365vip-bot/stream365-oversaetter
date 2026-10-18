@@ -109,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
     o.add_argument("--tmdb-id", help="TMDB-id til konteksten, fx 12345 (film) eller tv:12345 (serie)")
     o.add_argument("--parallel", type=int, default=1, help="så mange bidder samtidig (standard 1)")
     o.add_argument("--hi", choices=("on", "off"), default="on", help="rens HI/SDH-kilden før bidderne (standard on)")
+    o.add_argument("--vis-kontekst", action="store_true", help="skriv filmkonteksten og ordlisten øverst i rapporten")
     args = parser.parse_args(argv)
 
     cfg = Config.from_env()
@@ -130,6 +131,7 @@ def main(argv: list[str] | None = None) -> int:
             tmdb_id=args.tmdb_id,
             parallel=args.parallel,
             hi_clean=args.hi == "on",
+            show_context=args.vis_kontekst,
         )
     from .runner import main as run_main
 

@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
+
+from .checks import SWEARS_AND_EXCLAMATIONS
 
 log = logging.getLogger("oversaetter")
 
@@ -54,10 +57,11 @@ whole English subtitle text. Make a glossary that a team of translators will fol
 - "terms": at most {MAX_TERMS} names, nicknames, insults/epithets, places, organisations, recurring expressions and \
 slang, each with how it must be written in Danish subtitles ("da") and a short "note" (e.g. "name, keep", \
 "nickname", "slang: cool"). Names of people, places, companies and brands stay unchanged (da = en). Nicknames and \
-epithets with a meaning are translated when a Danish viewer would otherwise miss the point. English swear words, \
-insults, slang and forms of address ALWAYS get a Danish translation in the list (bitch/bitches -> kælling/kællinger, \
-dude -> mand, holy shit -> hold da kæft) and are never marked "keep". Only proper names (people, places, companies, \
-groups, shows, brands) may stay untranslated.
+epithets with a meaning are translated when a Danish viewer would otherwise miss the point. English insults, \
+slang and forms of address ALWAYS get a Danish translation in the list (bitch/bitches -> kælling/kællinger, \
+dude -> mand) and are never marked "keep". Only proper names (people, places, companies, groups, shows, brands) may \
+stay untranslated. Swear words, exclamations and filler words are NEVER terms (shit, fuck, damn, hell, holy shit, \
+Jesus, oh my God, okay, yeah, man, hey ...): the translators vary them by context.
 - "address": for pairs of characters, how they address each other in Danish: "du" (normal) or "De" (only very \
 formal: royalty, servants to masters, period drama).
 - "tone": one line about tone and register (e.g. "rå teenagekomedie, meget bandeord").
@@ -101,8 +105,14 @@ def _text(value) -> str:
     return " ".join(str(value).split()) if isinstance(value, str) else ""
 
 
+def is_swear_or_exclamation(en: str) -> bool:
+    """Termen er et bandeord, udbrud eller fyldord (checks.SWEARS_AND_EXCLAMATIONS) - de filtreres fra (trin B4d)."""
+    return " ".join(re.sub(r"[^\w' ]", " ", en.lower()).split()) in SWEARS_AND_EXCLAMATIONS
+
+
 def parse(text: str) -> Wordlist:
-    """Læs svaret (tåler ```json-hegn). Ugyldige termer springes over. Rejser ValueError ved ugyldig JSON."""
+    """Læs svaret (tåler ```json-hegn). Ugyldige termer og bandeord/udbrud springes over. Rejser ValueError ved
+    ugyldig JSON."""
     start, end = text.find("{"), text.rfind("}")
     if start < 0 or end < start:
         raise ValueError("intet JSON-objekt i svaret")
@@ -114,7 +124,7 @@ def parse(text: str) -> Wordlist:
         if not isinstance(t, dict):
             continue
         en, da = _text(t.get("en")), _text(t.get("da"))
-        if not en or not da or en.lower() in seen:
+        if not en or not da or en.lower() in seen or is_swear_or_exclamation(en):
             continue
         seen.add(en.lower())
         terms.append({"en": en, "da": da, "note": _text(t.get("note"))})

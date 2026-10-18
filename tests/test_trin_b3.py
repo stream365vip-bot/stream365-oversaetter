@@ -71,7 +71,7 @@ def test_glossary_prompt_demands_danish_slang():
     for part in (
         "bitch/bitches -> kælling/kællinger",
         "dude -> mand",
-        "holy shit -> hold da kæft",
+        "Swear words, exclamations and filler words are NEVER terms",  # trin B4d: holy shit er ikke en term
         'never marked "keep"',
     ):
         assert part in ordliste.PROMPT

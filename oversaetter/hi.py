@@ -334,7 +334,7 @@ def clean(cues: list[Cue], quiet: bool = False, drop_lyrics: bool = True) -> HiR
     names: dict[str, None] = {}
     for c in cues:
         lines, speakers = _clean_cue(c.text, stats, drop_lyrics)
-        if not lines:
+        if not any(ch.isalnum() for ch in _plain("".join(lines))):  # tom, eller kun '" "', "...", "-" (trin B4e)
             stats.dropped += 1
             continue
         out.append(replace(c, text="\n".join(lines)))

@@ -60,7 +60,10 @@ slang, each with how it must be written in Danish subtitles ("da") and a short "
 epithets with a meaning are translated when a Danish viewer would otherwise miss the point. English insults, \
 slang and forms of address ALWAYS get a Danish translation in the list (bitch/bitches -> kælling/kællinger, \
 dude -> mand) and are never marked "keep". Only proper names (people, places, companies, groups, shows, brands) may \
-stay untranslated. Swear words, exclamations and filler words are NEVER terms (shit, fuck, damn, hell, holy shit, \
+stay untranslated. Organisations and places are written with the Danish spelling when one exists: Taliban -> \
+Taleban, Hezbollah -> Hizbollah, Al Qaeda -> al-Qaeda, Tehran -> Teheran. Slang short forms of such names (e.g. \
+"Tali") get the Danish name (Taleban), they are never kept. Swear words, exclamations and filler words are \
+NEVER terms (shit, fuck, damn, hell, holy shit, \
 Jesus, oh my God, okay, yeah, man, hey ...): the translators vary them by context.
 - "address": for pairs of characters, how they address each other in Danish: "du" (normal) or "De" (only very \
 formal: royalty, servants to masters, period drama).

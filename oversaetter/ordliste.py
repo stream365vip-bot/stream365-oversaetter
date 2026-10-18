@@ -54,7 +54,10 @@ whole English subtitle text. Make a glossary that a team of translators will fol
 - "terms": at most {MAX_TERMS} names, nicknames, insults/epithets, places, organisations, recurring expressions and \
 slang, each with how it must be written in Danish subtitles ("da") and a short "note" (e.g. "name, keep", \
 "nickname", "slang: cool"). Names of people, places, companies and brands stay unchanged (da = en). Nicknames and \
-epithets with a meaning are translated when a Danish viewer would otherwise miss the point.
+epithets with a meaning are translated when a Danish viewer would otherwise miss the point. English swear words, \
+insults, slang and forms of address ALWAYS get a Danish translation in the list (bitch/bitches -> kælling/kællinger, \
+dude -> mand, holy shit -> hold da kæft) and are never marked "keep". Only proper names (people, places, companies, \
+groups, shows, brands) may stay untranslated.
 - "address": for pairs of characters, how they address each other in Danish: "du" (normal) or "De" (only very \
 formal: royalty, servants to masters, period drama).
 - "tone": one line about tone and register (e.g. "rå teenagekomedie, meget bandeord").

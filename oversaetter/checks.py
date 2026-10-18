@@ -335,6 +335,7 @@ FLAG_TEXT = {
     "english_word": "contains an English word",
     "reading_speed": "too many characters per second on screen - make it shorter",  # kun information
     "inconsistent_term": "a glossary term is translated differently from the film glossary",
+    "mixed_case": "a made-up word with a capital letter inside it (e.g. 'sundhedsTHC') - translate the meaning",
 }
 
 
@@ -473,6 +474,8 @@ def check_cue(
             flags.append("reading_speed")
         if en and inconsistent_term(da, en, glossary):
             flags.append("inconsistent_term")
+        if mixed_case(da):
+            flags.append("mixed_case")
     return flags
 
 
@@ -597,7 +600,23 @@ ENGLISH_ONLY = {
     "ma'am",
     "buddy",
     "girl",
+    # udbrud, skældsord og kæleord (trin B3: blev stående uden flag i test16)
+    "damn",
+    "gosh",
+    "jeez",
+    "seriously",
+    "literally",
+    "babe",
+    "sweetie",
+    "honey",
+    "bastard",
+    "asshole",
+    "jerk",
+    "loser",
+    "losers",
 }
+# Engelske ord, der kun flages i bestemte vendinger: "shit" alene er tilladt, "holy shit" er ikke.
+ENGLISH_PHRASE_RE = re.compile(r"\bholy\s+shit\b|\bhell\s*!|\bwhat\s+the\s+hell\b", re.IGNORECASE)
 DANISH_APOSTROPHE_ENDINGS = {"en", "et", "s", "er", "erne", "ene", "ens", "ets"}
 # Titler flages også, når ordlisten har navnet uændret ("Mr. Vice" -> "Mr. Vice" skal være "hr. Vice").
 TITLES = {"mr", "mrs", "miss", "sir", "ma'am"}
@@ -764,15 +783,31 @@ def capitalized_weekday(da: str) -> bool:
     return False
 
 
+def _proper_names(glossary) -> list[str]:
+    """Ordlisteudtryk, der er egennavne: samme engelske og danske form og stort begyndelsesbogstav (trin B3)."""
+    out = []
+    for t in _glossary_terms(glossary):
+        en = t["en"].strip()
+        if en and en == t["da"].strip() and en[0].isupper():
+            out.append(en)
+    return sorted(out, key=len, reverse=True)
+
+
 def english_word(da: str, en: str = "", glossary=None) -> bool:
-    names = _glossary_names(glossary) - TITLES
-    for w in _words(da):
+    text = plain(da)
+    if ENGLISH_PHRASE_RE.search(text):
+        return True
+    # Egennavne fra ordlisten fjernes før tjekket ("The Paragon"), men titler i dem bliver stående ("Mr. Vice").
+    for name in _proper_names(glossary):
+        titles = " ".join(w for w in WORD_RE.findall(name) if w.lower() in TITLES)
+        text = re.sub(rf"(?<!\w){re.escape(name)}(?!\w)", f" {titles} ", text)
+    for w in _words(text):
         base, _, ending = w.partition("'")
         if ending in DANISH_APOSTROPHE_ENDINGS:
             w = base  # "crew'et", "bitch'en"
-        if w in ENGLISH_ONLY and w not in ENGLISH_ALLOWED and w not in names:
+        if w in ENGLISH_ONLY and w not in ENGLISH_ALLOWED:
             return True
-    return bool(ENGLISH_MAN_RE.search(plain(da)))
+    return bool(ENGLISH_MAN_RE.search(text))
 
 
 def reading_speed(da: str, en: str, duration_ms: int, max_cps: float = MAX_CPS) -> bool:
@@ -785,14 +820,23 @@ def reading_speed(da: str, en: str, duration_ms: int, max_cps: float = MAX_CPS) 
     return len(text) >= len(plain(en).replace("\n", " ").strip())
 
 
-def _stem(word: str) -> str:
+def _stems(word: str) -> set[str]:
+    """De første 4 bogstaver af ordet - også uden det tabte e (regel/reglen/reglerne/regler regnes som ens)."""
     w = word.lower()
-    return w[: max(3, len(w) - 2)] if len(w) > 4 else w
+    forms = {w}
+    m = re.match(r"^(.{2,}?)e([lnr])(\w*)$", w)
+    if m:
+        forms.add(m.group(1) + m.group(2) + m.group(3))
+    return {f[:4] for f in forms}
 
 
 def inconsistent_term(da: str, en: str, glossary=None) -> bool:
-    """Et ordlisteterm i den engelske replik er oversat anderledes end ordlistens danske form."""
-    da_low = plain(da).lower()
+    """Et ordlisteterm i den engelske replik er oversat anderledes end ordlistens danske form.
+
+    Trin B3: en bøjning tæller som den samme form (samme 4 første bogstaver), og et ord flages kun én gang pr.
+    replik, så gentagelse inden for replikken aldrig giver et flag.
+    """
+    da_stems = set().union(*(_stems(w) for w in _words(da))) if _words(da) else set()
     en_low = plain(en).lower()
     for t in _glossary_terms(glossary):
         src, dst = t["en"].lower(), t["da"].lower()
@@ -800,7 +844,28 @@ def inconsistent_term(da: str, en: str, glossary=None) -> bool:
             continue  # navne, der står uændret, tjekkes ikke her
         if not re.search(rf"(?<![\w]){re.escape(src)}(?![\w])", en_low):
             continue
-        if _stem(dst) not in da_low:
+        words = _words(dst)
+        long_words = [w for w in words if len(w) >= 4] or words
+        if not all(_stems(w) & da_stems for w in long_words):
+            return True
+    return False
+
+
+MIXED_CASE_RE = re.compile(r"[a-zæøåäöüé][A-ZÆØÅÄÖÜ]")
+
+
+def mixed_case(da: str) -> bool:
+    """Et opfundet ord med stort bogstav inde i ordet efter små ("sundhedsTHC").
+
+    Fritaget: ord, der starter med stort (navne som OnlyFans, YouTube, og forkortelser som THC, JD's), ord med ét
+    stort bogstav som andet tegn (iPhone, eBay) og bindestreg før det store bogstav (sundheds-THC).
+    """
+    for w in WORD_RE.findall(plain(da)):
+        if w[0].isupper():
+            continue
+        if sum(c.isupper() for c in w) == 1 and w[1:2].isupper():
+            continue
+        if MIXED_CASE_RE.search(w):
             return True
     return False
 

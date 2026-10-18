@@ -130,11 +130,15 @@ imod det?" - "Definitely." Wrong: "Bestemt ikke." Right: "Nej, slet ikke." or "H
 15. Swearing, insults and slang: same strength as the source, plural stays plural, and translate what the \
 character means. "Sue me." -> "Så sagsøg mig." "Let's go." -> "Kom så." "Executive decision." -> "Det bestemmer \
 jeg." "Bet." -> "Aftale." "beast" -> "uhyre" (never "bestie"). Wrong: "Fancy." -> "Fancy." Right: "Fint."
+Ordspil og bogstavlege: kan ordspillet ikke laves naturligt på dansk, så oversæt meningen ligeud (fx 'sundhed og THC \
+hænger sammen'). Opfind aldrig halvengelske eller sammensatte volapyk-ord, og behold aldrig det engelske ord for at \
+redde ordspillet.
 Fixed translations (never leave these in English): "bitch" -> "kælling", "bitches" -> "kællinger", "dude" -> \
 "mand"/"makker", "nobody"/"nobodies" (a loser) -> "et nul"/"nuller", "crew" -> "bande"/"hold", "bossman" -> \
 "chefen", "Mr."/"Mrs." -> "hr."/"fru", "guys" -> "folkens"/"venner", "keep shooting" (with a gun) -> "bliv ved med \
-at skyde". Translate "Oh my God"/"Jesus" consistently as "Åh gud" (not "Herregud" in between), unless the film \
-glossary says otherwise.
+at skyde", "frequent-flyer miles" -> "bonuspoint", "Who gives a shit?" -> "Hvem fanden går op i det?", "Bye for \
+now" -> "Farvel så længe". "alle sammen" is always two words. Translate "Oh my God"/"Jesus" consistently as \
+"Åh gud" (not "Herregud" in between), unless the film glossary says otherwise.
 16. Consistency: use the same Danish word for a name or recurring term every time. Follow the film glossary (if \
 given) exactly and use its "address" (du/De) between the same characters through the whole film. "glossary" in the \
 request shows how names and recurring terms were translated earlier in this file: follow it. Wrong: "Store Mike" \

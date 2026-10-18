@@ -256,6 +256,13 @@ Skriv nøglen i filen med `sudo nano` (kun nøglen, én linje). Mangler en nøgl
 
   **Anbefalede værdier (står i `.env.example`):** `PROMPT_VERSION=v4`, `CONTEXT=on`, `GLOSSARY=on`, `PARALLEL=4`, `READING_SPEED_MAX=25`, `PROMPT_CACHE=true`. Mangler `PROMPT_VERSION`, `CONTEXT`, `GLOSSARY` eller `PARALLEL` helt i `.env`, bruger programmet stadig de gamle værdier (v3, off, off, 1).
 
+- **Trin B3: rettelser efter test16** (18.10.2026).
+
+  1. **Ordlisten fritager kun egennavne**: ordliste-prompten kræver dansk oversættelse af engelske bandeord, skældsord, slang og tiltaleord (bitches → kællinger, dude → mand, holy shit → hold da kæft). `english_word` fritager kun ordlisteudtryk med samme engelske og danske form, der starter med stort bogstav ("The Paragon"). Nye ord: damn, gosh, jeez, seriously, literally, babe, sweetie, honey, bastard, asshole, jerk, loser(s), samt "holy shit", "hell!" og "what the hell" ("shit" alene må stadig stå).
+  2. **Ordspil**: prompt v4 siger, at et ordspil, der ikke kan laves på dansk, oversættes ligeud. Nyt rettelsesflag `mixed_case` flager opfundne ord som "sundhedsTHC" (ikke THC, JD's, iPhone, eBay, sundheds-THC eller ord, der starter med stort, som OnlyFans og YouTube).
+  3. **Flere faste oversættelser** i prompt v4: frequent-flyer miles → bonuspoint, "Who gives a shit?" → "Hvem fanden går op i det?", "Bye for now" → "Farvel så længe", og "alle sammen" i to ord.
+  4. **`inconsistent_term` er mindre følsom**: en bøjning af ordlistens danske form tæller som den samme (de første 4 bogstaver, så regel/reglen/reglerne/regler er ens), og gentagelse i samme replik flages aldrig.
+
 ## Hvis noget går galt
 
 - Mislykkes en oversættelse, prøves den igen ved næste runde. Går det galt igen, markeres den som "fejlet" og prøves ikke igen automatisk.

@@ -170,6 +170,7 @@ class Bazarr(_Api):
             path, params = "/api/movies/subtitles", {"radarrid": media_id}
         else:
             path, params = "/api/episodes/subtitles", {"seriesid": series_id, "episodeid": media_id}
+        # Altid hi=false: vores danske tekst er almindelig, også når den engelske kilde var HI (trin B4f).
         form = {"language": "da", "forced": "false", "hi": "false"}
         files = {"file": (filename, content, "application/x-subrip")}
         self._request("POST", path, params, timeout_s, data=form, files=files)
@@ -233,6 +234,9 @@ class Radarr(_Api):
 
     def movies(self) -> list[dict]:
         return self.get("/api/v3/movie")
+
+    def by_tmdb(self, tmdb_id: int) -> list[dict]:
+        return self.get("/api/v3/movie", {"tmdbId": tmdb_id})
 
     def tags(self) -> list[dict]:
         return self.get("/api/v3/tag")

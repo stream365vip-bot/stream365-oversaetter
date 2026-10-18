@@ -110,6 +110,15 @@ class Database:
             self.conn.execute(f"UPDATE items SET {sets} WHERE key = ?", (*fields.values(), key))
         self.conn.commit()
 
+    def find_title(self, title: str) -> list[sqlite3.Row]:
+        """Rækker med netop denne titel (uden forskel på store og små bogstaver)."""
+        return list(self.conn.execute("SELECT * FROM items WHERE lower(title) = lower(?)", (title.strip(),)))
+
+    def delete(self, key: str) -> None:
+        """Slet emnets række (med ordlisten), så næste runde behandler det forfra (`glem`, trin B4f)."""
+        self.conn.execute("DELETE FROM items WHERE key = ?", (key,))
+        self.conn.commit()
+
     def with_status(self, status: str) -> list[sqlite3.Row]:
         return list(self.conn.execute("SELECT * FROM items WHERE status = ?", (status,)))
 

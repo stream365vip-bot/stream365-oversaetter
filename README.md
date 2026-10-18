@@ -187,6 +187,18 @@ Nøgler:
 
 Skriv nøglen i filen med `sudo nano` (kun nøglen, én linje). Mangler en nøgle, stopper kun testtilstanden med en dansk besked – driften kører videre.
 
+## Kør en film forfra: glem
+
+`glem` sletter filmens række i databasen (med dens gemte ordliste), så næste runde behandler den, som om den var ny (trin B4f). Bazarr og filerne røres ikke – en dansk fil, der allerede ligger ved filmen, bliver liggende, og så ser næste runde blot, at der er dansk. Slet den danske fil i Bazarr først, hvis filmen skal oversættes igen.
+
+```bash
+sudo docker exec oversaetter python -m oversaetter glem "Idiots"
+sudo docker exec oversaetter python -m oversaetter glem 12345      # TMDB-id (slås op i Radarr)
+sudo docker exec oversaetter python -m oversaetter glem movie:12   # nøglen fra loggen
+```
+
+Loggen viser, hvad der blev slettet. Passer titlen på flere rækker, slettes intet, og nøglerne vises.
+
 ## Indstillinger og beslutninger
 
 - **Hvornår der oversættes** (besluttet af Jesper 17.10.2026). Erstatter de gamle regler med ventetider på 30 min (Seerr), 48 t (mærket) og 24 t (første gang set):

@@ -119,7 +119,8 @@ ikke tid", 13 "til at vente."
 10. Keep <i>...</i> and speaker dashes: "-" at the start of both lines when the source has them. Wrong: "<i>Hvor \
 er du?" Right: "<i>Hvor er du?</i>"
 11. Numbers keep their value. Digits stay digits, numbers written as words become Danish words. Wrong: "three \
-days" -> "3 dage". Right: "tre dage".
+days" -> "3 dage". Right: "tre dage". Convert measurements to metric units, as Danish subtitles do: miles -> \
+kilometer, feet -> meter, pounds -> kilo, Fahrenheit -> Celsius. Round naturally ("five miles" -> "otte kilometer").
 12. Names of people, places, companies, groups, shows and brands stay unchanged. Song lyrics and signs are \
 translated unless they are names. Wrong: "John" -> "Jens". Right: "John".
 13. Other foreign languages in the source (French, Spanish ...) stay exactly as written. Wrong: "Merci." -> "Tak." \
@@ -141,7 +142,7 @@ now" -> "Farvel så længe", "checkpoint"/"checkpoints" -> "kontrolpost"/"kontro
 "karrieresoldat", "Copy." (on the radio) -> "Modtaget." (every time, never "Forstået" in between), "Flight deck \
 to cockpit" -> "Flydæk til cockpit". "alle sammen" is always two words. Translate "Oh my God" consistently as \
 "Åh gud" (not "Herregud" in between) and "Jesus." (an exclamation) as "Jøsses." or "Åh gud.", unless the film \
-glossary says otherwise.
+glossary says otherwise. "Shit." or "Oh, shit." as a cue on its own -> "Pis." / "Åh, pis."
 16. Consistency: use the same Danish word for a name or recurring term every time. Follow the film glossary (if \
 given) exactly and use its "address" (du/De) between the same characters through the whole film. "glossary" in the \
 request shows how names and recurring terms were translated earlier in this file: follow it. Wrong: "Store Mike" \

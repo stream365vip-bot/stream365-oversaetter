@@ -316,6 +316,8 @@ NOT_NAMES = ENGLISH_WORDS | {
 WORD_RE = re.compile(r"[A-Za-zÆØÅæøåÄÖÜäöüé']+")
 # Tusindtalsseparator med mellemrum ("82 000", også hårdt/smalt mellemrum) hører med til tallet (trin B4d).
 NUMBER_RE = re.compile(r"\d+(?:[.,:]\d+|[ \u00a0\u202f]\d{3}(?!\d))*")
+# Mål, der omregnes til metriske enheder (prompt v4): så sammenlignes tal ikke (trin B4e).
+IMPERIAL_RE = re.compile(r"\b(?:miles?|feet|pounds?)\b|°\s*F\b", re.IGNORECASE)
 
 BAZARR_HEADER_RE = re.compile(r"^\s*#\s*subtitles translated with\b.*#\s*$", re.IGNORECASE | re.DOTALL)
 
@@ -465,7 +467,7 @@ def check_cue(
     if en:
         da_nums = _numbers(da)
         da_digits = re.sub(r"\D", "", plain(da))
-        if any(n not in da_nums and n not in da_digits for n in _numbers(en)):
+        if not IMPERIAL_RE.search(plain(en)) and any(n not in da_nums and n not in da_digits for n in _numbers(en)):
             flags.append("missing_number")
         if (
             _norm(da) == _norm(en)

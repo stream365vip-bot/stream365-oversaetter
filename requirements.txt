@@ -1,2 +1,4 @@
 # anthropic bringer selv httpx2 med, som også bruges til Bazarr/Radarr/Sonarr/Seerr.
 anthropic==1.15.0
+# Kun til testtilstanden oversaet-test (DeepSeek og Gemini via OpenAI-kompatible API'er).
+openai==3.35.1

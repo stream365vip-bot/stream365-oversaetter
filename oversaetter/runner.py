@@ -1,4 +1,4 @@
-"""Hovedløkken: find emner, sørg for en gyldig søgning, bed Bazarr oversætte, efterbehandl og gem status."""
+"""Hovedløkken: find emner, sørg for en gyldig søgning, oversæt (selv eller via Bazarr), og gem status."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import glob
 import logging
 import os
 import signal
+import subprocess
 import time
 from datetime import UTC, datetime, timedelta
 
@@ -15,6 +16,7 @@ from .clients import GET_TIMEOUT, ApiError, Bazarr, Radarr, Seerr, SeerrIndex, S
 from .config import Config
 from .credit import apply_credit
 from .db import Database, iso
+from .direct import CALL_TIMEOUT, DirectTranslator, NoEnglish, english_cues
 from .postprocess import make_client, postprocess
 from .proofread import DbBudget
 from .search import PAUSE_WARN, nice_name, paused_providers, search_jobs, unfinished, wait_for_jobs, waiting_text
@@ -42,8 +44,10 @@ class Runner:
         translate=request_translation,
         sleep=time.sleep,
         clock=time.monotonic,
+        run_cmd=subprocess.run,
     ):
         self.cfg = cfg
+        self.run_cmd = run_cmd  # ffprobe/ffmpeg (kan udskiftes i testene)
         self.db = db
         self.http = http or httpx.Client(timeout=httpx.Timeout(GET_TIMEOUT))
         self.bazarr = Bazarr(cfg, self.http)
@@ -339,6 +343,9 @@ class Runner:
                 log.warning("Samme fejl ramte %d emner: %s", count, msg)
 
     def process(self, cand: Candidate) -> None:
+        if self.cfg.direct:
+            self.process_direct(cand)
+            return
         if self.cfg.dry_run:
             log.info(
                 "DRY_RUN: ville oversætte nu: %s (%s, gyldig søgning fandt ikke dansk) fra %s til %s",
@@ -381,6 +388,77 @@ class Runner:
         self.finish(
             cand.key, cand.title, cand.media_type, cand.media_id, cand.video_path, cand.da_path, cand.source_path
         )
+        self.current = None
+
+    def process_direct(self, cand: Candidate) -> None:
+        """TRANSLATE_MODE=direct: oversæt selv med Claude og aflever filen til Bazarr."""
+        cfg = self.cfg
+        if cfg.dry_run:
+            try:
+                en, desc = english_cues(cand, self.run_cmd)
+            except NoEnglish as e:
+                log.info("DRY_RUN: %s - %s", cand.title, e)
+                return
+            log.info(
+                "DRY_RUN: ville oversætte %d replikker med %s: %s (%s, gyldig søgning fandt ikke dansk) fra %s",
+                len(en),
+                cfg.translate_model,
+                cand.title,
+                cand.reason,
+                desc,
+            )
+            return
+        if self.claude is None:
+            log.warning("%s oversættes ikke: ingen Anthropic-nøgle i %s", cand.title, cfg.anthropic_api_key_file)
+            return
+        budget = DbBudget(self.db)
+        if budget.spent() >= cfg.monthly_budget_usd:
+            log.warning(
+                "Månedens budget på %.2f USD er nået (brugt %.2f USD) - %s oversættes, når budgettet er der igen",
+                cfg.monthly_budget_usd,
+                budget.spent(),
+                cand.title,
+            )
+            return
+        self.current = (cand.key, cand.title)
+        row = self.db.get(cand.key)
+        attempts = (row["attempts"] if row else 0) + 1
+        self.db.upsert(
+            cand.key,
+            media_type=cand.media_type,
+            media_id=cand.media_id,
+            title=cand.title,
+            status="i_gang",
+            attempts=attempts,
+            video_path=cand.video_path,
+            source=cand.source_path or f"subtitles_id:{cand.subtitles_id}",
+            da_path=cand.da_path,
+            started_at=iso(),
+            reason=cand.reason,
+        )
+        try:
+            en, desc = english_cues(cand, self.run_cmd)
+        except NoEnglish as e:
+            self._failed(cand.key, cand.title, attempts, str(e), e.permanent)
+            self.current = None
+            return
+        direct = DirectTranslator(cfg, self.bazarr, self.claude, budget, self.run_cmd, self.sleep, self.clock)
+        out = direct.translate(cand, en, desc)
+        if not out.ok:
+            self.db.upsert(cand.key, cost_usd=out.cost)
+            self._failed(cand.key, cand.title, attempts, out.reason)
+            self.current = None
+            return
+        self.db.upsert(
+            cand.key,
+            status="faerdig",
+            reason=f"direkte med {out.model}: {out.delivery}",
+            cost_usd=out.cost,
+            flags_before=out.flags_before,
+            flags_after=out.flags_after,
+            fixes=out.fixes,
+        )
+        log.info("Færdig: %s - %s", cand.title, out.summary())
         self.current = None
 
     def _failed(self, key: str, title: str, attempts: int, reason: str, permanent: bool = False) -> None:
@@ -476,7 +554,11 @@ class Runner:
         started = parse_date(row["started_at"])
         da_path = row["da_path"] or ""
         mtime = os.path.getmtime(da_path) if da_path and os.path.exists(da_path) else None
-        if mtime and started and mtime > started.timestamp():
+        if self.cfg.direct and mtime and started and mtime > started.timestamp():
+            # Filen nåede at blive afleveret (af Bazarr eller os selv) - den er allerede efterbehandlet.
+            log.info("%s blev afleveret, før programmet stoppede - markeres som færdig", row["title"])
+            self.db.upsert(row["key"], status="faerdig", reason="direkte: afleveret før genstart")
+        elif mtime and started and mtime > started.timestamp():
             log.info("Genoptager efterbehandling af %s", row["title"])
             source = row["source"] if row["source"] and not row["source"].startswith("subtitles_id:") else None
             self.finish(
@@ -519,17 +601,31 @@ class Runner:
 
     def log_start(self) -> None:
         log.info(
-            "Oversætter startet. DRY_RUN=%s, runde hvert %g minut, budget %.2f USD/måned",
+            "Oversætter startet. DRY_RUN=%s, runde hvert %g minut, budget %.2f USD/måned, TRANSLATE_MODE=%s",
             self.cfg.dry_run,
             self.cfg.poll_minutes,
             self.cfg.monthly_budget_usd,
+            self.cfg.translate_mode,
         )
         for key in self.cfg.ignored_keys:
             log.info("%s i .env bruges ikke længere og ignoreres (se README under Indstillinger og beslutninger)", key)
+        if self.cfg.direct:
+            log.info(
+                "Oversætter selv med %s (effort %s), fallback-model %s, højst %d replikker i rettelsesrunden",
+                self.cfg.translate_model,
+                self.cfg.translate_effort,
+                self.cfg.fallback_model,
+                self.cfg.max_fix_lines,
+            )
+            if self.cfg.proofread_keys:
+                log.info(
+                    "%s i .env bruges ikke i TRANSLATE_MODE=direct og ignoreres", ", ".join(self.cfg.proofread_keys)
+                )
         if self.cfg.dry_run:
             log.info("DRY_RUN er slået til: der søges, synkroniseres og oversættes ikke, og der skrives ingen filer")
         if self.claude is None:
-            log.warning("Ingen Anthropic-nøgle fundet i %s - korrektur springes over", self.cfg.anthropic_api_key_file)
+            what = "der oversættes ikke" if self.cfg.direct else "korrektur springes over"
+            log.warning("Ingen Anthropic-nøgle fundet i %s - %s", self.cfg.anthropic_api_key_file, what)
 
     def _stop(self, *_):
         log.info("Stopper efter den igangværende opgave")
@@ -538,4 +634,5 @@ class Runner:
 
 def main(cfg: Config) -> None:
     db = Database(os.path.join(cfg.data_dir, "oversaetter.db"))
-    Runner(cfg, db, claude=make_client(cfg)).loop()
+    client = make_client(cfg, CALL_TIMEOUT / 60 if cfg.direct else None)
+    Runner(cfg, db, claude=client).loop()

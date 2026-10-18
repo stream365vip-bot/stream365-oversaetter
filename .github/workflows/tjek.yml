@@ -22,3 +22,5 @@ jobs:
         run: pytest -q
       - name: Docker build
         run: docker build -t stream365-oversaetter:test .
+      - name: ffmpeg i billedet
+        run: docker run --rm stream365-oversaetter:test sh -c "ffmpeg -version | head -1 && ffprobe -version | head -1"

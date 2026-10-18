@@ -110,13 +110,17 @@ def postprocess(
     )
 
 
-def make_client(cfg: Config):
-    """Opret Anthropic-klienten, eller None hvis nøglen mangler."""
+def make_client(cfg: Config, timeout_minutes: float | None = None):
+    """Opret Anthropic-klienten, eller None hvis nøglen mangler.
+
+    timeout_minutes: SDK'ens tidsgrænse pr. læsning (standard PROOFREAD_CALL_TIMEOUT_MINUTES).
+    """
     key = cfg.anthropic_api_key()
     if not key:
         return None
     import anthropic
 
     # SDK'ens timeout gælder hver læsning; den hårde grænse for hele kaldet ligger i proofread (call_with_timeout).
-    timeout = max(1.0, cfg.proofread_call_timeout_minutes * 60)
+    minutes = cfg.proofread_call_timeout_minutes if timeout_minutes is None else timeout_minutes
+    timeout = max(1.0, minutes * 60)
     return anthropic.Anthropic(api_key=key, timeout=anthropic.Timeout(timeout, connect=30.0), max_retries=2)

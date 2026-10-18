@@ -68,8 +68,10 @@ def test_music_lines_drop_cue(src):
 
 def test_music_over_two_lines_and_mixed_cue():
     r = cleaned("♪ Oh, the night is long\nand the road is cold ♪", "♪ La la ♪\nHey, you.")
+    assert [c.text for c in r.cues] == []  # trin B4d: én sanglinje dropper hele replikken
+    assert r.stats.music == 4
+    r = hi.clean([cue(0, 1, "♪ La la ♪\nHey, you.")], drop_lyrics=False)
     assert [c.text for c in r.cues] == ["Hey, you."]
-    assert r.stats.music == 3
 
 
 def test_hash_number_is_not_music():

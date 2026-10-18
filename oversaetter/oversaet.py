@@ -116,8 +116,8 @@ ikke tænkt mig at tage med dig derhen i aften." Right: "Jeg tager ikke med\\ndi
 that cue under its own number, but make the sentence read correctly across cues. Never move words to another \
 number, and never merge or split numbers. Wrong: 12 "Jeg har ikke tid til at vente", 13 "". Right: 12 "Jeg har \
 ikke tid", 13 "til at vente."
-10. Keep <i>...</i> and speaker dashes: "-" at the start of both lines when the source has them, never added \
-otherwise. Wrong: "<i>Hvor er du?" Right: "<i>Hvor er du?</i>"
+10. Keep <i>...</i> and speaker dashes: "-" at the start of both lines when the source has them. Wrong: "<i>Hvor \
+er du?" Right: "<i>Hvor er du?</i>"
 11. Numbers keep their value. Digits stay digits, numbers written as words become Danish words. Wrong: "three \
 days" -> "3 dage". Right: "tre dage".
 12. Names of people, places, companies, groups, shows and brands stay unchanged. Song lyrics and signs are \
@@ -137,9 +137,11 @@ Fixed translations (never leave these in English): "bitch" -> "kælling", "bitch
 "mand"/"makker", "nobody"/"nobodies" (a loser) -> "et nul"/"nuller", "crew" -> "bande"/"hold", "bossman" -> \
 "chefen", "Mr."/"Mrs." -> "hr."/"fru", "guys" -> "folkens"/"venner", "keep shooting" (with a gun) -> "bliv ved med \
 at skyde", "frequent-flyer miles" -> "bonuspoint", "Who gives a shit?" -> "Hvem fanden går op i det?", "Bye for \
-now" -> "Farvel så længe", "checkpoint"/"checkpoints" -> "kontrolpost"/"kontrolposter". "alle sammen" is \
-always two words. Translate "Oh my God"/"Jesus" consistently as "Åh gud" (not "Herregud" in between), unless \
-the film glossary says otherwise.
+now" -> "Farvel så længe", "checkpoint"/"checkpoints" -> "kontrolpost"/"kontrolposter", "lifer" -> \
+"karrieresoldat", "Copy." (on the radio) -> "Modtaget." (every time, never "Forstået" in between), "Flight deck \
+to cockpit" -> "Flydæk til cockpit". "alle sammen" is always two words. Translate "Oh my God" consistently as \
+"Åh gud" (not "Herregud" in between) and "Jesus." (an exclamation) as "Jøsses." or "Åh gud.", unless the film \
+glossary says otherwise.
 16. Consistency: use the same Danish word for a name or recurring term every time. Follow the film glossary (if \
 given) exactly and use its "address" (du/De) between the same characters through the whole film. "glossary" in the \
 request shows how names and recurring terms were translated earlier in this file: follow it. Wrong: "Store Mike" \
@@ -149,6 +151,9 @@ cues) are only for understanding. Never translate, repeat or return them. Reply 
 Et navn i [klammer] foran en linje fortæller, hvem der taler. Brug det til du/I, han/hun og tiltale. Skriv aldrig \
 navnet eller klammerne i den danske tekst.
 Når den engelske replik har streger ("- "), skal alle danske linjer i replikken starte med "- ".
+Når en replik har to linjer, der tydeligt siges af to forskellige personer (spørgsmål og svar, ordre og \
+kvittering, to forskellige navne i talernoterne), så sæt '- ' foran begge danske linjer, også selv om den engelske \
+ikke har streger. Er du i tvivl, så lad være.
 
 Format: write a line break as \\n. Reply ONLY with JSON of the form {"lines":[{"i":<number>,"da":"<Danish text>"}]} \
 with exactly one entry for every number in "lines" and no others."""
@@ -705,7 +710,9 @@ def run_translate_test(
     parallel: int = 1,
     http=None,
     hi_clean: bool = True,
+    show_context: bool = False,
 ) -> int:
+    """show_context (--vis-kontekst): filmkonteksten og ordlisten (termer og tiltaler) skrives øverst i rapporten."""
     if os.path.abspath(out) == os.path.abspath(en_path):
         log.error("--out må ikke være den samme fil som --en")
         return 2
@@ -812,6 +819,7 @@ def run_translate_test(
     report = "\n".join(
         [
             "Testrapport (oversaet-test)",
+            *(_context_lines(ctx_text, wordlist) if show_context else []),
             f"Engelsk fil: {en_path}",
             en_kind,
             f"Resultat: {out}",
@@ -843,6 +851,23 @@ def run_translate_test(
     )
     print(report)
     return 0
+
+
+def _context_lines(ctx_text: str | None, wordlist) -> list[str]:
+    """--vis-kontekst: det, modellen fik ud over replikkerne (trin B4d)."""
+    lines = ["--- Filmkontekst ---", ctx_text or "(ingen)", "--- Ordliste ---"]
+    if wordlist is None:
+        lines.append("(ingen)")
+    else:
+        lines.append(f"Termer ({len(wordlist.terms)}):")
+        lines += [
+            f'- "{t["en"]}" -> "{t["da"]}"' + (f" ({t['note']})" if t.get("note") else "") for t in wordlist.terms
+        ]
+        lines.append(f"Tiltaler ({len(wordlist.address)}):")
+        lines += [f"- {a['who']} til {a['to']}: {a['form']}" for a in wordlist.address]
+        if wordlist.tone:
+            lines.append(f"Tone: {wordlist.tone}")
+    return [*lines, "---"]
 
 
 def _test_context(cfg: Config, tmdb_id: str | None, http) -> str | None:

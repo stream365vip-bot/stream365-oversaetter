@@ -314,7 +314,8 @@ NOT_NAMES = ENGLISH_WORDS | {
 }
 
 WORD_RE = re.compile(r"[A-Za-zÆØÅæøåÄÖÜäöüé']+")
-NUMBER_RE = re.compile(r"\d+(?:[.,:]\d+)*")
+# Tusindtalsseparator med mellemrum ("82 000", også hårdt/smalt mellemrum) hører med til tallet (trin B4d).
+NUMBER_RE = re.compile(r"\d+(?:[.,:]\d+|[ \u00a0\u202f]\d{3}(?!\d))*")
 
 BAZARR_HEADER_RE = re.compile(r"^\s*#\s*subtitles translated with\b.*#\s*$", re.IGNORECASE | re.DOTALL)
 
@@ -374,8 +375,13 @@ def _words(text: str) -> list[str]:
     return [w.lower() for w in WORD_RE.findall(plain(text))]
 
 
+def _norm_number(n: str) -> str:
+    """Tallet uden separatorer: 82,000 = 82.000 = 82 000 = 82000 (trin B4d)."""
+    return re.sub(r"[.,: \u00a0\u202f]", "", n)
+
+
 def _numbers(text: str) -> set[str]:
-    return {re.sub(r"[.,:]", "", n) for n in NUMBER_RE.findall(plain(text))}
+    return {_norm_number(n) for n in NUMBER_RE.findall(plain(text))}
 
 
 def _is_names_or_interjections(text: str) -> bool:
@@ -625,9 +631,71 @@ ENGLISH_ONLY = {
     # trin B4c (test18/test19)
     "checkpoint",
     "checkpoints",
+    # trin B4d (test20)
+    "lifer",
+    "lifers",
+    "copy",
 }
-# Engelske ord, der kun flages i bestemte vendinger: "shit" alene er tilladt, "holy shit" er ikke.
-ENGLISH_PHRASE_RE = re.compile(r"\bholy\s+shit\b|\bhell\s*!|\bwhat\s+the\s+hell\b", re.IGNORECASE)
+# Engelske ord, der kun flages i bestemte vendinger: "shit" alene er tilladt, "holy shit" er ikke. "Jesus" kun som
+# udbrud først i en linje ("Jesus." -> "Jøsses.", trin B4d).
+ENGLISH_PHRASE_RE = re.compile(
+    r"\bholy\s+shit\b|\bhell\s*!|\bwhat\s+the\s+hell\b|\bflight\s+deck\b"
+    r"|^\s*(?:-\s*)?jesus(?:\s+christ)?\s*(?:[.!?,…]|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+# Bandeord, udbrud og fyldord. De er aldrig termer i ordlisten (trin B4d: "shit" -> "Pis" gav 17 inconsistent_term i
+# test20); prompt v4 har sine egne regler for dem.
+SWEARS_AND_EXCLAMATIONS = {
+    "shit",
+    "holy shit",
+    "bullshit",
+    "fuck",
+    "fucking",
+    "fuck off",
+    "fuck you",
+    "what the fuck",
+    "damn",
+    "damn it",
+    "dammit",
+    "goddamn",
+    "goddammit",
+    "hell",
+    "what the hell",
+    "bloody hell",
+    "crap",
+    "bloody",
+    "gosh",
+    "jeez",
+    "jesus",
+    "jesus christ",
+    "christ",
+    "god",
+    "oh god",
+    "oh my god",
+    "my god",
+    "okay",
+    "ok",
+    "yeah",
+    "yes",
+    "no",
+    "man",
+    "hey",
+    "wow",
+    "yo",
+    "oh",
+    "ah",
+    "uh",
+    "um",
+    "hmm",
+    "well",
+    "right",
+    "sure",
+    "like",
+    "you know",
+    "i mean",
+    "seriously",
+    "literally",
+}
 DANISH_APOSTROPHE_ENDINGS = {"en", "et", "s", "er", "erne", "ene", "ens", "ets"}
 # Titler flages også, når ordlisten har navnet uændret ("Mr. Vice" -> "Mr. Vice" skal være "hr. Vice").
 TITLES = {"mr", "mrs", "miss", "sir", "ma'am"}

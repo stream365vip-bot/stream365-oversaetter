@@ -161,6 +161,7 @@ sudo docker exec oversaetter python -m oversaetter oversaet-test \
 - `--glossary on|off`: ordliste pr. film før bidderne (standard off).
 - `--parallel 4`: så mange bidder samtidig (standard 1).
 - `--hi on|off`: rens en hørehæmmede-tekst (HI/SDH) for lydbeskrivelser, musiklinjer og talernavne før bidderne (standard on, se trin B4).
+- `--vis-kontekst`: skriv filmkonteksten og ordlisten (termer, tiltaler og tone) øverst i rapporten, så man kan se, hvad modellen fik (trin B4d).
 
 Eksempel med alle forbedringer slået til:
 
@@ -280,6 +281,15 @@ Skriv nøglen i filen med `sudo nano` (kun nøglen, én linje). Mangler en nøgl
   3. **Talernavne med tal** (`REPORTER 1:`) fjernes også, og alle kontroller bruger den rensede engelske tekst (også efterbehandlingen i Bazarr-tilstand), så tal fra talernavne og lydbeskrivelser ikke giver `missing_number`.
   4. **`identical_to_english`** flager kun, når den engelske replik har mindst ét almindeligt engelsk ord (ikke "Salam alaikum.", "Merci.", "Allahu Akbar!").
   5. **`english_word`**: checkpoint/checkpoints -> kontrolpost/kontrolposter (også i prompt v4's faste liste).
+
+- **Trin B4d: rettelser efter test20 (The Fix, HI)** (18.10.2026):
+
+  1. **Talerstreger uden streger i kilden**: britiske SDH-tekster markerer talerskift med farver, som forsvinder i .srt. Prompt v4 beder nu om `- ` foran begge danske linjer, når to linjer tydeligt siges af to personer (spørgsmål og svar, ordre og kvittering, to navne i talernoterne) - "er du i tvivl, så lad være". hi.py: har en replik to linjer, hvor kun den ene har et talernavn (`TUCKER: Go.` / `No.`), regnes den anden som en anden taler, og der sættes streger - medmindre navnet står på første linje, og sætningen fortsætter på anden linje. `missing_dash` flager fortsat kun, når den engelske har streger.
+  2. **Sangtekst**: har én linje i en replik ♪ eller # i starten eller slutningen, droppes hele replikken (`DROP_LYRICS=true`).
+  3. **Ordlisten** indeholder aldrig bandeord, udbrud eller fyldord som termer (shit, fuck, damn, hell, Jesus, okay, yeah, man ...). Det står i ordliste-prompten, og termer på listen `SWEARS_AND_EXCLAMATIONS` i `checks.py` filtreres fra efter svaret (også i gemte ordlister fra tidligere afsnit).
+  4. **`missing_number`**: tal med tusindtalsseparator er samme tal (82,000 = 82.000 = 82 000 = 82000).
+  5. **Faste oversættelser** (prompt v4 og `english_word`): "Jesus." (udbrud) -> "Jøsses."/"Åh gud.", lifer -> karrieresoldat, "Copy." (radio) -> "Modtaget." (konsekvent), "Flight deck to cockpit" -> "Flydæk til cockpit".
+  6. **`oversaet-test --vis-kontekst`**: filmkonteksten og ordlisten øverst i rapporten.
 
 ## Hvis noget går galt
 

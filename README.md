@@ -160,6 +160,7 @@ sudo docker exec oversaetter python -m oversaetter oversaet-test \
 - `--tmdb-id 12345`: TMDB-id til konteksten uden Radarr-opslag (`tv:12345` for en serie).
 - `--glossary on|off`: ordliste pr. film før bidderne (standard off).
 - `--parallel 4`: så mange bidder samtidig (standard 1).
+- `--hi on|off`: rens en hørehæmmede-tekst (HI/SDH) for lydbeskrivelser, musiklinjer og talernavne før bidderne (standard on, se trin B4).
 
 Eksempel med alle forbedringer slået til:
 
@@ -262,6 +263,14 @@ Skriv nøglen i filen med `sudo nano` (kun nøglen, én linje). Mangler en nøgl
   2. **Ordspil**: prompt v4 siger, at et ordspil, der ikke kan laves på dansk, oversættes ligeud. Nyt rettelsesflag `mixed_case` flager opfundne ord som "sundhedsTHC" (ikke THC, JD's, iPhone, eBay, sundheds-THC eller ord, der starter med stort, som OnlyFans og YouTube).
   3. **Flere faste oversættelser** i prompt v4: frequent-flyer miles → bonuspoint, "Who gives a shit?" → "Hvem fanden går op i det?", "Bye for now" → "Farvel så længe", og "alle sammen" i to ord.
   4. **`inconsistent_term` er mindre følsom**: en bøjning af ordlistens danske form tæller som den samme (de første 4 bogstaver, så regel/reglen/reglerne/regler er ens), og gentagelse i samme replik flages aldrig.
+
+- **Trin B4: hørehæmmede-tekster (HI/SDH) som kilde** (18.10.2026). Talernavnene i HI-tekster hjælper oversættelsen (du/I, han/hun, tiltale), men intet af HI-indholdet må stå i den danske tekst. Den engelske kilde renses derfor (`oversaetter/hi.py`) før bidderne, både i driften og i `oversaet-test`:
+
+  1. **Rensning**: tekst i [klammer] og (parenteser) fjernes, når indholdet kun har STORE bogstaver eller er en kendt lydbeskrivelse (laughs, sighs, whispers, gasps, music, gunshot, indistinct, speaking foreign language osv.). Almindelige parenteser ("We're (almost) there.") røres ikke. Linjer med kun ♪/# eller ♪ ... ♪ (sangtekst) fjernes. Talernavne som `RICK:`, `- CORA:` og `MAN ON RADIO:` (1-3 ord med store bogstaver) fjernes fra teksten, men gemmes; bindestreg og kursiv bevares. En replik uden tekst tilbage droppes. Loggen viser én linje pr. film: `HI-rensning: X lydbeskrivelser, Y musiklinjer, Z talernavne, W replikker droppet` (intet, hvis alt er 0).
+  2. **Talernavne som note**: med prompt v4 sendes en linje med kendt taler som `[Rick] Let's go.` (to talere: `- [Rick] Go.` / `- [Cora] No.`). Noten står kun i inputtet; prompt v4 siger, at navnet aldrig må skrives i den danske tekst. Med prompt v3 sendes den rensede tekst uden noter. Nyt rettelsesflag `hi_rest` flager en dansk replik med `[` eller `]` eller en linje, der starter med `NAVN:`.
+  3. **Ordlisten** får listen over talere (og teksten med noterne) sammen med rollelisten fra TMDB, så tiltalen (address) bliver bedre.
+  4. **`oversaet-test --hi on|off`** (standard on = rens). Rapporten viser HI-rensningens tal og talerne.
+  5. Hvilke engelske tekster Bazarr henter, styres i Bazarr (sprogprofilen), ikke her.
 
 ## Hvis noget går galt
 

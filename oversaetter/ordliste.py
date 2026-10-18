@@ -166,12 +166,22 @@ def build(
     context: str | None,
     previous: Wordlist | None,
     on_usage=None,
+    speakers: list[str] | None = None,
+    notes: list[str] | None = None,
 ) -> Wordlist | None:
-    """Lav ordlisten med ét kald. ask(system, user, schema) -> Reply. Returnerer None (med en WARNING) ved fejl."""
+    """Lav ordlisten med ét kald. ask(system, user, schema) -> Reply. Returnerer None (med en WARNING) ved fejl.
+
+    speakers: talernavne fra en HI-kilde (trin B4); gives med sammen med rollelisten i konteksten. notes: de engelske
+    replikker med talernavnet som note ("[Rick] Let's go."), så modellen kan se, hvem der taler til hvem.
+    """
     parts = [context] if context else []
     if previous is not None and (previous.terms or previous.address):
         parts.append("previous_glossary (earlier episodes of this series):\n" + previous.to_json())
-    parts.append("English subtitles (one cue per line):\n" + english_text(en))
+    if speakers:
+        parts.append('Speakers named in the subtitles (use them with the cast for "address"): ' + ", ".join(speakers))
+        parts.append("English subtitles (one cue per line, [Name] = who speaks):\n" + english_text(notes or en))
+    else:
+        parts.append("English subtitles (one cue per line):\n" + english_text(en))
     user = "\n\n".join(parts)
     try:
         reply = ask(PROMPT, user, SCHEMA)

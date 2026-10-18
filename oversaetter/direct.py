@@ -18,13 +18,14 @@ import subprocess
 import time
 from dataclasses import dataclass, replace
 
+from . import hi
 from .checks import FLAG_TEXT, EnglishIndex, check_all, count_info, fix_flags, plain
 from .clients import ApiError, Bazarr
 from .config import Config, model_price
 from .credit import apply_credit
 from .deadline import call_with_timeout
 from .ordliste import Wordlist, merge_previous
-from .oversaet import build_system, drop_empty, filler_positions, make_glossary, translate_all
+from .oversaet import build_system, drop_empty, filler_positions, make_glossary, speaker_notes, translate_all
 from .proofread import OUTPUT_SCHEMA as FIX_SCHEMA
 from .proofread import Budget, validate_fix
 from .selection import Candidate, has_danish
@@ -325,6 +326,12 @@ class DirectTranslator:
             spent["cost"] += cost
             self.budget.record(cand.key, inp + cache_read + cache_write, out, cost)
 
+        hi_result = hi.clean(en_cues)  # trin B4: lydbeskrivelser, musiklinjer og talernavne ud før bidderne
+        en_cues = hi_result.cues
+        if not en_cues:
+            return DirectOutcome(
+                ok=False, model=cfg.translate_model, reason=f"ingen replikker tilbage efter HI-rensningen ({desc})"
+            )
         log.info(
             "Gyldig søgning fandt ikke dansk - oversætter %s selv (%s) med %s (effort %s): %d replikker fra %s",
             cand.title,
@@ -355,6 +362,8 @@ class DirectTranslator:
                 previous,
                 max(1.0, min(CALL_TIMEOUT, deadline - self.clock())),
                 on_usage,
+                hi_result.speakers,
+                hi_result.notes,
             )
             outcome.glossary = wordlist
             outcome.glossary_terms = len(wordlist.terms) if wordlist is not None else None
@@ -375,6 +384,7 @@ class DirectTranslator:
             parallel=cfg.parallel,
             empty_ok=filler_positions(en, cfg.prompt_version),
             cache=cfg.prompt_cache,
+            notes=speaker_notes(hi_result, cfg.prompt_version),
         )
         if res.cache_read or res.cache_write:
             log.info("Prompt-cache: %d tokens læst, %d tokens skrevet", res.cache_read, res.cache_write)

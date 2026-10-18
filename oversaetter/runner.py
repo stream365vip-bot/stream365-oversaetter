@@ -17,7 +17,7 @@ from .clients import GET_TIMEOUT, ApiError, Bazarr, Radarr, Seerr, SeerrIndex, S
 from .config import Config
 from .credit import apply_credit
 from .db import Database, iso
-from .direct import CALL_TIMEOUT, DirectTranslator, NoEnglish, english_cues
+from .direct import CALL_TIMEOUT, DirectTranslator, NoEnglish, english_cues, english_source
 from .postprocess import make_client, postprocess
 from .proofread import DbBudget
 from .search import PAUSE_WARN, nice_name, paused_providers, search_jobs, unfinished, wait_for_jobs, waiting_text
@@ -439,7 +439,7 @@ class Runner:
             series_id=cand.series_id,
         )
         try:
-            en, desc = english_cues(cand, self.run_cmd)
+            en, desc, label, by_name = english_source(cand, self.run_cmd)
         except NoEnglish as e:
             self._failed(cand.key, cand.title, attempts, str(e), e.permanent)
             self.current = None
@@ -455,7 +455,8 @@ class Runner:
             context_for=self.context_for,
             glossaries_for=self.glossaries_for,
         )
-        out = direct.translate(cand, en, desc)
+        out = direct.translate(cand, en, desc, label, by_name)
+        self.db.upsert(cand.key, en_hi=int(out.en_hi))
         if out.glossary is not None:
             self.db.upsert(cand.key, glossary=out.glossary.to_json())
         if not out.ok:
@@ -506,7 +507,7 @@ class Runner:
         # Indlejret kilde: Bazarr har udtrukket sporet til en ekstern fil.
         try:
             item = self.bazarr.item(media_type, media_id) or {}
-            path, _, _ = choose_source(item.get("subtitles") or [])
+            path, _, _ = choose_source(item.get("subtitles") or [], prefer_hi=False)
             if path:
                 return path
         except Exception:

@@ -725,6 +725,9 @@ def run_translate_test(
         log.error("Der er ingen replikker i %s", en_path)
         return 2
     hi_result = hi.clean(en_cues) if hi_clean else hi.passthrough(en_cues)
+    # Kilden vurderes efter samme regel som i driften, også med --hi off (så tælles der uden at rense).
+    hi_stats = hi_result.stats if hi_clean else hi.clean(en_cues, quiet=True).stats
+    _, en_kind = hi.source_kind(hi_stats, hi.hi_filename(en_path), os.path.basename(en_path))
     en_cues = hi_result.cues
     if not en_cues:
         log.error("Der er ingen replikker tilbage i %s efter HI-rensningen", en_path)
@@ -807,7 +810,8 @@ def run_translate_test(
     report = "\n".join(
         [
             "Testrapport (oversaet-test)",
-            f"Engelsk kilde: {en_path}",
+            f"Engelsk fil: {en_path}",
+            en_kind,
             f"Resultat: {out}",
             f"Provider: {provider}",
             f"Model: {model} (effort {effort or '-'})",

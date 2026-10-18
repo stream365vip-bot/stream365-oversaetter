@@ -83,6 +83,7 @@ class DirectOutcome:
     model: str = ""
     switches: str = ""  # kontakterne fra 18.10.2026, kun når de ikke står på standard
     removed_empty: int = 0  # replikker med kun fyldlyde (v4), fjernet fra filen
+    en_hi: bool = False  # den engelske kilde var HI/SDH (navn/disposition eller indhold)
     glossary_terms: int | None = None  # None = ingen ordliste
     glossary: Wordlist | None = None
 
@@ -124,7 +125,7 @@ def _sdh(stream: dict) -> bool:
 
 
 def pick_stream(streams: list[dict]) -> tuple[dict | None, str]:
-    """Vælg det engelske tekstspor (ikke forced, helst ikke SDH). Returnerer (spor, hvorfor intet blev valgt)."""
+    """Vælg det engelske tekstspor (ikke forced, helst SDH/HI). Returnerer (spor, hvorfor intet blev valgt)."""
     english = [
         s
         for s in streams
@@ -137,12 +138,17 @@ def pick_stream(streams: list[dict]) -> tuple[dict | None, str]:
     text = [s for s in english if str(s.get("codec_name") or "").lower() in TEXT_CODECS]
     if not text:
         return None, "kun PGS/VobSub (billedbaseret engelsk tekst) - kan ikke oversættes"
-    text.sort(key=_sdh)  # sorted er stabil: første ikke-SDH-spor vinder
+    text.sort(key=lambda s: not _sdh(s))  # sorted er stabil: første SDH/HI-spor vinder (talernavne hjælper)
     return text[0], ""
 
 
-def embedded_english(video: str, run_cmd=subprocess.run, timeout: float = FFMPEG_TIMEOUT) -> tuple[list[Cue], str]:
-    """Træk det engelske tekstspor ud af videoen med ffmpeg. Rejser NoEnglish, hvis der ikke er et brugbart."""
+def embedded_english(
+    video: str, run_cmd=subprocess.run, timeout: float = FFMPEG_TIMEOUT
+) -> tuple[list[Cue], str, dict]:
+    """Træk det engelske tekstspor ud af videoen med ffmpeg. Returnerer (replikker, beskrivelse, ffprobes spor).
+
+    Rejser NoEnglish, hvis der ikke er et brugbart.
+    """
     probe = _run(
         run_cmd,
         [
@@ -181,22 +187,32 @@ def embedded_english(video: str, run_cmd=subprocess.run, timeout: float = FFMPEG
     cues = parse(decode(out.stdout or b""))
     title = (stream.get("tags") or {}).get("title")
     desc = f"indlejret engelsk spor {index} ({stream.get('codec_name')}{', ' + title if title else ''}, via ffmpeg)"
-    return cues, desc
+    return cues, desc, stream
 
 
-def english_cues(cand: Candidate, run_cmd=subprocess.run) -> tuple[list[Cue], str]:
-    """Den engelske tekst for emnet (uden tomme replikker) og en beskrivelse til loggen."""
+def english_source(cand: Candidate, run_cmd=subprocess.run) -> tuple[list[Cue], str, str, bool]:
+    """Som english_cues, plus sporets titel/filnavnet og om navn/disposition siger HI/SDH."""
     if cand.source_path:
         try:
             cues = read_file(cand.source_path)
         except OSError as e:
             raise NoEnglish(f"kan ikke læse {cand.source_path} ({e.strerror or type(e).__name__})") from None
         desc = cand.source_desc or f"ekstern engelsk: {os.path.basename(cand.source_path)}"
+        label = os.path.basename(cand.source_path)
+        by_name = cand.source_hi or hi.hi_filename(cand.source_path)
     else:
-        cues, desc = embedded_english(cand.video_path, run_cmd)
+        cues, desc, stream = embedded_english(cand.video_path, run_cmd)
+        label = str((stream.get("tags") or {}).get("title") or f"spor {stream['index']}")
+        by_name = _sdh(stream)
     cues = [c for c in cues if plain(c.text).strip()]
     if not cues:
         raise NoEnglish(f"der er ingen replikker i den engelske tekst ({desc})")
+    return cues, desc, label, by_name
+
+
+def english_cues(cand: Candidate, run_cmd=subprocess.run) -> tuple[list[Cue], str]:
+    """Den engelske tekst for emnet (uden tomme replikker) og en beskrivelse til loggen."""
+    cues, desc, _, _ = english_source(cand, run_cmd)
     return cues, desc
 
 
@@ -312,7 +328,10 @@ class DirectTranslator:
     def work_path(self, cand: Candidate) -> str:
         return os.path.join(self.cfg.data_dir, "direkte", cand.key.replace(":", "-") + ".da.srt")
 
-    def translate(self, cand: Candidate, en_cues: list[Cue], desc: str) -> DirectOutcome:
+    def translate(
+        self, cand: Candidate, en_cues: list[Cue], desc: str, label: str = "", by_name: bool = False
+    ) -> DirectOutcome:
+        """label/by_name: sporets titel eller filnavnet, og om navn/disposition siger HI (fra english_source)."""
         cfg = self.cfg
         started = self.clock()
         deadline = started + cfg.translate_timeout_minutes * 60
@@ -327,10 +346,15 @@ class DirectTranslator:
             self.budget.record(cand.key, inp + cache_read + cache_write, out, cost)
 
         hi_result = hi.clean(en_cues)  # trin B4: lydbeskrivelser, musiklinjer og talernavne ud før bidderne
+        en_hi, kind = hi.source_kind(hi_result.stats, by_name, label)
+        log.info("%s", kind)
         en_cues = hi_result.cues
         if not en_cues:
             return DirectOutcome(
-                ok=False, model=cfg.translate_model, reason=f"ingen replikker tilbage efter HI-rensningen ({desc})"
+                ok=False,
+                model=cfg.translate_model,
+                reason=f"ingen replikker tilbage efter HI-rensningen ({desc})",
+                en_hi=en_hi,
             )
         log.info(
             "Gyldig søgning fandt ikke dansk - oversætter %s selv (%s) med %s (effort %s): %d replikker fra %s",
@@ -342,7 +366,7 @@ class DirectTranslator:
             desc,
         )
         en = [c.text for c in en_cues]
-        outcome = DirectOutcome(ok=False, model=cfg.translate_model, lines=len(en_cues))
+        outcome = DirectOutcome(ok=False, model=cfg.translate_model, lines=len(en_cues), en_hi=en_hi)
         if cfg.switches() != Config().switches():
             outcome.switches = cfg.switches()
             log.info("Kontakter for %s: %s", cand.title, outcome.switches)

@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS items (
     search_at TEXT,                -- tidspunkt for en gyldig søgning (ingen tjeneste på pause før og efter)
     en_search_at TEXT,             -- tidspunkt for seneste gyldige søgning efter engelsk (ingen dansk, ingen kilde)
     series_id INTEGER,             -- sonarrSeriesId (kun afsnit), så ordlisten kan genbruges i serien
-    glossary TEXT                  -- ordlisten (JSON) fra GLOSSARY=on
+    glossary TEXT,                 -- ordlisten (JSON) fra GLOSSARY=on
+    en_hi INTEGER                  -- 1 = oversat fra en engelsk HI/SDH-kilde, 0 = almindelig (NULL = ikke vurderet)
 );
 CREATE TABLE IF NOT EXISTS spend (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,6 +57,7 @@ NEW_COLUMNS = {
         "en_search_at": "TEXT",
         "series_id": "INTEGER",
         "glossary": "TEXT",
+        "en_hi": "INTEGER",
     }
 }
 

@@ -13,7 +13,7 @@ Hvert kvarter gør programmet dette:
 3. Springer over, hvis der allerede findes danske undertekster (som fil eller inde i videoen).
 4. Sørger for en **gyldig søgning**: beder Bazarr søge efter dansk til netop det emne og tjekker, at ingen af Bazarrs undertekst-tjenester var sat på pause lige før eller lige efter. Fandt søgningen dansk, er der intet at gøre.
 5. Fandt en gyldig søgning ikke dansk, og findes der en engelsk tekst, **oversætter programmet selv** med Claude (standard Opus 5.5, `TRANSLATE_MODE=direct`):
-   - Den engelske tekst hentes: en ekstern `.en.srt` læses direkte, et indlejret engelsk tekstspor trækkes ud af videoen med ffmpeg (ikke SDH/forced, hvis der er flere). Billedbaserede spor (PGS/VobSub) springes over.
+   - Den engelske tekst hentes: en ekstern `.en.srt` læses direkte, et indlejret engelsk tekstspor trækkes ud af videoen med ffmpeg (helst SDH/HI, aldrig forced). Billedbaserede spor (PGS/VobSub) springes over.
    - Teksten oversættes i bidder af 50 replikker med sammenhæng (som i testtilstanden `oversaet-test`). Afviser modellen en bid (refusal) også efter halvering, prøves den med `FALLBACK_MODEL` (standard Sonnet 5.5). Lykkes det heller ikke, beholder de replikker den engelske tekst, og det står tydeligt i loggen.
    - **Gratis kontrol** af hver replik (engelske rester, norske/svenske ord, kendte forkerte ord som "bestie" og "please", for lange linjer, manglende tal osv.). De flagede replikker (højst `MAX_FIX_LINES`, standard 60) rettes i **ét ekstra kald** med 2 nabolinjer på hver side.
    - Kreditlinjen sættes ind, og filen **uploades til Bazarr** (samme kald som Upload-knappen). Så registrerer Bazarr teksten, kører sync/Sub-Zero og kan senere udskifte den. Fejler uploaden, skriver programmet selv `<videonavn>.da.srt` ved siden af videoen og beder Bazarr om "scan disk".
@@ -271,6 +271,7 @@ Skriv nøglen i filen med `sudo nano` (kun nøglen, én linje). Mangler en nøgl
   3. **Ordlisten** får listen over talere (og teksten med noterne) sammen med rollelisten fra TMDB, så tiltalen (address) bliver bedre.
   4. **`oversaet-test --hi on|off`** (standard on = rens). Rapporten viser HI-rensningens tal og talerne.
   5. Hvilke engelske tekster Bazarr henter, styres i Bazarr (sprogprofilen), ikke her.
+  6. **Kildevalg og logning** (opfølgning, 18.10.2026): et indlejret engelsk SDH/HI-spor foretrækkes (titlen har SDH, HI, CC eller HOH som helt ord, eller ffprobe-disposition `hearing_impaired=1`); tekstbaserede spor går stadig forud for billedbaserede. Af flere eksterne engelske filer foretrækkes HI-filen (Bazarrs hi-flag eller `.en.hi.srt`/`.en.sdh.srt`). Loggen viser altid én linje pr. film: `Engelsk kilde: HI (sporets titel/filnavn)` eller `Engelsk kilde: almindelig`. HI = navnet/dispositionen siger det, eller hi.py finder mindst 5 lydbeskrivelser og talernavne i alt. Resultatet gemmes i `items.en_hi` (1/0), fx `SELECT COUNT(*) FROM items WHERE en_hi = 1 AND status = 'faerdig'`. `oversaet-test` viser samme linje i rapporten (stien står nu under `Engelsk fil:`). Efterbehandlingen i Bazarr-tilstand bruger stadig helst den almindelige engelske fil som reference.
 
 ## Hvis noget går galt
 

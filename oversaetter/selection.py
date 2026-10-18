@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from .clients import ApiError, Bazarr, Radarr, SeerrIndex, Sonarr, parse_date
 from .config import Config
 from .db import Database
+from .hi import hi_filename
 
 log = logging.getLogger("oversaetter")
 
@@ -34,6 +35,7 @@ class Candidate:
     source_path: str | None = None
     subtitles_id: int | None = None
     source_desc: str = ""
+    source_hi: bool = False  # Bazarr eller filnavnet siger, at den eksterne engelske fil er HI/SDH
 
     @property
     def key(self) -> str:
@@ -105,18 +107,27 @@ def has_danish(subtitles: list[dict]) -> dict | None:
     return None
 
 
-def choose_source(subtitles: list[dict]) -> tuple[str | None, int | None, str]:
-    """Foretræk ekstern engelsk .srt (ikke forced, helst ikke HI), ellers indlejret engelsk spor."""
+def external_hi(sub: dict) -> bool:
+    """Bazarr markerer filen som HI, eller filnavnet gør (.en.hi.srt / .en.sdh.srt)."""
+    return bool(sub.get("hi")) or hi_filename(str(sub.get("path") or ""))
+
+
+def choose_source(subtitles: list[dict], prefer_hi: bool = True) -> tuple[str | None, int | None, str]:
+    """Foretræk ekstern engelsk .srt (ikke forced, helst HI), ellers indlejret engelsk spor.
+
+    prefer_hi=False: helst ikke HI (efterbehandlingens engelske reference, som før B4-opfølgningen).
+    """
     english = [s for s in subtitles or [] if s.get("code2") == "en" and not s.get("forced")]
     external = [
         s for s in english if s.get("path") and str(s["path"]).lower().endswith(".srt") and os.path.isfile(s["path"])
     ]
-    external.sort(key=lambda s: bool(s.get("hi")))
+    external.sort(key=lambda s: external_hi(s) != prefer_hi)  # stabil: første foretrukne vinder
     if external:
         s = external[0]
-        return s["path"], None, f"ekstern engelsk{' (HI)' if s.get('hi') else ''}: {os.path.basename(s['path'])}"
+        tag = " (HI)" if external_hi(s) else ""
+        return s["path"], None, f"ekstern engelsk{tag}: {os.path.basename(s['path'])}"
     embedded = [s for s in english if not s.get("path") and s.get("embedded_track_id") is not None and s.get("id")]
-    embedded.sort(key=lambda s: bool(s.get("hi")))
+    embedded.sort(key=lambda s: bool(s.get("hi")) != prefer_hi)
     if embedded:
         s = embedded[0]
         return None, int(s["id"]), f"indlejret engelsk spor (id {s['id']}{', HI' if s.get('hi') else ''})"
@@ -287,6 +298,7 @@ class Selector:
             self.no_english(cand, no_source_reason(subtitles), stats)
             return None
         cand.source_path, cand.subtitles_id, cand.source_desc = path, sub_id, desc
+        cand.source_hi = any(external_hi(s) for s in subtitles if path and s.get("path") == path)
         row = self.db.get(cand.key)
         if row is not None and row["status"] == "mangler_engelsk":
             log.info("Engelsk fundet til %s - oversætter", cand.title)

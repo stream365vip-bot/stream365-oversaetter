@@ -9,6 +9,7 @@ tiltale), så de gemmes og sendes til modellen som en note: "[Rick] Let's go.".
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass, field, replace
 
@@ -138,6 +139,12 @@ SPEAKER_RE = re.compile(
     rf"^(?P<pre>(?:\s*(?:<[^>]+>|\{{[^}}]*\}}))*\s*(?:-\s*)?(?:<[^>]+>)*)"
     rf"(?P<name>{_NAME_WORD}(?: {_NAME_WORD}){{0,2}}):(?:\s+|$)"
 )
+
+# Kildens navn (sporets titel eller filnavnet) siger HI/SDH. Indholdet tæller også: mindst HI_MIN lydbeskrivelser
+# eller talernavne = HI (opfølgning på B4, 18.10.2026).
+HI_NAME_RE = re.compile(r"\b(sdh|hi)\b", re.IGNORECASE)
+HI_FILE_TAGS = {"hi", "sdh"}
+HI_MIN = 5
 
 # Korte ord med kolon, der ikke er talernavne ("OK: fint", "TV: nyheder").
 NOT_SPEAKERS = {"OK", "TV", "PS", "AM", "PM", "NO", "YES", "HEY", "NOTE"}
@@ -280,8 +287,8 @@ def note_line(line: str, speaker: str | None) -> str:
     return f"{pre}[{speaker}] {line[len(pre) :]}"
 
 
-def clean(cues: list[Cue]) -> HiResult:
-    """Rens den engelske kilde. Logger tallene én gang, hvis der blev fjernet noget."""
+def clean(cues: list[Cue], quiet: bool = False) -> HiResult:
+    """Rens den engelske kilde. Logger tallene én gang, hvis der blev fjernet noget (ikke med quiet=True)."""
     stats = HiStats()
     out: list[Cue] = []
     notes: list[str] = []
@@ -294,7 +301,7 @@ def clean(cues: list[Cue]) -> HiResult:
         out.append(replace(c, text="\n".join(lines)))
         notes.append("\n".join(note_line(x, s) for x, s in zip(lines, speakers, strict=True)))
         names.update((s, None) for s in speakers if s)
-    if stats.any():
+    if stats.any() and not quiet:
         log.info("HI-rensning: %s", stats.text())
     return HiResult(out, notes, list(names), stats)
 
@@ -302,3 +309,21 @@ def clean(cues: list[Cue]) -> HiResult:
 def passthrough(cues: list[Cue]) -> HiResult:
     """Ingen rensning (oversaet-test --hi off)."""
     return HiResult(list(cues), [c.text for c in cues])
+
+
+def hi_filename(path: str) -> bool:
+    """Filnavnet er markeret som HI: "Film.en.hi.srt", "Film.en.sdh.srt" (eller "Film.hi.en.srt")."""
+    tokens = os.path.basename(path).lower().split(".")[1:-1]
+    return bool(HI_FILE_TAGS & set(tokens[-2:]))
+
+
+def source_kind(stats: HiStats, by_name: bool, label: str = "") -> tuple[bool, str]:
+    """Er den engelske kilde HI? Ja, når navn/disposition siger det, eller hi.py fandt mindst HI_MIN
+    lydbeskrivelser eller talernavne. Returnerer (HI, linje til loggen/rapporten)."""
+    found = stats.sounds + stats.speakers
+    if not by_name and found < HI_MIN:
+        return False, "Engelsk kilde: almindelig"
+    why = [label] if label else []
+    if not by_name:
+        why.append(f"indhold: {found} lydbeskrivelser/talernavne")
+    return True, "Engelsk kilde: HI" + (f" ({'; '.join(why)})" if why else "")

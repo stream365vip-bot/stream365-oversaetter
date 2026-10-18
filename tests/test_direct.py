@@ -250,7 +250,7 @@ def test_embedded_track_is_extracted_with_ffmpeg(arr, tmp_path):
     r.run_once()
     assert [c[0] for c in commands.calls] == ["ffprobe", "ffmpeg"]
     ff = commands.calls[1]
-    assert ff[ff.index("-map") + 1] == "0:6" and ff[ff.index("-i") + 1] == video and "srt" in ff
+    assert ff[ff.index("-map") + 1] == "0:3" and ff[ff.index("-i") + 1] == video and "srt" in ff  # SDH foretrækkes
     assert "Hvor er bilen?" in da_text(video)
     assert db.get("movie:1")["status"] == "faerdig"
 
@@ -292,11 +292,11 @@ def test_ffmpeg_timeout_is_a_normal_failure(arr, tmp_path):
     assert "blev ikke færdig" in db.get("movie:1")["reason"]
 
 
-def test_pick_stream_prefers_non_sdh():
-    picked, _ = pick_stream([stream(3, hi=1), stream(4, title="SDH"), stream(5, title="English")])
-    assert picked["index"] == 5
-    picked, _ = pick_stream([stream(3, title="SDH")])
-    assert picked["index"] == 3  # kun SDH: så bruges det
+def test_pick_stream_prefers_sdh():
+    picked, _ = pick_stream([stream(5, title="English"), stream(3, hi=1), stream(4, title="SDH")])
+    assert picked["index"] == 3  # disposition hearing_impaired=1
+    picked, _ = pick_stream([stream(5, title="English")])
+    assert picked["index"] == 5  # kun et almindeligt spor: så bruges det
     assert pick_stream([stream(3, lang="ger")]) == (None, "ingen engelsk tekstkilde i videoen")
 
 

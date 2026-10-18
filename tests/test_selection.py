@@ -157,7 +157,7 @@ def test_embedded_english_is_used_when_no_external(arr, tmp_path):
     assert cands[0].subtitles_id == 42 and cands[0].source_path is None
 
 
-def test_choose_source_prefers_external_non_hi_and_skips_forced(tmp_path):
+def test_choose_source_prefers_external_hi_and_skips_forced(tmp_path):
     files = {}
     for name in ("a.en.hi.srt", "a.en.srt", "a.en.forced.srt"):
         p = tmp_path / name
@@ -170,9 +170,11 @@ def test_choose_source_prefers_external_non_hi_and_skips_forced(tmp_path):
         embedded("en", 5),
     ]
     path, sub_id, _ = choose_source(subs)
-    assert path == files["a.en.srt"] and sub_id is None
-    path, _, _ = choose_source([en_sub(files["a.en.hi.srt"], hi=True), embedded("en", 5)])
-    assert path == files["a.en.hi.srt"]
+    assert path == files["a.en.hi.srt"] and sub_id is None
+    path, _, _ = choose_source(subs, prefer_hi=False)  # efterbehandlingens reference: som før
+    assert path == files["a.en.srt"]
+    path, _, _ = choose_source([en_sub(files["a.en.srt"]), embedded("en", 5)])
+    assert path == files["a.en.srt"]
 
 
 def test_finished_items_are_not_picked_again(arr, tmp_path):

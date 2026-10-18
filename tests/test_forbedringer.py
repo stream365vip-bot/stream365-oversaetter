@@ -28,7 +28,7 @@ from oversaetter.oversaet import (
 )
 from oversaetter.selection import Candidate
 from tests.fakes import FakeArr, en_sub
-from tests.helpers import cfg, srt
+from tests.helpers import cfg, srt, system_text
 from tests.test_direct import Clock, reply
 from tests.test_direct import runner as direct_runner
 from tests.test_oversaet import FakeProvider, request_payload, translations
@@ -255,7 +255,7 @@ def test_glossary_failure_translates_without(tmp_path, capsys, caplog):
     fake = SmartClaude(glossary=RuntimeError("nede"))
     with caplog.at_level(logging.WARNING, logger="oversaetter"):
         assert run_translate_test(cfg(), en, str(tmp_path / "u.srt"), "anthropic", "m", client=fake, glossary=True) == 0
-    assert fake.of("oversæt")[0]["system"] == SYSTEM_PROMPT
+    assert system_text(fake.of("oversæt")[0]["system"]) == SYSTEM_PROMPT
     assert "oversætter uden ordliste" in caplog.text and "Ordliste: kunne ikke laves" in capsys.readouterr().out
 
 
@@ -330,7 +330,7 @@ def test_drift_with_failing_context_translates_without(arr, tmp_path, caplog):
             )
         )
     assert db.get("episode:5")["status"] == "faerdig"
-    assert claude.of("oversæt")[0]["system"] == SYSTEM_PROMPT
+    assert system_text(claude.of("oversæt")[0]["system"]) == SYSTEM_PROMPT
     assert "oversætter uden kontekst" in caplog.text
 
 

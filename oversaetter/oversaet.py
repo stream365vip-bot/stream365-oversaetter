@@ -18,7 +18,18 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 
 from . import ordliste
-from .checks import INTERJECTIONS, NOT_NAMES, WORD_RE, EnglishIndex, check_all, only_filler, plain
+from .checks import (
+    INFO_FLAGS,
+    INTERJECTIONS,
+    NOT_NAMES,
+    WORD_RE,
+    EnglishIndex,
+    check_all,
+    count_info,
+    fix_flags,
+    only_filler,
+    plain,
+)
 from .config import Config, model_price, read_key
 from .deadline import call_with_timeout
 from .srt import Cue, read_file, write_file_atomic
@@ -114,10 +125,16 @@ translated unless they are names. Wrong: "John" -> "Jens". Right: "John".
 13. Other foreign languages in the source (French, Spanish ...) stay exactly as written. Wrong: "Merci." -> "Tak." \
 Right: "Merci."
 14. Negations stay correct. Wrong: "Do not disrespect my science" -> "Respektér ikke min videnskab." Right: "Vis \
-lidt respekt for min videnskab."
+lidt respekt for min videnskab." A yes-answer to a negative question keeps its meaning: "Diane har vel ikke noget \
+imod det?" - "Definitely." Wrong: "Bestemt ikke." Right: "Nej, slet ikke." or "Helt sikkert."
 15. Swearing, insults and slang: same strength as the source, plural stays plural, and translate what the \
 character means. "Sue me." -> "Så sagsøg mig." "Let's go." -> "Kom så." "Executive decision." -> "Det bestemmer \
 jeg." "Bet." -> "Aftale." "beast" -> "uhyre" (never "bestie"). Wrong: "Fancy." -> "Fancy." Right: "Fint."
+Fixed translations (never leave these in English): "bitch" -> "kælling", "bitches" -> "kællinger", "dude" -> \
+"mand"/"makker", "nobody"/"nobodies" (a loser) -> "et nul"/"nuller", "crew" -> "bande"/"hold", "bossman" -> \
+"chefen", "Mr."/"Mrs." -> "hr."/"fru", "guys" -> "folkens"/"venner", "keep shooting" (with a gun) -> "bliv ved med \
+at skyde". Translate "Oh my God"/"Jesus" consistently as "Åh gud" (not "Herregud" in between), unless the film \
+glossary says otherwise.
 16. Consistency: use the same Danish word for a name or recurring term every time. Follow the film glossary (if \
 given) exactly and use its "address" (du/De) between the same characters through the whole film. "glossary" in the \
 request shows how names and recurring terms were translated earlier in this file: follow it. Wrong: "Store Mike" \
@@ -173,9 +190,11 @@ class KeyMissing(Exception):
 @dataclass
 class Reply:
     text: str
-    input_tokens: int
+    input_tokens: int  # almindelige tokens ind (uden prompt-cachens)
     output_tokens: int
     stop: str  # "ok", "refusal", "max_tokens", "content_filter" ...
+    cache_read: int = 0  # tokens læst fra prompt-cachen (10 % af inputprisen)
+    cache_write: int = 0  # tokens skrevet til prompt-cachen (125 % af inputprisen)
 
 
 @dataclass
@@ -184,9 +203,11 @@ class TranslateResult:
     fallback: list[int] = field(default_factory=list)  # positioner (0-baseret) der beholdt den engelske tekst
     batches: int = 0
     calls: int = 0
-    input_tokens: int = 0
+    input_tokens: int = 0  # uden prompt-cachens tokens
     output_tokens: int = 0
-    usage: dict[str, list[int]] = field(default_factory=dict)  # model -> [tokens ind, tokens ud]
+    cache_read: int = 0
+    cache_write: int = 0
+    usage: dict[str, list[int]] = field(default_factory=dict)  # model -> [ind, ud, cache-læs, cache-skriv]
     by_fallback: int = 0  # replikker oversat af fallback-modellen efter refusal
     timed_out: bool = False  # tidsgrænsen (deadline) blev nået, før alle bidder var oversat
 
@@ -247,10 +268,16 @@ def ask_model(
             },
         )
         usage = getattr(response, "usage", None)
-        inp = sum(_int(usage, n) for n in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
         text = next((b.text for b in getattr(response, "content", []) if getattr(b, "type", "") == "text"), "")
         stop = getattr(response, "stop_reason", None)
-        return Reply(text, inp, _int(usage, "output_tokens"), "ok" if stop in ("end_turn", None) else str(stop))
+        return Reply(
+            text,
+            _int(usage, "input_tokens"),
+            _int(usage, "output_tokens"),
+            "ok" if stop in ("end_turn", None) else str(stop),
+            _int(usage, "cache_read_input_tokens"),
+            _int(usage, "cache_creation_input_tokens"),
+        )
 
     kwargs = {}
     if provider == "gemini" and effort:
@@ -292,7 +319,7 @@ def clean_da(text: str) -> str:
 def valid_lines(lines: list, wanted: set[int], empty_ok: set[int] = frozenset()) -> tuple[dict[int, str], list[str]]:
     """Gyldige oversættelser {nummer: tekst} og en liste med problemer (manglende, ekstra eller tomme numre).
 
-    empty_ok: numre, der må få tom tekst (v4: replikker, der kun består af fyldlyde).
+    empty_ok: numre, der må få tom tekst eller mangle i svaret (v4: replikker, der kun består af fyldlyde).
     """
     found: dict[int, str] = {}
     extra: list = []
@@ -310,6 +337,9 @@ def valid_lines(lines: list, wanted: set[int], empty_ok: set[int] = frozenset())
             empty.append(i)
             continue
         found.setdefault(i, clean_da(da))
+    for i in empty_ok & wanted:
+        if i not in found and i not in empty:
+            found[i] = ""  # en udeladt fyldlyd tæller som tom - intet genforsøg
     problems = []
     missing = sorted(wanted - found.keys() - set(empty))
     if missing:
@@ -409,7 +439,7 @@ def make_glossary(
 
     def usage(inp: int, out: int) -> None:
         if on_usage is not None:
-            on_usage(model, inp, out)
+            on_usage(model, inp, out, 0, 0)
 
     wl = ordliste.build(ask, en, context, previous, usage)
     if wl is not None:
@@ -418,7 +448,7 @@ def make_glossary(
 
 
 def filler_positions(en: list[str], version: str) -> set[int]:
-    """v4: positioner, hvor replikken kun er fyldlyde og må få tom tekst."""
+    """v4: positioner, hvor replikken kun er fyldlyde/interjektioner (checks.FILLER) og må få tom tekst."""
     return {p for p, t in enumerate(en) if only_filler(t)} if version == "v4" else set()
 
 
@@ -445,13 +475,15 @@ def translate_all(
     system: str | None = None,
     parallel: int = 1,
     empty_ok: set[int] = frozenset(),
+    cache: bool | None = None,
 ) -> TranslateResult:
     """Oversæt alle replikker i bidder.
 
     fallback_model: afvises en bid (refusal) også efter halvering, prøves den med denne model.
-    on_usage(model, tokens_ind, tokens_ud): kaldes efter hvert svar (bruges til budgettet i driften).
+    on_usage(model, tokens_ind, tokens_ud, cache_læs, cache_skriv): kaldes efter hvert svar (budgettet i driften).
     deadline: tidspunkt (efter clock) hvor oversættelsen stopper; resten beholder den engelske tekst.
-    system: systeminstruksen (standard v3 uden kontekst); en anden instruks markeres til prompt-cachen.
+    system: systeminstruksen (standard v3 uden kontekst).
+    cache: marker systeminstruksen til Anthropics prompt-cache (PROMPT_CACHE). None: kun en anden instruks end v3.
     parallel: så mange bidder sendes samtidig (tråde). De danske "foregående" linjer sendes kun, når de er færdige.
     empty_ok: positioner (0-baseret), der må få tom tekst (v4: kun fyldlyde).
     """
@@ -461,7 +493,8 @@ def translate_all(
     fallback: set[int] = set()
     glossary = Glossary(en)
     system = system or SYSTEM_PROMPT
-    cache = system != SYSTEM_PROMPT
+    if cache is None:
+        cache = system != SYSTEM_PROMPT
     lock = threading.RLock()  # bogføring (tokens, budget, da, fallback) fra flere tråde
 
     def attempt(start: int, end: int, use_model: str = model) -> tuple[dict[int, str], list[str], bool]:
@@ -485,11 +518,15 @@ def translate_all(
         with lock:
             result.input_tokens += reply.input_tokens
             result.output_tokens += reply.output_tokens
-            used = result.usage.setdefault(use_model, [0, 0])
+            result.cache_read += reply.cache_read
+            result.cache_write += reply.cache_write
+            used = result.usage.setdefault(use_model, [0, 0, 0, 0])
             used[0] += reply.input_tokens
             used[1] += reply.output_tokens
+            used[2] += reply.cache_read
+            used[3] += reply.cache_write
             if on_usage is not None:
-                on_usage(use_model, reply.input_tokens, reply.output_tokens)
+                on_usage(use_model, reply.input_tokens, reply.output_tokens, reply.cache_read, reply.cache_write)
         if reply.stop != "ok":
             return {}, [f"svaret blev afbrudt (stop={reply.stop})"], reply.stop == "refusal"
         try:
@@ -675,6 +712,8 @@ def run_translate_test(
     parallel = max(1, parallel)
     on = {True: "on", False: "off"}
     switches = f"prompt {prompt}, kontekst {on[context]}, ordliste {on[glossary]}, parallel {parallel}"
+    cache = cfg.prompt_cache and provider == "anthropic"
+    switches += f", prompt-cache {on[cache]}"
 
     started = clock()
     log.info("oversaet-test: %d replikker, %s/%s, bidder af %d, %s", len(en_cues), provider, model, batch, switches)
@@ -699,6 +738,7 @@ def run_translate_test(
         system=system,
         parallel=parallel,
         empty_ok=filler_positions(en, prompt),
+        cache=cache,
     )
     kept, fallback = drop_empty(res.da, res.fallback)
     da_cues: list[Cue] = [replace(en_cues[p], text=res.da[p]) for p in kept]
@@ -706,13 +746,24 @@ def run_translate_test(
     elapsed = clock() - started
 
     # De skarpere flag vises altid i rapporten, så v3 og v4 kan sammenlignes på samme kontrol.
-    flags = check_all(da_cues, EnglishIndex(en_cues), cfg.max_line_chars, cfg.bad_words(), wordlist, strict=True)
-    counts = Counter(f for fl in flags.values() for f in fl)
+    flags = check_all(
+        da_cues,
+        EnglishIndex(en_cues),
+        cfg.max_line_chars,
+        cfg.bad_words(),
+        wordlist,
+        strict=True,
+        reading_speed_max=cfg.reading_speed_max,
+    )
+    # Informationsflag (fx reading_speed) tælles for sig: de ville ikke blive sendt i rettelsesrunden.
+    fix = fix_flags(flags)
+    counts = Counter(f for fl in fix.values() for f in fl)
+    info_counts = Counter(f for fl in flags.values() for f in fl if f in INFO_FLAGS)
     inp, outp = res.input_tokens, res.output_tokens
     if wordlist is not None:
         inp, outp = inp + wordlist.input_tokens, outp + wordlist.output_tokens
-    cost = model_price(model, inp, outp)
-    examples = [f"  #{p + 1} {', '.join(fl)}: {da_cues[p].text.replace(chr(10), ' / ')}" for p, fl in flags.items()]
+    cost = model_price(model, inp, outp, res.cache_read, res.cache_write)
+    examples = [f"  #{p + 1} {', '.join(fl)}: {da_cues[p].text.replace(chr(10), ' / ')}" for p, fl in fix.items()]
     if not glossary:
         glossary_line = "Ordliste: slået fra"
     elif wordlist is None:
@@ -733,12 +784,15 @@ def run_translate_test(
             f"Replikker: {len(en_cues)}"
             + (f" (heraf {len(en_cues) - len(kept)} med kun fyldlyde fjernet)" if len(kept) < len(en_cues) else ""),
             f"Bidder: {res.batches} (kald i alt: {res.calls})",
-            f"Tokens ind: {inp}",
+            f"Tokens ind: {inp + res.cache_read + res.cache_write}"
+            + (f" (heraf cache-læs {res.cache_read}, cache-skriv {res.cache_write})" if cache else ""),
             f"Tokens ud: {outp}",
             "Pris: " + ("pris ukendt" if cost is None else f"{cost:.4f} USD"),
             f"Tid: {_duration(elapsed)}",
-            f"Flag fra kontrollen: {len(flags)}"
-            + (" (" + ", ".join(f"{k}={v}" for k, v in counts.most_common()) + ")" if flags else ""),
+            f"Rettelsesflag fra kontrollen: {len(fix)}"
+            + (" (" + ", ".join(f"{k}={v}" for k, v in counts.most_common()) + ")" if fix else ""),
+            f"Informationsflag (sendes ikke til rettelse): {count_info(flags)}"
+            + (" (" + ", ".join(f"{k}={v}" for k, v in info_counts.most_common()) + ")" if info_counts else ""),
             *(["Eksempler:", *examples[:10]] if examples else []),
             f"Faldt tilbage til engelsk: {len(fallback)}"
             + (f" (replik {_numbers([p + 1 for p in fallback])})" if fallback else ""),

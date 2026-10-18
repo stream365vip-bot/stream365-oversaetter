@@ -19,6 +19,11 @@ def cue(start_s: float, end_s: float, text: str) -> Cue:
     return Cue(int(start_s * 1000), int(end_s * 1000), text)
 
 
+def system_text(system) -> str:
+    """Systeminstruksen som tekst - også når den er sendt som blok til prompt-cachen (PROMPT_CACHE=true)."""
+    return system if isinstance(system, str) else "".join(b["text"] for b in system)
+
+
 def cfg(**kw) -> Config:
     c = Config(data_dir="/nonexistent", anthropic_api_key_file="/nonexistent")
     for k, v in kw.items():

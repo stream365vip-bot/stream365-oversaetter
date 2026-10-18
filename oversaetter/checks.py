@@ -241,7 +241,29 @@ INTERJECTIONS = {
 }
 
 # Fyldlyde, der udelades i v4. En replik med kun fyldlyde får tom tekst og fjernes fra filen.
-FILLER = {"uh", "uhh", "um", "umm", "uhm", "hm", "hmm", "hmmm", "mm", "mmm", "ah", "ahh", "aah", "ugh", "er", "erm"}
+# Også de rene interjektioner (oh, huh, ooh): en tom oversættelse af dem udløser intet genforsøg (trin B2).
+FILLER = {
+    "uh",
+    "uhh",
+    "um",
+    "umm",
+    "uhm",
+    "hm",
+    "hmm",
+    "hmmm",
+    "mm",
+    "mmm",
+    "ah",
+    "ahh",
+    "aah",
+    "ugh",
+    "er",
+    "erm",
+    "oh",
+    "ohh",
+    "huh",
+    "ooh",
+}
 
 
 def only_filler(text: str) -> bool:
@@ -311,9 +333,29 @@ FLAG_TEXT = {
     "generic_you": "generic English 'you' translated as 'du' - use 'man' (e.g. 'Man ved aldrig')",
     "capitalized_weekday": "weekday or month with a capital letter mid-sentence (write it in lower case)",
     "english_word": "contains an English word",
-    "reading_speed": "too many characters per second on screen - make it shorter",
+    "reading_speed": "too many characters per second on screen - make it shorter",  # kun information
     "inconsistent_term": "a glossary term is translated differently from the film glossary",
 }
+
+
+# Informationsflag tælles i rapporten og loggen, men sendes aldrig i rettelsesrunden (trin B2, 18.10.2026).
+# reading_speed: på korte replikker er det oftest filmens timing, ikke oversættelsen, der er problemet.
+INFO_FLAGS = frozenset({"reading_speed"})
+
+
+def fix_flags(flags: dict[int, list[str]]) -> dict[int, list[str]]:
+    """Kun de flag, der skal rettes: informationsflag fjernes, og replikker med kun informationsflag udelades."""
+    out = {}
+    for pos, fl in flags.items():
+        keep = [f for f in fl if f not in INFO_FLAGS]
+        if keep:
+            out[pos] = keep
+    return out
+
+
+def count_info(flags: dict[int, list[str]]) -> int:
+    """Antal replikker med mindst ét informationsflag."""
+    return sum(1 for fl in flags.values() if any(f in INFO_FLAGS for f in fl))
 
 
 def plain(text: str) -> str:
@@ -381,6 +423,7 @@ def check_cue(
     duration_ms: int = 0,
     glossary=None,
     strict: bool = False,
+    reading_speed_max: float | None = None,
 ) -> list[str]:
     """Flag for én replik. strict=True (PROMPT_VERSION=v4 og oversaet-test) giver også de skarpere flag."""
     flags: list[str] = []
@@ -426,7 +469,7 @@ def check_cue(
             flags.append("capitalized_weekday")
         if english_word(da, en, glossary) and "identical_to_english" not in flags:
             flags.append("english_word")
-        if reading_speed(da, en, duration_ms):
+        if reading_speed(da, en, duration_ms, reading_speed_max or MAX_CPS):
             flags.append("reading_speed")
         if en and inconsistent_term(da, en, glossary):
             flags.append("inconsistent_term")
@@ -538,9 +581,31 @@ ENGLISH_ONLY = {
     "everything",
     "guys",
     "anyway",
+    # slang, bandeord og tiltaler (trin B2: blev stående uden flag i test14)
+    "bitch",
+    "bitches",
+    "dude",
+    "nobody",
+    "nobodies",
+    "crew",
+    "bossman",
+    "boss",
+    "mr",
+    "mrs",
+    "miss",
+    "sir",
+    "ma'am",
+    "buddy",
+    "girl",
 }
+DANISH_APOSTROPHE_ENDINGS = {"en", "et", "s", "er", "erne", "ene", "ens", "ets"}
+# Titler flages også, når ordlisten har navnet uændret ("Mr. Vice" -> "Mr. Vice" skal være "hr. Vice").
+TITLES = {"mr", "mrs", "miss", "sir", "ma'am"}
+# "Man" som engelsk udbrud: stort M og ikke efterfulgt af et ord ("Man!", "Man, det er koldt."). "Man ved aldrig"
+# og ", man" er dansk og må stå.
+ENGLISH_MAN_RE = re.compile(r"(?<![\wæøåÆØÅ'])Man(?=\s*(?:[,!?.…]|$))", re.MULTILINE)
 # Ord der må stå (låneord og ord, der er almindelige i dansk tale).
-ENGLISH_ALLOWED = ALLOWED_LOANWORDS | {"sorry", "awesome", "weird", "fair", "deal", "date", "party"}
+ENGLISH_ALLOWED = ALLOWED_LOANWORDS | {"sorry", "awesome", "weird", "fair", "deal", "date", "party", "vibe"}
 
 # Enkelte ord, der er ens på dansk og engelsk, så en ens replik ikke er en fejl.
 SAME_WORDS = {
@@ -626,7 +691,7 @@ FOREIGN_WORDS = {
     "niet",
     "spasibo",
 }
-MAX_CPS = 20.0
+MAX_CPS = 25.0  # standard for READING_SPEED_MAX (hævet fra 20 i trin B2)
 
 
 def _glossary_terms(glossary) -> list[dict]:
@@ -700,19 +765,22 @@ def capitalized_weekday(da: str) -> bool:
 
 
 def english_word(da: str, en: str = "", glossary=None) -> bool:
-    names = _glossary_names(glossary)
+    names = _glossary_names(glossary) - TITLES
     for w in _words(da):
+        base, _, ending = w.partition("'")
+        if ending in DANISH_APOSTROPHE_ENDINGS:
+            w = base  # "crew'et", "bitch'en"
         if w in ENGLISH_ONLY and w not in ENGLISH_ALLOWED and w not in names:
             return True
-    return False
+    return bool(ENGLISH_MAN_RE.search(plain(da)))
 
 
-def reading_speed(da: str, en: str, duration_ms: int) -> bool:
-    """Over MAX_CPS tegn pr. sekund - men kun når den danske tekst ikke allerede er kortere end den engelske."""
+def reading_speed(da: str, en: str, duration_ms: int, max_cps: float = MAX_CPS) -> bool:
+    """Over max_cps tegn pr. sekund - men kun når den danske tekst ikke allerede er kortere end den engelske."""
     if duration_ms <= 0:
         return False
     text = plain(da).replace("\n", " ").strip()
-    if len(text) / (duration_ms / 1000) <= MAX_CPS:
+    if len(text) / (duration_ms / 1000) <= max_cps:
         return False
     return len(text) >= len(plain(en).replace("\n", " ").strip())
 
@@ -770,12 +838,15 @@ def check_all(
     bad_words: frozenset[str] | None = None,
     glossary=None,
     strict: bool = False,
+    reading_speed_max: float | None = None,
 ) -> dict[int, list[str]]:
-    """Returnerer {position (0-baseret): [flag]} for replikker med fejl."""
+    """Returnerer {position (0-baseret): [flag]} for replikker med fejl (inkl. informationsflag, se INFO_FLAGS)."""
     result: dict[int, list[str]] = {}
     for pos, cue in enumerate(da_cues):
         en = en_index.text_for(cue)
-        flags = check_cue(cue.text, en, max_line_chars, bad_words, cue.end - cue.start, glossary, strict)
+        flags = check_cue(
+            cue.text, en, max_line_chars, bad_words, cue.end - cue.start, glossary, strict, reading_speed_max
+        )
         if flags:
             result[pos] = flags
     return result

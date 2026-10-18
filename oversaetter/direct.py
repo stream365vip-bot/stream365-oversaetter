@@ -18,7 +18,7 @@ import subprocess
 import time
 from dataclasses import dataclass, replace
 
-from .checks import FLAG_TEXT, EnglishIndex, check_all, plain
+from .checks import FLAG_TEXT, EnglishIndex, check_all, count_info, fix_flags, plain
 from .clients import ApiError, Bazarr
 from .config import Config, model_price
 from .credit import apply_credit
@@ -69,8 +69,9 @@ class DirectOutcome:
     reason: str = ""
     permanent: bool = False
     lines: int = 0
-    flags_before: int = 0
+    flags_before: int = 0  # rettelsesflag (uden informationsflag)
     flags_after: int = 0
+    info_flags: int = 0  # replikker med informationsflag (fx reading_speed) - tælles, men rettes ikke
     fixes: int = 0
     fallback_english: int = 0
     by_fallback: int = 0
@@ -92,7 +93,8 @@ class DirectOutcome:
                 extra += f", ordliste: {self.glossary_terms} termer"
             extra += f", tomme fjernet: {self.removed_empty}"
         return (
-            f"model: {self.model}, replikker: {self.lines}, flag: {self.flags_before}, rettelser: {self.fixes}, "
+            f"model: {self.model}, replikker: {self.lines}, flag: {self.flags_before}, "
+            f"informationsflag: {self.info_flags}, rettelser: {self.fixes}, "
             f"flag efter: {self.flags_after}, beholdt engelsk: {self.fallback_english}, "
             f"fallback-model: {self.by_fallback}, pris: {self.cost:.4f} USD, tid: {duration(self.seconds)}, "
             f"{self.delivery}, {self.credit}{extra}"
@@ -248,9 +250,17 @@ def fix_flagged(
         log.error("Rettelsesrunden fejlede (%s: %s) - ingen rettelser", type(e).__name__, str(e)[:200])
         return {}
     usage = getattr(response, "usage", None)
-    names = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
-    inp = sum(int(getattr(usage, n, 0) or 0) for n in names)
-    on_usage(cfg.translate_model, inp, int(getattr(usage, "output_tokens", 0) or 0))
+
+    def get(name: str) -> int:
+        return int(getattr(usage, name, 0) or 0)
+
+    on_usage(
+        cfg.translate_model,
+        get("input_tokens"),
+        get("output_tokens"),
+        get("cache_read_input_tokens"),
+        get("cache_creation_input_tokens"),
+    )
     stop = getattr(response, "stop_reason", None)
     if stop not in ("end_turn", None):
         log.error("Rettelsesrunden blev afbrudt (stop_reason=%s) - ingen rettelser", stop)
@@ -307,13 +317,13 @@ class DirectTranslator:
         deadline = started + cfg.translate_timeout_minutes * 60
         spent = {"cost": 0.0}
 
-        def on_usage(model: str, inp: int, out: int) -> None:
-            cost = model_price(model, inp, out)
+        def on_usage(model: str, inp: int, out: int, cache_read: int = 0, cache_write: int = 0) -> None:
+            cost = model_price(model, inp, out, cache_read, cache_write)
             if cost is None:
-                cost = cfg.price(inp, out)
+                cost = cfg.price(inp, out, cache_read, cache_write)
                 log.warning("Ukendt pris for %s - bruger PRICE_INPUT_PER_M/PRICE_OUTPUT_PER_M", model)
             spent["cost"] += cost
-            self.budget.record(cand.key, inp, out, cost)
+            self.budget.record(cand.key, inp + cache_read + cache_write, out, cost)
 
         log.info(
             "Gyldig søgning fandt ikke dansk - oversætter %s selv (%s) med %s (effort %s): %d replikker fra %s",
@@ -364,7 +374,10 @@ class DirectTranslator:
             system=system,
             parallel=cfg.parallel,
             empty_ok=filler_positions(en, cfg.prompt_version),
+            cache=cfg.prompt_cache,
         )
+        if res.cache_read or res.cache_write:
+            log.info("Prompt-cache: %d tokens læst, %d tokens skrevet", res.cache_read, res.cache_write)
         outcome.fallback_english, outcome.by_fallback = len(res.fallback), res.by_fallback
         if res.timed_out:
             outcome.cost, outcome.seconds = spent["cost"], self.clock() - started
@@ -392,10 +405,17 @@ class DirectTranslator:
         bad_words = cfg.bad_words()
         kept_english = set(fallback)
         strict = cfg.prompt_version == "v4"
-        flags = check_all(da, en_index, cfg.max_line_chars, bad_words, wordlist, strict)
+        speed = cfg.reading_speed_max
+        flags = check_all(da, en_index, cfg.max_line_chars, bad_words, wordlist, strict, speed)
         flags = {p: f for p, f in flags.items() if p not in kept_english}  # afviste replikker sendes ikke igen
+        outcome.info_flags = count_info(flags)
+        flags = fix_flags(flags)  # informationsflag (reading_speed) sendes aldrig i rettelsesrunden
         outcome.flags_before = len(flags)
-        log.info("Kontrol efter oversættelse: %d replikker flaget", len(flags))
+        log.info(
+            "Kontrol efter oversættelse: %d replikker flaget til rettelse, %d med informationsflag",
+            len(flags),
+            outcome.info_flags,
+        )
         if flags:
             left = deadline - self.clock()
             if self.budget.spent() >= cfg.monthly_budget_usd:
@@ -409,7 +429,7 @@ class DirectTranslator:
                 outcome.fixes = len(fixes)
                 sent = min(len(flags), cfg.max_fix_lines)
                 log.info("Rettelsesrunde: %d af %d flagede replikker rettet", len(fixes), sent)
-        after = check_all(da, en_index, cfg.max_line_chars, bad_words, wordlist, strict)
+        after = fix_flags(check_all(da, en_index, cfg.max_line_chars, bad_words, wordlist, strict, speed))
         outcome.flags_after = len([p for p in after if p not in kept_english])
 
         final, outcome.credit = apply_credit(da, cfg.credit_text)

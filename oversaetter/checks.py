@@ -6,6 +6,7 @@ import bisect
 import functools
 import re
 
+from .hi import speaker_prefix
 from .srt import Cue
 
 TAG_RE = re.compile(r"<[^>]+>|\{[^}]*\}")
@@ -336,6 +337,7 @@ FLAG_TEXT = {
     "reading_speed": "too many characters per second on screen - make it shorter",  # kun information
     "inconsistent_term": "a glossary term is translated differently from the film glossary",
     "mixed_case": "a made-up word with a capital letter inside it (e.g. 'sundhedsTHC') - translate the meaning",
+    "hi_rest": "contains [brackets] or a speaker name like 'RICK:' from the English source - remove them",
 }
 
 
@@ -449,6 +451,8 @@ def check_cue(
         flags.append("english_misspelling")
     if has_known_bad_word(da, bad_words):
         flags.append("known_bad_word")
+    if hi_rest(da):
+        flags.append("hi_rest")
     if en:
         da_nums = _numbers(da)
         da_digits = re.sub(r"\D", "", plain(da))
@@ -868,6 +872,13 @@ def mixed_case(da: str) -> bool:
         if MIXED_CASE_RE.search(w):
             return True
     return False
+
+
+def hi_rest(da: str) -> bool:
+    """Rester fra en HI-kilde i den danske tekst: [klammer] (fx talernoten "[Rick]") eller "NAVN:" først i en linje."""
+    if "[" in da or "]" in da:
+        return True
+    return any(speaker_prefix(line) for line in da.split("\n"))
 
 
 class EnglishIndex:

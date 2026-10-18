@@ -108,6 +108,7 @@ def main(argv: list[str] | None = None) -> int:
     o.add_argument("--glossary", choices=("on", "off"), default="off", help="ordliste pr. film før bidderne")
     o.add_argument("--tmdb-id", help="TMDB-id til konteksten, fx 12345 (film) eller tv:12345 (serie)")
     o.add_argument("--parallel", type=int, default=1, help="så mange bidder samtidig (standard 1)")
+    o.add_argument("--hi", choices=("on", "off"), default="on", help="rens HI/SDH-kilden før bidderne (standard on)")
     args = parser.parse_args(argv)
 
     cfg = Config.from_env()
@@ -128,6 +129,7 @@ def main(argv: list[str] | None = None) -> int:
             glossary=args.glossary == "on",
             tmdb_id=args.tmdb_id,
             parallel=args.parallel,
+            hi_clean=args.hi == "on",
         )
     from .runner import main as run_main
 

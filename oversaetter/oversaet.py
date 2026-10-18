@@ -17,7 +17,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 
-from . import ordliste
+from . import hi, ordliste
 from .checks import (
     INFO_FLAGS,
     INTERJECTIONS,
@@ -145,6 +145,8 @@ request shows how names and recurring terms were translated earlier in this file
 in one cue and "Big Mike" in the next. Right: the same every time.
 17. "context_before" (the previous cues with their finished Danish translation) and "context_after" (the next \
 cues) are only for understanding. Never translate, repeat or return them. Reply with JSON only, no notes.
+Et navn i [klammer] foran en linje fortæller, hvem der taler. Brug det til du/I, han/hun og tiltale. Skriv aldrig \
+navnet eller klammerne i den danske tekst.
 
 Format: write a line break as \\n. Reply ONLY with JSON of the form {"lines":[{"i":<number>,"da":"<Danish text>"}]} \
 with exactly one entry for every number in "lines" and no others."""
@@ -409,8 +411,12 @@ class Glossary:
         return out[::-1]
 
 
-def build_user(en: list[str], da: list[str | None], start: int, end: int, glossary: list) -> str:
+def build_user(
+    en: list[str], da: list[str | None], start: int, end: int, glossary: list, notes: list[str] | None = None
+) -> str:
+    """notes: de engelske replikker med talernavne som note ("[Rick] Let's go."), sendes i stedet for en (trin B4)."""
     before = range(max(0, start - CONTEXT_BEFORE), start)
+    en = notes or en
     payload = {
         "glossary": glossary,
         "context_before": [{"i": p + 1, "en": en[p], "da": da[p]} for p in before if da[p] is not None],
@@ -435,8 +441,13 @@ def make_glossary(
     previous: ordliste.Wordlist | None,
     timeout: float,
     on_usage=None,
+    speakers: list[str] | None = None,
+    notes: list[str] | None = None,
 ) -> ordliste.Wordlist | None:
-    """Ordlisten pr. film med ét kald til samme model som oversættelsen. None (med en WARNING) ved fejl."""
+    """Ordlisten pr. film med ét kald til samme model som oversættelsen. None (med en WARNING) ved fejl.
+
+    speakers/notes: talernavne fra en HI-kilde (trin B4), så tiltalen (address) bliver bedre.
+    """
 
     def ask(system: str, user: str, schema: dict) -> Reply:
         return call_with_timeout(ask_model, timeout, provider, client, model, effort, system, user, schema)
@@ -445,10 +456,15 @@ def make_glossary(
         if on_usage is not None:
             on_usage(model, inp, out, 0, 0)
 
-    wl = ordliste.build(ask, en, context, previous, usage)
+    wl = ordliste.build(ask, en, context, previous, usage, speakers, notes)
     if wl is not None:
         wl.cost = model_price(model, wl.input_tokens, wl.output_tokens)
     return wl
+
+
+def speaker_notes(hi_result, version: str) -> list[str] | None:
+    """Talernavnene som note i modellens input - kun med prompt v4, som forklarer noten (trin B4)."""
+    return hi_result.notes if version == "v4" and hi_result.speakers else None
 
 
 def filler_positions(en: list[str], version: str) -> set[int]:
@@ -480,6 +496,7 @@ def translate_all(
     parallel: int = 1,
     empty_ok: set[int] = frozenset(),
     cache: bool | None = None,
+    notes: list[str] | None = None,
 ) -> TranslateResult:
     """Oversæt alle replikker i bidder.
 
@@ -490,6 +507,7 @@ def translate_all(
     cache: marker systeminstruksen til Anthropics prompt-cache (PROMPT_CACHE). None: kun en anden instruks end v3.
     parallel: så mange bidder sendes samtidig (tråde). De danske "foregående" linjer sendes kun, når de er færdige.
     empty_ok: positioner (0-baseret), der må få tom tekst (v4: kun fyldlyde).
+    notes: samme replikker med talernavne som note (hi.HiResult.notes); kun i modellens input, aldrig i filen.
     """
     n = len(en)
     da: list[str | None] = [None] * n
@@ -509,7 +527,8 @@ def translate_all(
             result.timed_out = True
             return {}, ["tidsgrænsen for hele filen er nået"], False
         with lock:
-            user = build_user(en, da, start, end, glossary.pairs(en, da, start, start - CONTEXT_BEFORE, fallback))
+            pairs = glossary.pairs(en, da, start, start - CONTEXT_BEFORE, fallback)
+            user = build_user(en, da, start, end, pairs, notes)
             result.calls += 1
         try:
             reply = call_with_timeout(
@@ -683,6 +702,7 @@ def run_translate_test(
     tmdb_id: str | None = None,
     parallel: int = 1,
     http=None,
+    hi_clean: bool = True,
 ) -> int:
     if os.path.abspath(out) == os.path.abspath(en_path):
         log.error("--out må ikke være den samme fil som --en")
@@ -704,6 +724,11 @@ def run_translate_test(
     if not en_cues:
         log.error("Der er ingen replikker i %s", en_path)
         return 2
+    hi_result = hi.clean(en_cues) if hi_clean else hi.passthrough(en_cues)
+    en_cues = hi_result.cues
+    if not en_cues:
+        log.error("Der er ingen replikker tilbage i %s efter HI-rensningen", en_path)
+        return 2
     if client is None:
         try:
             client = make_client(provider, cfg)
@@ -717,11 +742,12 @@ def run_translate_test(
     on = {True: "on", False: "off"}
     switches = f"prompt {prompt}, kontekst {on[context]}, ordliste {on[glossary]}, parallel {parallel}"
     cache = cfg.prompt_cache and provider == "anthropic"
-    switches += f", prompt-cache {on[cache]}"
+    switches += f", prompt-cache {on[cache]}, hi {on[hi_clean]}"
 
     started = clock()
     log.info("oversaet-test: %d replikker, %s/%s, bidder af %d, %s", len(en_cues), provider, model, batch, switches)
     en = [c.text for c in en_cues]
+    notes = speaker_notes(hi_result, prompt)
     call_timeout = max(1.0, cfg.proofread_call_timeout_minutes * 60)
 
     ctx_text = None
@@ -729,7 +755,9 @@ def run_translate_test(
         ctx_text = _test_context(cfg, tmdb_id, http)
     wordlist = None
     if glossary:
-        wordlist = make_glossary(provider, client, model, effort, en, ctx_text, None, call_timeout)
+        wordlist = make_glossary(
+            provider, client, model, effort, en, ctx_text, None, call_timeout, None, hi_result.speakers, hi_result.notes
+        )
     system = build_system(prompt, provider, ctx_text, wordlist)
     res = translate_all(
         en,
@@ -743,6 +771,7 @@ def run_translate_test(
         parallel=parallel,
         empty_ok=filler_positions(en, prompt),
         cache=cache,
+        notes=notes,
     )
     kept, fallback = drop_empty(res.da, res.fallback)
     da_cues: list[Cue] = [replace(en_cues[p], text=res.da[p]) for p in kept]
@@ -785,6 +814,9 @@ def run_translate_test(
             f"Kontakter: {switches}",
             "Filmkontekst: " + (f"{len(ctx_text)} tegn" if ctx_text else "ingen"),
             glossary_line,
+            "HI-rensning: "
+            + (hi_result.stats.text() if hi_clean else "slået fra")
+            + (f" (talere: {', '.join(hi_result.speakers)})" if hi_result.speakers else ""),
             f"Replikker: {len(en_cues)}"
             + (f" (heraf {len(en_cues) - len(kept)} med kun fyldlyde fjernet)" if len(kept) < len(en_cues) else ""),
             f"Bidder: {res.batches} (kald i alt: {res.calls})",

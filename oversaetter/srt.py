@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 TIME_RE = re.compile(
     r"^\s*(\d{1,3}):(\d{1,2}):(\d{1,2})[,.](\d{1,3})\s*-->\s*(\d{1,3}):(\d{1,2}):(\d{1,2})[,.](\d{1,3})(.*)$"
@@ -89,6 +89,14 @@ def parse(text: str) -> list[Cue]:
     return cues
 
 
+# Talerstreg først i en linje (efter evt. tags): "-Tekst" og "–Tekst" skrives som "- Tekst" (trin B4c).
+DASH_RE = re.compile(r"^((?:<[^>]+>|\{[^}]*\})*)[-–][ \t]*(?=[^\s\d\-–])", re.MULTILINE)
+
+
+def normalize_dashes(text: str) -> str:
+    return DASH_RE.sub(r"\1- ", text)
+
+
 def compose(cues: list[Cue]) -> str:
     out = []
     for n, cue in enumerate(cues, start=1):
@@ -102,12 +110,12 @@ def read_file(path: str) -> list[Cue]:
 
 
 def write_file_atomic(path: str, cues: list[Cue]) -> None:
-    """Skriv til en midlertidig fil i samme mappe og omdøb den bagefter."""
+    """Skriv til en midlertidig fil i samme mappe og omdøb den bagefter. Talerstreger skrives ensartet som "- "."""
     directory = os.path.dirname(os.path.abspath(path))
     fd, tmp = tempfile.mkstemp(prefix=".oversaetter-", suffix=".tmp", dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            f.write(compose(cues))
+            f.write(compose([replace(c, text=normalize_dashes(c.text)) for c in cues]))
             f.flush()
             os.fsync(f.fileno())
         if os.path.exists(path):

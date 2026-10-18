@@ -240,6 +240,17 @@ INTERJECTIONS = {
     "øh",
 }
 
+# Fyldlyde, der udelades i v4. En replik med kun fyldlyde får tom tekst og fjernes fra filen.
+FILLER = {"uh", "uhh", "um", "umm", "uhm", "hm", "hmm", "hmmm", "mm", "mmm", "ah", "ahh", "aah", "ugh", "er", "erm"}
+
+
+def only_filler(text: str) -> bool:
+    """Replikken består kun af fyldlyde (uh, um, hmm ...) og tegnsætning."""
+    words = [w.lower() for w in WORD_RE.findall(plain(text))]
+    rest = re.sub(r"[\W_]", "", WORD_RE.sub("", plain(text)))
+    return bool(words) and all(w in FILLER for w in words) and not re.search(r"\d", rest)
+
+
 # Engelske ord med stort begyndelsesbogstav, som ikke er navne.
 NOT_NAMES = ENGLISH_WORDS | {
     "hello",
@@ -296,6 +307,12 @@ FLAG_TEXT = {
     "empty": "empty line",
     "identical_to_english": "identical to the English line (not translated)",
     "known_bad_word": "contains a known wrong word (e.g. bestie, please, prank, sweetheart, uansett)",
+    "compound_space": "a compound noun is written as two words (e.g. 'bil nøgle' -> 'bilnøgle')",
+    "generic_you": "generic English 'you' translated as 'du' - use 'man' (e.g. 'Man ved aldrig')",
+    "capitalized_weekday": "weekday or month with a capital letter mid-sentence (write it in lower case)",
+    "english_word": "contains an English word",
+    "reading_speed": "too many characters per second on screen - make it shorter",
+    "inconsistent_term": "a glossary term is translated differently from the film glossary",
 }
 
 
@@ -356,7 +373,16 @@ def has_known_bad_word(text: str, words: frozenset[str] | None = None) -> bool:
     return bool(rx and rx.search(plain(text)))
 
 
-def check_cue(da: str, en: str, max_line_chars: int, bad_words: frozenset[str] | None = None) -> list[str]:
+def check_cue(
+    da: str,
+    en: str,
+    max_line_chars: int,
+    bad_words: frozenset[str] | None = None,
+    duration_ms: int = 0,
+    glossary=None,
+    strict: bool = False,
+) -> list[str]:
+    """Flag for én replik. strict=True (PROMPT_VERSION=v4 og oversaet-test) giver også de skarpere flag."""
     flags: list[str] = []
     p = plain(da).strip()
     if not p:
@@ -384,9 +410,331 @@ def check_cue(da: str, en: str, max_line_chars: int, bad_words: frozenset[str] |
         da_digits = re.sub(r"\D", "", plain(da))
         if any(n not in da_nums and n not in da_digits for n in _numbers(en)):
             flags.append("missing_number")
-        if _norm(da) == _norm(en) and _norm(da) and not _is_names_or_interjections(en):
+        if (
+            _norm(da) == _norm(en)
+            and _norm(da)
+            and not _is_names_or_interjections(en)
+            and not same_is_fine(en, glossary)
+        ):
             flags.append("identical_to_english")
+    if strict:
+        if compound_space(da):
+            flags.append("compound_space")
+        if en and generic_you(da, en):
+            flags.append("generic_you")
+        if capitalized_weekday(da):
+            flags.append("capitalized_weekday")
+        if english_word(da, en, glossary) and "identical_to_english" not in flags:
+            flags.append("english_word")
+        if reading_speed(da, en, duration_ms):
+            flags.append("reading_speed")
+        if en and inconsistent_term(da, en, glossary):
+            flags.append("inconsistent_term")
     return flags
+
+
+# --- skarpere kontrol (18.10.2026). Konservativ: hellere et flag for lidt end en falsk alarm. -------------
+# Sammensætninger, der aldrig er rigtige som to ord. Andet ord må have en dansk endelse (nøglen, vagterne ...).
+COMPOUNDS = [
+    ("bil", "nøgle"),
+    ("hoved", "nøgle"),
+    ("nat", "syn"),
+    ("nattesyns", "brille"),
+    ("tele", "fon"),
+    ("under", "tekst"),
+    ("sikkerheds", "vagt"),
+    ("politi", "station"),
+    ("politi", "bil"),
+    ("hoved", "kvarter"),
+    ("fødsels", "dag"),
+    ("køle", "skab"),
+    ("mobil", "telefon"),
+    ("kredit", "kort"),
+    ("computer", "skærm"),
+    ("sove", "værelse"),
+    ("bade", "værelse"),
+    ("skole", "lærer"),
+    ("dør", "klokke"),
+    ("brand", "mand"),
+]
+_ENDINGS = r"(?:ernes|erne|rnes|rne|ens|ets|en|et|er|ne|n|r|s|e)?"
+COMPOUND_RE = re.compile(
+    r"(?<![\wæøå])(?:" + "|".join(rf"{a} {b}{_ENDINGS}" for a, b in COMPOUNDS) + r")(?![\wæøå])",
+    re.IGNORECASE,
+)
+# "under tekst" er også en præposition + navneord ("under teksten står ...") - kun når det står først.
+UNDER_TEKST_OK_RE = re.compile(r"\bunder tekst", re.IGNORECASE)
+
+GENERIC_YOU_EN_RE = re.compile(r"^\W*you\s+(never|can't|cannot|can never|just)\b", re.IGNORECASE)
+GENERIC_YOU_DA_RE = re.compile(r"^\W*(du ved aldrig|du kan aldrig|du skal bare)\b", re.IGNORECASE)
+# Ord der viser, at replikken er henvendt til en bestemt person.
+ADDRESS_WORDS = {
+    "man",
+    "dude",
+    "buddy",
+    "honey",
+    "sweetie",
+    "guys",
+    "sir",
+    "ma'am",
+    "kid",
+    "baby",
+    "bro",
+    "mom",
+    "dad",
+    "mister",
+    "pal",
+    "darling",
+    "son",
+    "girl",
+    "boy",
+}
+
+WEEKDAYS_MONTHS = {
+    "mandag",
+    "tirsdag",
+    "onsdag",
+    "torsdag",
+    "fredag",
+    "lørdag",
+    "søndag",
+    "januar",
+    "februar",
+    "marts",
+    "april",
+    "juni",
+    "juli",
+    "september",
+    "oktober",
+    "november",
+    "december",
+}  # "maj" og "august" er udeladt: de kan også være navne eller stå i titler
+SENTENCE_START = '.!?-:"…♪(['
+
+# Engelske ord, der aldrig hører hjemme i en dansk replik (hele ord). "and" (en and) og "her" er danske ord.
+ENGLISH_ONLY = {
+    "the",
+    "with",
+    "what",
+    "please",
+    "check",
+    "swag",
+    "healthcare",
+    "whatever",
+    "you",
+    "your",
+    "yeah",
+    "thanks",
+    "they",
+    "this",
+    "that",
+    "would",
+    "could",
+    "should",
+    "because",
+    "really",
+    "something",
+    "nothing",
+    "everything",
+    "guys",
+    "anyway",
+}
+# Ord der må stå (låneord og ord, der er almindelige i dansk tale).
+ENGLISH_ALLOWED = ALLOWED_LOANWORDS | {"sorry", "awesome", "weird", "fair", "deal", "date", "party"}
+
+# Enkelte ord, der er ens på dansk og engelsk, så en ens replik ikke er en fejl.
+SAME_WORDS = {
+    "stop",
+    "okay",
+    "ok",
+    "hey",
+    "wow",
+    "yo",
+    "cool",
+    "nice",
+    "shit",
+    "fuck",
+    "bro",
+    "taxi",
+    "hotel",
+    "pizza",
+    "bar",
+    "film",
+    "sex",
+    "super",
+    "alarm",
+    "radio",
+    "video",
+    "show",
+    "job",
+    "team",
+    "chef",
+    "hallo",
+    "halløj",
+    "mor",
+    "far",
+    "nej",
+    "ja",
+}
+FOREIGN_LETTERS_RE = re.compile(r"[¿¡ñçàèêëîïôûùœ]", re.IGNORECASE)
+FOREIGN_WORDS = {
+    "je",
+    "tu",
+    "est",
+    "le",
+    "les",
+    "c'est",
+    "oui",
+    "non",
+    "merci",
+    "monsieur",
+    "madame",
+    "mademoiselle",
+    "bonjour",
+    "bonsoir",
+    "pourquoi",
+    "mais",
+    "très",
+    "señor",
+    "señora",
+    "sí",
+    "gracias",
+    "por",
+    "favor",
+    "qué",
+    "que",
+    "el",
+    "los",
+    "las",
+    "usted",
+    "hola",
+    "amigo",
+    "adiós",
+    "vamos",
+    "dios",
+    "mío",
+    "danke",
+    "bitte",
+    "nein",
+    "ich",
+    "nicht",
+    "grazie",
+    "prego",
+    "ciao",
+    "signore",
+    "da",
+    "niet",
+    "spasibo",
+}
+MAX_CPS = 20.0
+
+
+def _glossary_terms(glossary) -> list[dict]:
+    return list(getattr(glossary, "terms", None) or [])
+
+
+def _glossary_names(glossary) -> set[str]:
+    """Ord fra ordlistens termer, der står uændret på dansk (navne)."""
+    out: set[str] = set()
+    for t in _glossary_terms(glossary):
+        if t["en"].strip().lower() == t["da"].strip().lower():
+            out.update(_words(t["en"]))
+    return out
+
+
+def is_foreign(en: str) -> bool:
+    """Replikken er på et andet fremmedsprog end engelsk (fransk, spansk ...)."""
+    words = _words(en)
+    if not words:
+        return False
+    if any(w in ENGLISH_WORDS and w not in DANISH_HOMOGRAPHS and w not in FOREIGN_WORDS for w in words):
+        return False
+    return bool(FOREIGN_LETTERS_RE.search(plain(en))) or any(w in FOREIGN_WORDS for w in words)
+
+
+def same_is_fine(en: str, glossary=None) -> bool:
+    """En dansk replik, der er identisk med den engelske, er i orden for navne, tal, ens ord og fremmedsprog."""
+    words = _words(en)
+    if not words:
+        return True  # kun tal og tegn
+    names = _glossary_names(glossary)
+    if all(w in names or w in INTERJECTIONS for w in words):
+        return True
+    if len(words) == 1 and words[0] in SAME_WORDS:
+        return True
+    return is_foreign(en)
+
+
+def compound_space(da: str) -> bool:
+    p = plain(da)
+    for m in COMPOUND_RE.finditer(p):
+        if UNDER_TEKST_OK_RE.match(m.group(0)):
+            before = p[: m.start()].rstrip()
+            if before and before[-1] not in SENTENCE_START:
+                continue  # "står under teksten" - en præposition
+        return True
+    return False
+
+
+def generic_you(da: str, en: str) -> bool:
+    if not (GENERIC_YOU_EN_RE.search(plain(en)) and GENERIC_YOU_DA_RE.search(plain(da))):
+        return False
+    raw = WORD_RE.findall(plain(en))
+    if any(w.lower() in ADDRESS_WORDS for w in raw):
+        return False
+    if "," in plain(en):  # "You never listen, Tom." - ofte en tiltale
+        return False
+    return not any(w[0].isupper() and w.lower() not in NOT_NAMES and w.lower() != "i" for w in raw[1:])
+
+
+def capitalized_weekday(da: str) -> bool:
+    p = plain(da)
+    for m in WORD_RE.finditer(p):
+        w = m.group(0)
+        if w.lower() not in WEEKDAYS_MONTHS or not w[0].isupper():
+            continue
+        line_before = p[: m.start()].split("\n")[-1].rstrip(" \t")
+        if line_before and line_before[-1] not in SENTENCE_START:
+            return True
+    return False
+
+
+def english_word(da: str, en: str = "", glossary=None) -> bool:
+    names = _glossary_names(glossary)
+    for w in _words(da):
+        if w in ENGLISH_ONLY and w not in ENGLISH_ALLOWED and w not in names:
+            return True
+    return False
+
+
+def reading_speed(da: str, en: str, duration_ms: int) -> bool:
+    """Over MAX_CPS tegn pr. sekund - men kun når den danske tekst ikke allerede er kortere end den engelske."""
+    if duration_ms <= 0:
+        return False
+    text = plain(da).replace("\n", " ").strip()
+    if len(text) / (duration_ms / 1000) <= MAX_CPS:
+        return False
+    return len(text) >= len(plain(en).replace("\n", " ").strip())
+
+
+def _stem(word: str) -> str:
+    w = word.lower()
+    return w[: max(3, len(w) - 2)] if len(w) > 4 else w
+
+
+def inconsistent_term(da: str, en: str, glossary=None) -> bool:
+    """Et ordlisteterm i den engelske replik er oversat anderledes end ordlistens danske form."""
+    da_low = plain(da).lower()
+    en_low = plain(en).lower()
+    for t in _glossary_terms(glossary):
+        src, dst = t["en"].lower(), t["da"].lower()
+        if len(src) < 3 or src == dst:
+            continue  # navne, der står uændret, tjekkes ikke her
+        if not re.search(rf"(?<![\w]){re.escape(src)}(?![\w])", en_low):
+            continue
+        if _stem(dst) not in da_low:
+            return True
+    return False
 
 
 class EnglishIndex:
@@ -416,12 +764,18 @@ class EnglishIndex:
 
 
 def check_all(
-    da_cues: list[Cue], en_index: EnglishIndex, max_line_chars: int, bad_words: frozenset[str] | None = None
+    da_cues: list[Cue],
+    en_index: EnglishIndex,
+    max_line_chars: int,
+    bad_words: frozenset[str] | None = None,
+    glossary=None,
+    strict: bool = False,
 ) -> dict[int, list[str]]:
     """Returnerer {position (0-baseret): [flag]} for replikker med fejl."""
     result: dict[int, list[str]] = {}
     for pos, cue in enumerate(da_cues):
-        flags = check_cue(cue.text, en_index.text_for(cue), max_line_chars, bad_words)
+        en = en_index.text_for(cue)
+        flags = check_cue(cue.text, en, max_line_chars, bad_words, cue.end - cue.start, glossary, strict)
         if flags:
             result[pos] = flags
     return result

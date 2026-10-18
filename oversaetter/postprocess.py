@@ -7,6 +7,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass, replace
 
+from . import hi
 from .checks import EnglishIndex, check_all
 from .config import Config
 from .credit import apply_credit, split_header
@@ -56,7 +57,7 @@ def postprocess(
     deadline = clock() + cfg.postprocess_timeout_minutes * 60
     body, had_header = split_header(da_cues, cfg.credit_text)
     en_body, _ = split_header(en_cues)
-    en_index = EnglishIndex(en_body)
+    en_index = EnglishIndex(hi.clean(en_body, quiet=True, drop_lyrics=cfg.drop_lyrics).cues)  # renset (trin B4c)
 
     bad_words = cfg.bad_words()
     before = check_all(body, en_index, cfg.max_line_chars, bad_words)

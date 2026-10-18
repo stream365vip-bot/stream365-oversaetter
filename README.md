@@ -273,6 +273,14 @@ Skriv nøglen i filen med `sudo nano` (kun nøglen, én linje). Mangler en nøgl
   5. Hvilke engelske tekster Bazarr henter, styres i Bazarr (sprogprofilen), ikke her.
   6. **Kildevalg og logning** (opfølgning, 18.10.2026): et indlejret engelsk SDH/HI-spor foretrækkes (titlen har SDH, HI, CC eller HOH som helt ord, eller ffprobe-disposition `hearing_impaired=1`); tekstbaserede spor går stadig forud for billedbaserede. Af flere eksterne engelske filer foretrækkes HI-filen (Bazarrs hi-flag eller `.en.hi.srt`/`.en.sdh.srt`). Loggen viser altid én linje pr. film: `Engelsk kilde: HI (sporets titel/filnavn)` eller `Engelsk kilde: almindelig`. HI = navnet/dispositionen siger det, eller hi.py finder mindst 5 lydbeskrivelser og talernavne i alt. Resultatet gemmes i `items.en_hi` (1/0), fx `SELECT COUNT(*) FROM items WHERE en_hi = 1 AND status = 'faerdig'`. `oversaet-test` viser samme linje i rapporten (stien står nu under `Engelsk fil:`). Efterbehandlingen i Bazarr-tilstand bruger stadig helst den almindelige engelske fil som reference.
 
+- **Trin B4c: rettelser efter test18/test19** (18.10.2026):
+
+  1. **Talerstreger**: har en replik to eller flere linjer med forskellige talernavne (`RICK: ...` / `CORA: ...`), sætter hi.py `- ` foran hver linje uden streg. Samme taler eller ingen taler: intet røres. Når en dansk fil skrives, normaliseres `-Tekst` og `–Tekst` først i en linje til `- Tekst` (alle kilder). Prompt v4 beder om `- ` på alle danske linjer, når den engelske replik har streger, og det nye rettelsesflag `missing_dash` flager en dansk replik, der mangler dem.
+  2. **Sangtekst fjernes altid** (`DROP_LYRICS=true`, standard): enhver linje, der starter eller slutter med ♪ eller #, fjernes fra den engelske kilde (alle kilder), og tomme replikker droppes. Tælles som musiklinjer i `HI-rensning`. `DROP_LYRICS=false` giver den gamle regel (kun ♪/#-linjer og ♪ ... ♪).
+  3. **Talernavne med tal** (`REPORTER 1:`) fjernes også, og alle kontroller bruger den rensede engelske tekst (også efterbehandlingen i Bazarr-tilstand), så tal fra talernavne og lydbeskrivelser ikke giver `missing_number`.
+  4. **`identical_to_english`** flager kun, når den engelske replik har mindst ét almindeligt engelsk ord (ikke "Salam alaikum.", "Merci.", "Allahu Akbar!").
+  5. **`english_word`**: checkpoint/checkpoints -> kontrolpost/kontrolposter (også i prompt v4's faste liste).
+
 ## Hvis noget går galt
 
 - Mislykkes en oversættelse, prøves den igen ved næste runde. Går det galt igen, markeres den som "fejlet" og prøves ikke igen automatisk.

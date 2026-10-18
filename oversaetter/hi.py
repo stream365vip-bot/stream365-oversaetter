@@ -132,12 +132,13 @@ TAG_RE = re.compile(r"<[^>]+>|\{[^}]*\}")
 EMPTY_TAG_RE = re.compile(r"<(i|b|u)>(\s*)</\1>", re.IGNORECASE)
 MUSIC = "♪#"
 
-# "NAVN:" eller "- NAVN:" først i linjen: 1-3 ord med store bogstaver, mindst to bogstaver i alt.
+# "NAVN:" eller "- NAVN:" først i linjen: 1-3 ord med store bogstaver, mindst to bogstaver i alt. Efter første ord
+# må et tal stå ("REPORTER 1:", trin B4c).
 _UPPER = "A-ZÀ-ÖØ-Þ"
 _NAME_WORD = rf"[{_UPPER}][{_UPPER}0-9'.\-]*"
 SPEAKER_RE = re.compile(
     rf"^(?P<pre>(?:\s*(?:<[^>]+>|\{{[^}}]*\}}))*\s*(?:-\s*)?(?:<[^>]+>)*)"
-    rf"(?P<name>{_NAME_WORD}(?: {_NAME_WORD}){{0,2}}):(?:\s+|$)"
+    rf"(?P<name>{_NAME_WORD}(?: (?:{_NAME_WORD}|\d+)){{0,2}}):(?:\s+|$)"
 )
 
 # Kildens navn (sporets titel eller filnavnet) siger HI/SDH. Indholdet tæller også: mindst HI_MIN lydbeskrivelser
@@ -211,14 +212,20 @@ def _remove_sounds(text: str, stats: HiStats) -> str:
     return text.replace("\x00", " ")
 
 
-def _is_music(line: str) -> bool:
-    """Linjen består kun af ♪/# eller er en sanglinje markeret med ♪ ... ♪ (eller # ... #)."""
+def _is_music(line: str, drop_lyrics: bool = True) -> bool:
+    """Linjen består kun af ♪/# eller er en sanglinje markeret med ♪ ... ♪ (eller # ... #).
+
+    drop_lyrics (DROP_LYRICS, trin B4c): også linjer, der kun starter eller kun slutter med ♪/#
+    ("♪ Oh say can you see").
+    """
     p = _plain(line).strip()
     p = re.sub(r"^-\s*", "", p)
     if not p:
         return False
     if all(c in MUSIC or c.isspace() for c in p):
         return True
+    if drop_lyrics:
+        return (p[0] in MUSIC and not p[1:2].isdigit()) or p[-1] in MUSIC  # "#1 fan" er ikke sang
     return p[0] in MUSIC and p[-1] in MUSIC
 
 
@@ -233,7 +240,19 @@ def _name(raw: str) -> str:
     return raw.capitalize()  # "MAN ON RADIO" -> "Man on radio"
 
 
-def _clean_cue(text: str, stats: HiStats) -> tuple[list[str], list[str | None]]:
+def _add_dashes(lines: list[str], speakers: list[str | None]) -> list[str]:
+    """To eller flere forskellige talernavne i replikken: "- " foran hver linje uden streg (trin B4c)."""
+    if len(lines) < 2 or len({s for s in speakers if s}) < 2:
+        return lines
+    out = []
+    for line in lines:
+        m = re.match(r"^((?:<[^>]+>|\{[^}]*\})*)", line)
+        pre = m.group(1)
+        out.append(line if line[len(pre) :].startswith(("-", "–")) else f"{pre}- {line[len(pre) :]}")
+    return out
+
+
+def _clean_cue(text: str, stats: HiStats, drop_lyrics: bool = True) -> tuple[list[str], list[str | None]]:
     """Rens én replik. Returnerer (linjer, taler pr. linje)."""
     text = _remove_sounds(text, stats)
     lines = text.split("\n")
@@ -246,7 +265,7 @@ def _clean_cue(text: str, stats: HiStats) -> tuple[list[str], list[str | None]]:
     carry = ""  # tags fra en droppet linje (fx "<i>"), der flyttes til næste linje
     dropped_line = False
     for line in lines:
-        if _is_music(line):
+        if _is_music(line, drop_lyrics):
             stats.music += 1
             carry += "".join(TAG_RE.findall(line))
             dropped_line = True
@@ -275,7 +294,7 @@ def _clean_cue(text: str, stats: HiStats) -> tuple[list[str], list[str | None]]:
         out = [EMPTY_TAG_RE.sub(r"\2", x) for x in out]
     if dropped_line and len(out) == 1:
         out[0] = re.sub(r"^((?:<[^>]+>)*)-\s*", r"\1", out[0])  # kun én taler tilbage: ingen bindestreg
-    return out, speakers
+    return _add_dashes(out, speakers), speakers
 
 
 def note_line(line: str, speaker: str | None) -> str:
@@ -287,14 +306,17 @@ def note_line(line: str, speaker: str | None) -> str:
     return f"{pre}[{speaker}] {line[len(pre) :]}"
 
 
-def clean(cues: list[Cue], quiet: bool = False) -> HiResult:
-    """Rens den engelske kilde. Logger tallene én gang, hvis der blev fjernet noget (ikke med quiet=True)."""
+def clean(cues: list[Cue], quiet: bool = False, drop_lyrics: bool = True) -> HiResult:
+    """Rens den engelske kilde. Logger tallene én gang, hvis der blev fjernet noget (ikke med quiet=True).
+
+    drop_lyrics=False (DROP_LYRICS=false): kun linjer med kun ♪/# eller ♪ ... ♪ fjernes, som før trin B4c.
+    """
     stats = HiStats()
     out: list[Cue] = []
     notes: list[str] = []
     names: dict[str, None] = {}
     for c in cues:
-        lines, speakers = _clean_cue(c.text, stats)
+        lines, speakers = _clean_cue(c.text, stats, drop_lyrics)
         if not lines:
             stats.dropped += 1
             continue

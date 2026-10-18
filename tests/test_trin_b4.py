@@ -201,6 +201,8 @@ def fake_translate(leak=False):
         lines = []
         for x in request_payload(kwargs)["lines"]:
             da = f"Dansk {x['i']}"
+            if x["en"].count("- ") >= 2:  # følger prompt v4: streger i den engelske replik giver streger på dansk
+                da = f"- Dansk {x['i']}\n- Dansk {x['i']}"
             if leak and x["en"].startswith("[Rick]"):
                 da = "[Rick] Kom så."
             lines.append({"i": x["i"], "da": da})

@@ -338,6 +338,7 @@ FLAG_TEXT = {
     "inconsistent_term": "a glossary term is translated differently from the film glossary",
     "mixed_case": "a made-up word with a capital letter inside it (e.g. 'sundhedsTHC') - translate the meaning",
     "hi_rest": "contains [brackets] or a speaker name like 'RICK:' from the English source - remove them",
+    "missing_dash": "the English line has speaker dashes - start every Danish line with '- '",
 }
 
 
@@ -453,6 +454,8 @@ def check_cue(
         flags.append("known_bad_word")
     if hi_rest(da):
         flags.append("hi_rest")
+    if en and missing_dash(da, en):
+        flags.append("missing_dash")
     if en:
         da_nums = _numbers(da)
         da_digits = re.sub(r"\D", "", plain(da))
@@ -463,6 +466,7 @@ def check_cue(
             and _norm(da)
             and not _is_names_or_interjections(en)
             and not same_is_fine(en, glossary)
+            and has_common_english(en)
         ):
             flags.append("identical_to_english")
     if strict:
@@ -618,6 +622,9 @@ ENGLISH_ONLY = {
     "jerk",
     "loser",
     "losers",
+    # trin B4c (test18/test19)
+    "checkpoint",
+    "checkpoints",
 }
 # Engelske ord, der kun flages i bestemte vendinger: "shit" alene er tilladt, "holy shit" er ikke.
 ENGLISH_PHRASE_RE = re.compile(r"\bholy\s+shit\b|\bhell\s*!|\bwhat\s+the\s+hell\b", re.IGNORECASE)
@@ -751,6 +758,49 @@ def same_is_fine(en: str, glossary=None) -> bool:
     if len(words) == 1 and words[0] in SAME_WORDS:
         return True
     return is_foreign(en)
+
+
+# Almindelige engelske ord. En dansk replik, der er identisk med den engelske, flages kun, når mindst ét af dem står
+# i replikken - ellers er den på et andet sprog ("Salam alaikum.", "Merci.", "Allahu Akbar!") (trin B4c).
+COMMON_ENGLISH = NOT_NAMES | {
+    "i",
+    "to",
+    "for",
+    "not",
+    "go",
+    "get",
+    "got",
+    "can",
+    "will",
+    "all",
+    "up",
+    "here",
+    "let",
+    "did",
+    "does",
+    "am",
+    "an",
+    "but",
+    "if",
+    "so",
+    "us",
+    "her",
+}
+
+
+def has_common_english(en: str) -> bool:
+    return any(w in COMMON_ENGLISH for w in _words(en))
+
+
+def _dashed(line: str) -> bool:
+    return line.strip().startswith(("-", "–"))
+
+
+def missing_dash(da: str, en: str) -> bool:
+    """Den engelske replik har talerstreger på mindst 2 linjer, men ikke alle danske linjer har en streg (trin B4c)."""
+    if sum(_dashed(x) for x in plain(en).split("\n")) < 2:
+        return False
+    return not all(_dashed(x) for x in plain(da).split("\n") if x.strip())
 
 
 def compound_space(da: str) -> bool:

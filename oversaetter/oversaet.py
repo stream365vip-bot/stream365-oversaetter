@@ -137,8 +137,9 @@ Fixed translations (never leave these in English): "bitch" -> "kælling", "bitch
 "mand"/"makker", "nobody"/"nobodies" (a loser) -> "et nul"/"nuller", "crew" -> "bande"/"hold", "bossman" -> \
 "chefen", "Mr."/"Mrs." -> "hr."/"fru", "guys" -> "folkens"/"venner", "keep shooting" (with a gun) -> "bliv ved med \
 at skyde", "frequent-flyer miles" -> "bonuspoint", "Who gives a shit?" -> "Hvem fanden går op i det?", "Bye for \
-now" -> "Farvel så længe". "alle sammen" is always two words. Translate "Oh my God"/"Jesus" consistently as \
-"Åh gud" (not "Herregud" in between), unless the film glossary says otherwise.
+now" -> "Farvel så længe", "checkpoint"/"checkpoints" -> "kontrolpost"/"kontrolposter". "alle sammen" is \
+always two words. Translate "Oh my God"/"Jesus" consistently as "Åh gud" (not "Herregud" in between), unless \
+the film glossary says otherwise.
 16. Consistency: use the same Danish word for a name or recurring term every time. Follow the film glossary (if \
 given) exactly and use its "address" (du/De) between the same characters through the whole film. "glossary" in the \
 request shows how names and recurring terms were translated earlier in this file: follow it. Wrong: "Store Mike" \
@@ -147,6 +148,7 @@ in one cue and "Big Mike" in the next. Right: the same every time.
 cues) are only for understanding. Never translate, repeat or return them. Reply with JSON only, no notes.
 Et navn i [klammer] foran en linje fortæller, hvem der taler. Brug det til du/I, han/hun og tiltale. Skriv aldrig \
 navnet eller klammerne i den danske tekst.
+Når den engelske replik har streger ("- "), skal alle danske linjer i replikken starte med "- ".
 
 Format: write a line break as \\n. Reply ONLY with JSON of the form {"lines":[{"i":<number>,"da":"<Danish text>"}]} \
 with exactly one entry for every number in "lines" and no others."""
@@ -724,9 +726,9 @@ def run_translate_test(
     if not en_cues:
         log.error("Der er ingen replikker i %s", en_path)
         return 2
-    hi_result = hi.clean(en_cues) if hi_clean else hi.passthrough(en_cues)
+    hi_result = hi.clean(en_cues, drop_lyrics=cfg.drop_lyrics) if hi_clean else hi.passthrough(en_cues)
     # Kilden vurderes efter samme regel som i driften, også med --hi off (så tælles der uden at rense).
-    hi_stats = hi_result.stats if hi_clean else hi.clean(en_cues, quiet=True).stats
+    hi_stats = hi_result.stats if hi_clean else hi.clean(en_cues, quiet=True, drop_lyrics=cfg.drop_lyrics).stats
     _, en_kind = hi.source_kind(hi_stats, hi.hi_filename(en_path), os.path.basename(en_path))
     en_cues = hi_result.cues
     if not en_cues:

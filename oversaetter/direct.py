@@ -345,7 +345,8 @@ class DirectTranslator:
             spent["cost"] += cost
             self.budget.record(cand.key, inp + cache_read + cache_write, out, cost)
 
-        hi_result = hi.clean(en_cues)  # trin B4: lydbeskrivelser, musiklinjer og talernavne ud før bidderne
+        # trin B4: lydbeskrivelser, musiklinjer og talernavne ud før bidderne
+        hi_result = hi.clean(en_cues, drop_lyrics=cfg.drop_lyrics)
         en_hi, kind = hi.source_kind(hi_result.stats, by_name, label)
         log.info("%s", kind)
         en_cues = hi_result.cues

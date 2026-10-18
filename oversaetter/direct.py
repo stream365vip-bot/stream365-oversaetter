@@ -229,6 +229,8 @@ def fix_flagged(
 ) -> dict[int, str]:
     """Ét kald til TRANSLATE_MODEL med de flagede replikker og 2 nabolinjer på hver side. Returnerer rettelser.
 
+    En tom rettelse ("") betyder: slet replikken (kun når den engelske tekst er ren lydbeskrivelse/musik, trin B4f).
+
     extra: filmkontekst og ordliste (CONTEXT/GLOSSARY=on), lægges efter instruksen.
     """
     chosen = sorted(flags)[: max(0, cfg.max_fix_lines)]
@@ -294,6 +296,15 @@ def fix_flagged(
     en_by_i = {pos + 1: en[pos] for pos in chosen}
     out: dict[int, str] = {}
     for fix in fixes:
+        if (
+            isinstance(fix, dict)
+            and fix.get("i") in allowed
+            and isinstance(fix.get("da"), str)
+            and not plain(fix["da"]).strip()
+            and hi.only_markup(en_by_i[fix["i"]])
+        ):
+            out[fix["i"] - 1] = ""  # kun lydbeskrivelse/musik på engelsk: tom rettelse = slet replikken (trin B4f)
+            continue
         ok, why = validate_fix(fix, allowed, en_by_i)
         if not ok:
             shown = fix.get("da") if isinstance(fix, dict) else fix
@@ -407,7 +418,7 @@ class DirectTranslator:
             clock=self.clock,
             system=system,
             parallel=cfg.parallel,
-            empty_ok=filler_positions(en, cfg.prompt_version),
+            empty_ok=filler_positions(en, cfg.prompt_version) | hi.markup_positions(en),  # trin B4f
             cache=cfg.prompt_cache,
             notes=speaker_notes(hi_result, cfg.prompt_version),
         )
@@ -464,6 +475,14 @@ class DirectTranslator:
                 outcome.fixes = len(fixes)
                 sent = min(len(flags), cfg.max_fix_lines)
                 log.info("Rettelsesrunde: %d af %d flagede replikker rettet", len(fixes), sent)
+                deleted = {p for p, t in fixes.items() if not t}
+                if deleted:  # trin B4f: kun lydbeskrivelse/musik på engelsk og tom rettelse - replikken slettes
+                    keep = [p for p in range(len(da)) if p not in deleted]
+                    new = {p: i for i, p in enumerate(keep)}
+                    da, en = [da[p] for p in keep], [en[p] for p in keep]
+                    kept_english = {new[p] for p in kept_english if p in new}
+                    outcome.removed_empty += len(deleted)
+                    log.info("Rettelsesrunde: %d replikker med kun lydbeskrivelse/musik er slettet", len(deleted))
         after = fix_flags(check_all(da, en_index, cfg.max_line_chars, bad_words, wordlist, strict, speed))
         outcome.flags_after = len([p for p in after if p not in kept_english])
 
@@ -510,6 +529,7 @@ class DirectTranslator:
             before = None
         why = ""
         try:
+            # Vores danske tekst er altid almindelig, aldrig HI - også når den engelske kilde var HI (trin B4f).
             self.bazarr.upload(cand.media_type, cand.media_id, cand.series_id, filename, content, UPLOAD_TIMEOUT)
             if self._wait_for_bazarr(cand, before):
                 log.info("Uploadet til Bazarr: %s (Bazarr registrerer og synkroniserer teksten)", filename)

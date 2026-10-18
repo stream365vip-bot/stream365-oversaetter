@@ -1,5 +1,6 @@
-"""Start: `python -m oversaetter` (løkken), `python -m oversaetter test --en .. --da .. --out ..`
-eller `python -m oversaetter oversaet-test --en .. --out .. --provider .. --model ..`."""
+"""Start: `python -m oversaetter` (løkken), `python -m oversaetter test --en .. --da .. --out ..`,
+`python -m oversaetter oversaet-test --en .. --out .. --provider .. --model ..`
+eller `python -m oversaetter glem "<titel eller tmdb-id>"`."""
 
 from __future__ import annotations
 
@@ -8,6 +9,7 @@ import logging
 import os
 import sys
 
+from .clients import ApiError, Radarr
 from .config import Config
 from .db import Database
 from .oversaet import PROVIDERS, run_translate_test
@@ -88,6 +90,55 @@ def run_test(cfg: Config, en: str, da: str, out: str, client=None, budget=None) 
     return 0
 
 
+def forget(cfg: Config, what: str, db: Database | None = None, radarr=None) -> int:
+    """Slet filmens række i items (og dermed dens ordliste), så næste runde behandler den forfra (trin B4f).
+
+    what: titlen, TMDB-id'et (kun tal, slås op i Radarr) eller nøglen ("movie:12"). Rører ikke Bazarr eller filer.
+    """
+    log = logging.getLogger("oversaetter")
+    db = db or Database(os.path.join(cfg.data_dir, "oversaetter.db"))
+    what = what.strip()
+    rows = []
+    if db.get(what) is not None:
+        rows = [db.get(what)]
+    elif what.isdigit():
+        if radarr is None:
+            import httpx
+
+            radarr = Radarr(cfg, httpx.Client(timeout=30.0))
+        try:
+            movies = radarr.by_tmdb(int(what))
+        except ApiError as e:
+            log.error("Kunne ikke slå TMDB-id %s op i Radarr: %s", what, e)
+            return 1
+        rows = [r for m in movies if (r := db.get(f"movie:{m.get('id')}")) is not None]
+    if not rows:
+        rows = db.find_title(what)
+    if not rows:
+        log.error("Fandt ingen række i items for %r - intet slettet", what)
+        return 1
+    if len(rows) > 1:
+        log.error(
+            "%r passer på %d rækker (%s) - brug nøglen, fx glem %s",
+            what,
+            len(rows),
+            ", ".join(r["key"] for r in rows),
+            rows[0]["key"],
+        )
+        return 1
+    row = rows[0]
+    db.delete(row["key"])
+    log.info(
+        "Glemt: %s (%s, status %s, forsøg %d%s) - behandles forfra i næste runde",
+        row["title"],
+        row["key"],
+        row["status"],
+        row["attempts"],
+        ", med ordliste" if row["glossary"] else "",
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="oversaetter")
     sub = parser.add_subparsers(dest="cmd")
@@ -110,10 +161,14 @@ def main(argv: list[str] | None = None) -> int:
     o.add_argument("--parallel", type=int, default=1, help="så mange bidder samtidig (standard 1)")
     o.add_argument("--hi", choices=("on", "off"), default="on", help="rens HI/SDH-kilden før bidderne (standard on)")
     o.add_argument("--vis-kontekst", action="store_true", help="skriv filmkonteksten og ordlisten øverst i rapporten")
+    g = sub.add_parser("glem", help="slet en films række i databasen, så den behandles forfra")
+    g.add_argument("what", help='titel, TMDB-id eller nøgle, fx "Idiots", 12345 eller movie:12')
     args = parser.parse_args(argv)
 
     cfg = Config.from_env()
     setup_logging(cfg.log_level)
+    if args.cmd == "glem":
+        return forget(cfg, args.what)
     if args.cmd == "test":
         return run_test(cfg, args.en, args.da, args.out)
     if args.cmd == "oversaet-test":

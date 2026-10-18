@@ -17,7 +17,8 @@ from .srt import Cue
 
 log = logging.getLogger("oversaetter")
 
-# Kendte lydbeskrivelser i (parenteser) eller [klammer]. Indholdet tæller, når det starter med et af udtrykkene.
+# Kendte lydbeskrivelser i (parenteser). Indholdet tæller, når det starter med et af udtrykkene. Alt i [klammer] er
+# altid lydbeskrivelse (trin B4f: "[ Clicking ]", "[ Sheridan groans ]").
 SOUND_WORDS = (
     "applause",
     "barking",
@@ -189,7 +190,7 @@ def _plain(text: str) -> str:
 
 
 def _is_sound(content: str) -> bool:
-    """Indholdet af en klamme/parentes er en lydbeskrivelse: kun STORE bogstaver eller en kendt beskrivelse."""
+    """Indholdet af en parentes er en lydbeskrivelse: kun STORE bogstaver eller en kendt beskrivelse."""
     text = _plain(content).strip(" \t\n" + MUSIC)
     letters = [c for c in text if c.isalpha()]
     if not letters:
@@ -201,8 +202,7 @@ def _is_sound(content: str) -> bool:
 
 def _remove_sounds(text: str, stats: HiStats) -> str:
     def sub(m: re.Match) -> str:
-        content = m.group(1) if m.group(1) is not None else m.group(2)
-        if _is_sound(content):
+        if m.group(1) is not None or _is_sound(m.group(2)):  # [klammer] er altid lyd (trin B4f)
             stats.sounds += 1
             return "\x00"
         return m.group(0)
@@ -320,6 +320,25 @@ def note_line(line: str, speaker: str | None) -> str:
     m = re.match(r"^((?:<[^>]+>|\{[^}]*\})*\s*(?:-\s*)?(?:<[^>]+>)*)", line)
     pre = m.group(1) if m else ""
     return f"{pre}[{speaker}] {line[len(pre) :]}"
+
+
+def only_markup(text: str) -> bool:
+    """Teksten består kun af [klammer], (parenteser), musiktegn, tags og tegnsætning - intet, der skal oversættes
+    (trin B4f: et tomt svar på sådan en replik betyder, at den skal slettes)."""
+    rest = _plain(text)
+    while True:
+        new = BRACKET_RE.sub(" ", rest)
+        if new == rest:
+            break
+        rest = new
+    if any(ch.isalnum() for ch in rest):
+        return False
+    return rest != _plain(text) or any(ch in MUSIC for ch in rest)
+
+
+def markup_positions(en: list[str]) -> set[int]:
+    """Positioner, hvor den rensede engelske tekst kun er klammer/parenteser eller musiktegn (se only_markup)."""
+    return {p for p, t in enumerate(en) if only_markup(t)}
 
 
 def clean(cues: list[Cue], quiet: bool = False, drop_lyrics: bool = True) -> HiResult:

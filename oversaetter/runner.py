@@ -17,7 +17,8 @@ from .clients import GET_TIMEOUT, ApiError, Bazarr, Radarr, Seerr, SeerrIndex, S
 from .config import Config
 from .credit import apply_credit
 from .db import Database, iso
-from .direct import CALL_TIMEOUT, DirectTranslator, NoEnglish, english_cues, english_source
+from .direct import CALL_TIMEOUT, UPLOADED, DirectTranslator, NoEnglish, english_cues, english_source
+from .plex import refresh_folder
 from .postprocess import make_client, postprocess
 from .proofread import DbBudget
 from .search import PAUSE_WARN, nice_name, paused_providers, search_jobs, unfinished, wait_for_jobs, waiting_text
@@ -474,6 +475,11 @@ class Runner:
             fixes=out.fixes,
         )
         log.info("Færdig: %s - %s", cand.title, out.summary())
+        if out.delivery == UPLOADED:
+            # Bazarrs egen Plex-opdatering kører kun ved download, ikke ved upload (trin B4g).
+            refreshed = refresh_folder(cfg, self.http, cand.video_path)
+            if refreshed is not None:
+                self.db.upsert(cand.key, plex_refresh=int(refreshed))
         self.current = None
 
     def context_for(self, cand: Candidate) -> str | None:

@@ -41,6 +41,7 @@ POLL_SECONDS = 5
 FIX_CONTEXT = 2
 FIX_MAX_TOKENS = 16000
 BATCH = 50
+UPLOADED = "uploadet til Bazarr"  # deliver() efter en vellykket upload (så beder runneren Plex scanne, trin B4g)
 
 # Tekstbaserede undertekstformater, som ffmpeg kan lave om til srt. Alt andet (PGS, VobSub, DVB ...) springes over.
 TEXT_CODECS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"}
@@ -533,7 +534,7 @@ class DirectTranslator:
             self.bazarr.upload(cand.media_type, cand.media_id, cand.series_id, filename, content, UPLOAD_TIMEOUT)
             if self._wait_for_bazarr(cand, before):
                 log.info("Uploadet til Bazarr: %s (Bazarr registrerer og synkroniserer teksten)", filename)
-                return "uploadet til Bazarr"
+                return UPLOADED
             why = f"Bazarr har ikke gemt filen efter {UPLOAD_WAIT:g} sekunder"
         except ApiError as e:
             why = str(e)

@@ -1,4 +1,5 @@
-"""Start: `python -m oversaetter` (løkken) eller `python -m oversaetter test --en .. --da .. --out ..`."""
+"""Start: `python -m oversaetter` (løkken), `python -m oversaetter test --en .. --da .. --out ..`
+eller `python -m oversaetter oversaet-test --en .. --out .. --provider .. --model ..`."""
 
 from __future__ import annotations
 
@@ -9,6 +10,7 @@ import sys
 
 from .config import Config
 from .db import Database
+from .oversaet import PROVIDERS, run_translate_test
 from .postprocess import make_client, postprocess
 from .proofread import DbBudget
 from .srt import read_file, write_file_atomic
@@ -94,12 +96,21 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--en", required=True, help="engelsk .srt")
     t.add_argument("--da", required=True, help="dansk .srt")
     t.add_argument("--out", required=True, help="ny fil der skal skrives")
+    o = sub.add_parser("oversaet-test", help="oversæt en hel engelsk fil i bidder (uden Lingarr og korrektur)")
+    o.add_argument("--en", required=True, help="engelsk .srt")
+    o.add_argument("--out", required=True, help="ny dansk fil der skal skrives")
+    o.add_argument("--provider", required=True, choices=PROVIDERS)
+    o.add_argument("--model", required=True, help="fx claude-sonnet-5-5, deepseek-v4-pro, gemini-3.8-flash")
+    o.add_argument("--effort", choices=("low", "medium", "high"), help="ikke for deepseek")
+    o.add_argument("--batch", type=int, default=50, help="replikker pr. bid (standard 50)")
     args = parser.parse_args(argv)
 
     cfg = Config.from_env()
     setup_logging(cfg.log_level)
     if args.cmd == "test":
         return run_test(cfg, args.en, args.da, args.out)
+    if args.cmd == "oversaet-test":
+        return run_translate_test(cfg, args.en, args.out, args.provider, args.model, args.effort, args.batch)
     from .runner import main as run_main
 
     run_main(cfg)

@@ -36,7 +36,15 @@ cd /opt/oversaetter
 sudo mkdir -p /opt/oversaetter/data
 sudo chown -R 1000:1000 /opt/oversaetter/data
 
-# 3. Lav din egen indstillingsfil
+# 3. Lav mappen til nøglerne til testtilstanden oversaet-test (DeepSeek og Gemini).
+#    Filerne skal findes, før containeren startes - ellers laver Docker en mappe i stedet.
+#    Tomme filer er i orden: så virker driften som normalt, og kun oversaet-test melder, at nøglen mangler.
+sudo mkdir -p /opt/oversaetter/secrets
+sudo touch /opt/oversaetter/secrets/deepseek_api_key.txt /opt/oversaetter/secrets/gemini_api_key.txt
+sudo chown 1000:1000 /opt/oversaetter/secrets/*.txt
+sudo chmod 600 /opt/oversaetter/secrets/*.txt
+
+# 4. Lav din egen indstillingsfil
 sudo cp .env.example .env
 sudo nano .env
 ```
@@ -124,6 +132,36 @@ sudo docker exec oversaetter python -m oversaetter test \
 
 Resultatet ligger derefter i `/opt/oversaetter/data/film-test.da.srt` og rapporten i `/opt/oversaetter/data/film-test.da.srt.rapport.txt`. Rapporten viser korrekturmodellen, antal fejl før og efter, antal rettelser fra korrektur og prisen. Prisen tæller med i månedens budget.
 
+## Testtilstand: oversæt en hel fil
+
+`oversaet-test` oversætter en hel engelsk undertekstfil direkte med en model – **uden** Lingarr og **uden** korrektur – så modeller kan sammenlignes i én gennemgang (se beslutningen 18.10.2026 nedenfor). Driften bliver ikke rørt: ingen database, intet budget, ingen kreditlinje, og der skrives kun til `--out`.
+
+```bash
+sudo docker exec oversaetter python -m oversaetter oversaet-test \
+  --en "/mnt/unionfs/Media/Movies/Film (2024)/Film.en.srt" \
+  --out "/data/film-deepseek.da.srt" \
+  --provider deepseek --model deepseek-v4-pro
+```
+
+- `--provider`: `anthropic`, `deepseek` eller `gemini`.
+- `--model`: fx `claude-sonnet-5-5`, `claude-opus-5-5`, `deepseek-v4-pro`, `deepseek-flash` eller `gemini-3.8-flash`.
+- `--effort low|medium|high`: grundighed (Anthropic, standard medium; Gemini kun hvis angivet; bruges ikke hos DeepSeek).
+- `--batch 50`: antal replikker pr. bid.
+
+Sådan virker den: filen oversættes i bidder af 50 replikker. Hver bid får de 5 foregående replikker med deres færdige danske oversættelse, de 3 næste engelske replikker og op til 30 tidligere par med navne og faste udtryk med som kontekst, så oversættelsen hænger sammen og bliver ensartet. Instruksen er Lingarr-prompten v3 (regel 1-15) tilpasset til bidder. Svarer modellen ikke med præcis de rigtige numre, prøves bidden én gang mere, derefter delt i to (25+25). Mangler der stadig replikker, beholder de den engelske tekst, og det står i loggen.
+
+Bagefter køres den gratis kontrol, og rapporten skrives på skærmen (vil du gemme den, så tilføj `> /opt/oversaetter/data/rapport.txt` uden for `docker exec`-anførselstegnene). Rapporten viser model, provider, antal replikker og bidder, tokens ind/ud, pris, tid, antal flag fra kontrollen med eksempler og antal replikker, der faldt tilbage til engelsk. Priserne pr. model står i `MODEL_PRICES` i `oversaetter/config.py`; ukendte modeller giver "pris ukendt".
+
+Nøgler:
+
+| Provider | Fil på serveren |
+|---|---|
+| anthropic | `/opt/lingarr/secrets/anthropic_api_key.txt` (samme som driften) |
+| deepseek | `/opt/oversaetter/secrets/deepseek_api_key.txt` |
+| gemini | `/opt/oversaetter/secrets/gemini_api_key.txt` |
+
+Skriv nøglen i filen med `sudo nano` (kun nøglen, én linje). Mangler en nøgle, stopper kun testtilstanden med en dansk besked – driften kører videre.
+
 ## Indstillinger og beslutninger
 
 - **Hvornår der oversættes** (besluttet af Jesper 17.10.2026). Erstatter de gamle regler med ventetider på 30 min (Seerr), 48 t (mærket) og 24 t (første gang set):
@@ -159,6 +197,8 @@ Resultatet ligger derefter i `/opt/oversaetter/data/film-test.da.srt` og rapport
 
   `\n` (backslash + n) bliver til et linjeskift i undertekstfilen. Farven #58D9AE er mint fra Stream365-logoet (appens `--color-accent`). Er `CREDIT_TEXT` tom, sættes der ingen kreditlinje ind. Kreditlinjen bliver hverken flaget af kontrollen eller rettet af korrekturen.
 - **Kendte forkerte ord**: Den gratis kontrol flager replikker med ord, der før er set forkert (bestie, bestien, menneskebestie, menneskebestien, uansett, please, sweetheart, prank, llige, here). Listen kan udvides med `KNOWN_BAD_WORDS` i `.env`. Låneordene okay, hey, wow, yo, cool, nice, shit, fuck og bro flages aldrig.
+
+- **Testtilstand til modelsammenligning** (besluttet 18.10.2026): `oversaet-test` oversætter en hel engelsk fil i bidder med sammenhæng, uden Lingarr og uden korrektur. Formålet er at sammenligne modeller (Anthropic, DeepSeek og Gemini) i én gennemgang for at se, om vi kan droppe Lingarrs linje-for-linje-oversættelse og Opus-korrekturen. Driften er uændret, indtil en beslutning er taget.
 
 ## Hvis noget går galt
 

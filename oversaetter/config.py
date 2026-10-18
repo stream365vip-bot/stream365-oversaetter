@@ -10,6 +10,32 @@ OLD_KEYS = ("SEERR_DELAY_MINUTES", "TAG_DELAY_HOURS", "FIRST_SEEN_DELAY_HOURS")
 # Felter hvor en tom værdi i .env betyder "slået fra" i stedet for "brug standard".
 EMPTY_ALLOWED = ("credit_text",)
 
+# Priser i USD pr. million tokens (ind, ud) til testtilstanden oversaet-test. Ukendt model = "pris ukendt".
+MODEL_PRICES: dict[str, tuple[float, float]] = {
+    "claude-haiku-5-5": (0.10, 0.50),
+    "claude-sonnet-5-5": (2.0, 10.0),
+    "claude-opus-5-5": (4.0, 20.0),
+    "deepseek-v4-pro": (0.66, 1.98),
+    "deepseek-flash": (0.15, 0.60),
+    "gemini-3.8-flash": (0.75, 3.75),
+}
+
+
+def model_price(model: str, input_tokens: int, output_tokens: int) -> float | None:
+    """Pris i USD for en model fra MODEL_PRICES, eller None hvis modellen er ukendt."""
+    prices = MODEL_PRICES.get(model)
+    if prices is None:
+        return None
+    return input_tokens * prices[0] / 1_000_000 + output_tokens * prices[1] / 1_000_000
+
+
+def read_key(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:  # findes ikke, ingen adgang, eller en mappe (Docker laver en mappe, hvis filen mangler)
+        return ""
+
 
 def _bool(value: str) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "ja", "on")
@@ -26,6 +52,9 @@ class Config:
     seerr_url: str = ""
     seerr_api_key: str = ""
     anthropic_api_key_file: str = "/run/secrets/anthropic_api_key"
+    # Kun til testtilstanden oversaet-test. Mangler filerne, påvirker det ikke driften.
+    deepseek_api_key_file: str = "/run/secrets/deepseek_api_key"
+    gemini_api_key_file: str = "/run/secrets/gemini_api_key"
 
     poll_minutes: float = 15.0
     translate_tag: str = "oversaet"
@@ -80,11 +109,7 @@ class Config:
         return cfg
 
     def anthropic_api_key(self) -> str:
-        try:
-            with open(self.anthropic_api_key_file, encoding="utf-8") as f:
-                return f.read().strip()
-        except OSError:
-            return ""
+        return read_key(self.anthropic_api_key_file)
 
     def bad_words(self) -> frozenset[str]:
         from .checks import known_bad_words

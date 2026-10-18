@@ -107,6 +107,9 @@ class TranslateResult:
     calls: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    usage: dict[str, list[int]] = field(default_factory=dict)  # model -> [tokens ind, tokens ud]
+    by_fallback: int = 0  # replikker oversat af fallback-modellen efter refusal
+    timed_out: bool = False  # tidsgrænsen (deadline) blev nået, før alle bidder var oversat
 
 
 # --- klienter ------------------------------------------------------------------------------------------
@@ -297,50 +300,69 @@ def translate_all(
     effort: str | None,
     batch: int,
     call_timeout: float,
+    fallback_model: str | None = None,
+    on_usage=None,
+    deadline: float | None = None,
+    clock=time.monotonic,
 ) -> TranslateResult:
+    """Oversæt alle replikker i bidder.
+
+    fallback_model: afvises en bid (refusal) også efter halvering, prøves den med denne model.
+    on_usage(model, tokens_ind, tokens_ud): kaldes efter hvert svar (bruges til budgettet i driften).
+    deadline: tidspunkt (efter clock) hvor oversættelsen stopper; resten beholder den engelske tekst.
+    """
     n = len(en)
     da: list[str | None] = [None] * n
     result = TranslateResult(da=[])
     fallback: set[int] = set()
     glossary = Glossary(en)
 
-    def attempt(start: int, end: int) -> tuple[dict[int, str], list[str]]:
-        """Ét kald for replik start..end-1. Returnerer (gyldige oversættelser, problemer)."""
+    def attempt(start: int, end: int, use_model: str = model) -> tuple[dict[int, str], list[str], bool]:
+        """Ét kald for replik start..end-1. Returnerer (gyldige oversættelser, problemer, afvist med refusal)."""
         wanted = set(range(start + 1, end + 1))
+        timeout = call_timeout if deadline is None else min(call_timeout, deadline - clock())
+        if timeout <= 0:
+            result.timed_out = True
+            return {}, ["tidsgrænsen for hele filen er nået"], False
         user = build_user(en, da, start, end, glossary.pairs(en, da, start, start - CONTEXT_BEFORE, fallback))
         result.calls += 1
         try:
-            reply = call_with_timeout(ask_model, call_timeout, provider, client, model, effort, SYSTEM_PROMPT, user)
+            reply = call_with_timeout(ask_model, timeout, provider, client, use_model, effort, SYSTEM_PROMPT, user)
         except TimeoutError:
-            return {}, [f"intet svar inden for {call_timeout:g} sekunder (timeout)"]
+            return {}, [f"intet svar inden for {timeout:g} sekunder (timeout)"], False
         except Exception as e:  # netværk, API-fejl osv.
-            return {}, [f"fejl fra {PROVIDER_NAMES[provider]}: {type(e).__name__}: {str(e)[:200]}"]
+            return {}, [f"fejl fra {PROVIDER_NAMES[provider]}: {type(e).__name__}: {str(e)[:200]}"], False
         result.input_tokens += reply.input_tokens
         result.output_tokens += reply.output_tokens
+        used = result.usage.setdefault(use_model, [0, 0])
+        used[0] += reply.input_tokens
+        used[1] += reply.output_tokens
+        if on_usage is not None:
+            on_usage(use_model, reply.input_tokens, reply.output_tokens)
         if reply.stop != "ok":
-            return {}, [f"svaret blev afbrudt (stop={reply.stop})"]
+            return {}, [f"svaret blev afbrudt (stop={reply.stop})"], reply.stop == "refusal"
         try:
             lines = parse_lines(reply.text)
         except (ValueError, TypeError) as e:
-            return {}, [f"ugyldig JSON ({e})"]
-        return valid_lines(lines, wanted)
+            return {}, [f"ugyldig JSON ({e})"], False
+        return (*valid_lines(lines, wanted), False)
 
     def keep(found: dict[int, str]) -> None:
         for i, text in found.items():
             da[i - 1] = text
 
     def run(start: int, end: int, label: str) -> None:
-        found, problems = attempt(start, end)
+        found, problems, _ = attempt(start, end)
         if not problems:
             keep(found)
             return
         log.warning("Bid %s (replik %d-%d): %s - prøver igen", label, start + 1, end, "; ".join(problems))
-        found, problems = attempt(start, end)
+        found, problems, refused = attempt(start, end)
         if not problems:
             keep(found)
             return
         if end - start < 2:
-            give_up(start, end, found, problems)
+            last_try(start, end, found, problems, refused)
             return
         mid = (start + end + 1) // 2
         log.warning(
@@ -355,11 +377,36 @@ def translate_all(
             end,
         )
         for a, b in ((start, mid), (mid, end)):
-            found, problems = attempt(a, b)
+            found, problems, refused = attempt(a, b)
             if problems:
-                give_up(a, b, found, problems)
+                last_try(a, b, found, problems, refused)
             else:
                 keep(found)
+
+    def last_try(start: int, end: int, found: dict[int, str], problems: list[str], refused: bool) -> None:
+        """Afvist (refusal) også efter halvering: prøv med fallback-modellen, før replikkerne beholder engelsk."""
+        if refused and fallback_model and fallback_model != model:
+            log.warning(
+                "Replik %d-%d blev afvist af %s også efter halvering - prøver med fallback-modellen %s",
+                start + 1,
+                end,
+                model,
+                fallback_model,
+            )
+            keep(found)
+            missing = [p for p in range(start, end) if da[p] is None]
+            if not missing:
+                return
+            a, b = missing[0], missing[-1] + 1
+            found, problems, _ = attempt(a, b, fallback_model)
+            if not problems:
+                keep(found)
+                result.by_fallback += b - a
+                log.info("Replik %d-%d er oversat med fallback-modellen %s", a + 1, b, fallback_model)
+                return
+            problems = [f"også {fallback_model}: " + "; ".join(problems)]
+            start, end = a, b
+        give_up(start, end, found, problems)
 
     def give_up(start: int, end: int, found: dict[int, str], problems: list[str]) -> None:
         """Behold de gyldige oversættelser; resten beholder den engelske tekst."""
@@ -379,6 +426,10 @@ def translate_all(
     for k, start in enumerate(starts, start=1):
         end = min(n, start + size)
         label = f"{k}/{len(starts)}"
+        if deadline is not None and clock() >= deadline:
+            result.timed_out = True
+            log.warning("Tidsgrænsen er nået ved bid %s - replik %d-%d oversættes ikke", label, start + 1, n)
+            break
         log.info("Oversætter bid %s (replik %d-%d) med %s", label, start + 1, end, model)
         try:
             run(start, end, label)
@@ -388,6 +439,10 @@ def translate_all(
             if da[p] is None:
                 da[p] = en[p]
                 fallback.add(p)
+    for p in range(n):
+        if da[p] is None:
+            da[p] = en[p]
+            fallback.add(p)
     result.da = [t if t is not None else en[p] for p, t in enumerate(da)]
     result.fallback = sorted(fallback)
     return result

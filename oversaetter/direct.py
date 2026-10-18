@@ -1,0 +1,425 @@
+"""TRANSLATE_MODE=direct: programmet oversætter selv med Claude i bidder og afleverer resultatet til Bazarr.
+
+Besluttet 18.10.2026 efter modeltesten på Do Not Enter (se README): Opus 5.5 direkte, ingen korrektur af hele
+filen - kun en lille rettelsesrunde for de replikker, den gratis kontrol flager.
+
+Flow for ét emne: hent den engelske tekst (ekstern .srt eller indlejret tekstspor via ffmpeg), oversæt med
+oversaet.translate_all, ret de flagede replikker i ét ekstra kald, sæt kreditlinjen ind, gem filen og upload den
+til Bazarr. Fejler uploaden, skrives filen ved siden af videoen, og Bazarr bedes om at scanne disken.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import subprocess
+import time
+from dataclasses import dataclass, replace
+
+from .checks import FLAG_TEXT, EnglishIndex, check_all, plain
+from .clients import ApiError, Bazarr
+from .config import Config, model_price
+from .credit import apply_credit
+from .deadline import call_with_timeout
+from .oversaet import translate_all
+from .proofread import OUTPUT_SCHEMA as FIX_SCHEMA
+from .proofread import Budget, validate_fix
+from .selection import Candidate, has_danish
+from .srt import Cue, decode, parse, read_file, write_file_atomic
+
+log = logging.getLogger("oversaetter")
+
+CALL_TIMEOUT = 600.0  # højst så mange sekunder på ét svar fra modellen
+FFMPEG_TIMEOUT = 900.0  # højst så mange sekunder på ffprobe/ffmpeg (store filer over netværksdrev)
+UPLOAD_TIMEOUT = 120.0
+UPLOAD_WAIT = 180.0  # så længe ventes der på, at Bazarr har gemt den uploadede fil
+POLL_SECONDS = 5
+FIX_CONTEXT = 2
+FIX_MAX_TOKENS = 16000
+BATCH = 50
+
+# Tekstbaserede undertekstformater, som ffmpeg kan lave om til srt. Alt andet (PGS, VobSub, DVB ...) springes over.
+TEXT_CODECS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"}
+ENGLISH = {"eng", "en", "english"}
+SDH_RE = re.compile(r"\b(sdh|cc|hi|hoh|hearing)\b", re.IGNORECASE)
+
+FIX_PROMPT = """You are a senior editor of Danish subtitles. An automatic check flagged some lines of a Danish \
+translation from English. Fix ONLY the lines with "fix": true (each has "en", "da" and "flag"). Lines with \
+"context": true are neighbours for understanding only: never return them. Write natural spoken Danish with the \
+same meaning, at most 2 lines of at most {max_chars} characters, keep tags such as <i> and write a line break as \
+\\n. Names stay unchanged. "da" must contain only the finished Danish subtitle: no notes, no explanations. If a \
+flagged line is already correct, return it unchanged. Reply ONLY with JSON {{"fixes":[{{"i":<number>,"da":"<Danish \
+text>"}}]}}."""
+
+
+class NoEnglish(Exception):
+    """Ingen engelsk tekst, der kan oversættes. permanent=True: prøv ikke igen (fx kun billedbaserede spor)."""
+
+    def __init__(self, message: str, permanent: bool = False):
+        super().__init__(message)
+        self.permanent = permanent
+
+
+@dataclass
+class DirectOutcome:
+    ok: bool
+    reason: str = ""
+    permanent: bool = False
+    lines: int = 0
+    flags_before: int = 0
+    flags_after: int = 0
+    fixes: int = 0
+    fallback_english: int = 0
+    by_fallback: int = 0
+    cost: float = 0.0
+    seconds: float = 0.0
+    delivery: str = ""
+    credit: str = ""
+    model: str = ""
+
+    def summary(self) -> str:
+        return (
+            f"model: {self.model}, replikker: {self.lines}, flag: {self.flags_before}, rettelser: {self.fixes}, "
+            f"flag efter: {self.flags_after}, beholdt engelsk: {self.fallback_english}, "
+            f"fallback-model: {self.by_fallback}, pris: {self.cost:.4f} USD, tid: {duration(self.seconds)}, "
+            f"{self.delivery}, {self.credit}"
+        )
+
+
+def duration(seconds: float) -> str:
+    m, s = divmod(int(round(seconds)), 60)
+    return f"{m} min {s} s" if m else f"{s} s"
+
+
+# --- engelsk kilde -------------------------------------------------------------------------------------
+def _run(run_cmd, args: list[str], timeout: float):
+    try:
+        return run_cmd(args, capture_output=True, timeout=timeout, check=False)
+    except FileNotFoundError:
+        raise NoEnglish(f"{args[0]} findes ikke i containeren - kan ikke læse indlejrede spor") from None
+    except subprocess.TimeoutExpired:
+        raise NoEnglish(f"{args[0]} blev ikke færdig inden for {timeout:g} sekunder") from None
+
+
+def _sdh(stream: dict) -> bool:
+    tags = stream.get("tags") or {}
+    disp = stream.get("disposition") or {}
+    return bool(disp.get("hearing_impaired")) or bool(SDH_RE.search(str(tags.get("title") or "")))
+
+
+def pick_stream(streams: list[dict]) -> tuple[dict | None, str]:
+    """Vælg det engelske tekstspor (ikke forced, helst ikke SDH). Returnerer (spor, hvorfor intet blev valgt)."""
+    english = [
+        s
+        for s in streams
+        if str((s.get("tags") or {}).get("language") or "").lower() in ENGLISH
+        and not (s.get("disposition") or {}).get("forced")
+        and "forced" not in str((s.get("tags") or {}).get("title") or "").lower()
+    ]
+    if not english:
+        return None, "ingen engelsk tekstkilde i videoen"
+    text = [s for s in english if str(s.get("codec_name") or "").lower() in TEXT_CODECS]
+    if not text:
+        return None, "kun PGS/VobSub (billedbaseret engelsk tekst) - kan ikke oversættes"
+    text.sort(key=_sdh)  # sorted er stabil: første ikke-SDH-spor vinder
+    return text[0], ""
+
+
+def embedded_english(video: str, run_cmd=subprocess.run, timeout: float = FFMPEG_TIMEOUT) -> tuple[list[Cue], str]:
+    """Træk det engelske tekstspor ud af videoen med ffmpeg. Rejser NoEnglish, hvis der ikke er et brugbart."""
+    probe = _run(
+        run_cmd,
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "s",
+            "-show_entries",
+            "stream=index,codec_name:stream_tags=language,title:stream_disposition=forced,hearing_impaired",
+            "-of",
+            "json",
+            video,
+        ],
+        timeout,
+    )
+    if probe.returncode != 0:
+        why = decode(probe.stderr or b"").strip()[:200]
+        raise NoEnglish(f"ffprobe kunne ikke læse {os.path.basename(video)} ({why or 'ukendt fejl'})")
+    try:
+        streams = json.loads(decode(probe.stdout or b"{}")).get("streams") or []
+    except ValueError:
+        raise NoEnglish("ffprobe gav et ugyldigt svar") from None
+    stream, why = pick_stream(streams)
+    if stream is None:
+        raise NoEnglish(why, permanent=True)
+    index = int(stream["index"])
+    out = _run(
+        run_cmd,
+        ["ffmpeg", "-nostdin", "-v", "error", "-i", video, "-map", f"0:{index}", "-f", "srt", "-"],
+        timeout,
+    )
+    if out.returncode != 0:
+        why = decode(out.stderr or b"").strip()[:200]
+        raise NoEnglish(f"ffmpeg kunne ikke trække spor {index} ud ({why or 'ukendt fejl'})")
+    cues = parse(decode(out.stdout or b""))
+    title = (stream.get("tags") or {}).get("title")
+    desc = f"indlejret engelsk spor {index} ({stream.get('codec_name')}{', ' + title if title else ''}, via ffmpeg)"
+    return cues, desc
+
+
+def english_cues(cand: Candidate, run_cmd=subprocess.run) -> tuple[list[Cue], str]:
+    """Den engelske tekst for emnet (uden tomme replikker) og en beskrivelse til loggen."""
+    if cand.source_path:
+        try:
+            cues = read_file(cand.source_path)
+        except OSError as e:
+            raise NoEnglish(f"kan ikke læse {cand.source_path} ({e.strerror or type(e).__name__})") from None
+        desc = cand.source_desc or f"ekstern engelsk: {os.path.basename(cand.source_path)}"
+    else:
+        cues, desc = embedded_english(cand.video_path, run_cmd)
+    cues = [c for c in cues if plain(c.text).strip()]
+    if not cues:
+        raise NoEnglish(f"der er ingen replikker i den engelske tekst ({desc})")
+    return cues, desc
+
+
+# --- rettelsesrunden -----------------------------------------------------------------------------------
+def fix_flagged(
+    da: list[Cue],
+    en: list[str],
+    flags: dict[int, list[str]],
+    cfg: Config,
+    client,
+    timeout: float,
+    on_usage,
+) -> dict[int, str]:
+    """Ét kald til TRANSLATE_MODEL med de flagede replikker og 2 nabolinjer på hver side. Returnerer rettelser."""
+    chosen = sorted(flags)[: max(0, cfg.max_fix_lines)]
+    if not chosen:
+        return {}
+    if len(flags) > len(chosen):
+        log.info("Rettelsesrunde: %d flagede replikker - kun de første %d sendes", len(flags), len(chosen))
+    show: set[int] = set()
+    for pos in chosen:
+        show.update(range(max(0, pos - FIX_CONTEXT), min(len(da), pos + FIX_CONTEXT + 1)))
+    lines = []
+    for pos in sorted(show):
+        item = {"i": pos + 1, "en": en[pos], "da": da[pos].text}
+        if pos in chosen:
+            item.update(fix=True, flag=[FLAG_TEXT.get(f, f) for f in flags[pos]])
+        else:
+            item["context"] = True
+        lines.append(item)
+    user = 'Fix only the lines with "fix": true and reply with JSON.\n\n' + json.dumps(
+        {"lines": lines}, ensure_ascii=False
+    )
+    try:
+        response = call_with_timeout(
+            client.messages.create,
+            timeout,
+            model=cfg.translate_model,
+            max_tokens=FIX_MAX_TOKENS,
+            system=FIX_PROMPT.format(max_chars=min(40, cfg.max_line_chars)),
+            messages=[{"role": "user", "content": user}],
+            output_config={"effort": cfg.translate_effort, "format": {"type": "json_schema", "schema": FIX_SCHEMA}},
+        )
+    except TimeoutError:
+        log.error("Rettelsesrunden fik intet svar inden for %g sekunder (timeout) - ingen rettelser", timeout)
+        return {}
+    except Exception as e:  # netværk, API-fejl osv.
+        log.error("Rettelsesrunden fejlede (%s: %s) - ingen rettelser", type(e).__name__, str(e)[:200])
+        return {}
+    usage = getattr(response, "usage", None)
+    names = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+    inp = sum(int(getattr(usage, n, 0) or 0) for n in names)
+    on_usage(cfg.translate_model, inp, int(getattr(usage, "output_tokens", 0) or 0))
+    stop = getattr(response, "stop_reason", None)
+    if stop not in ("end_turn", None):
+        log.error("Rettelsesrunden blev afbrudt (stop_reason=%s) - ingen rettelser", stop)
+        return {}
+    text = next((b.text for b in getattr(response, "content", []) if getattr(b, "type", "") == "text"), "")
+    try:
+        fixes = json.loads(text)["fixes"]
+        if not isinstance(fixes, list):
+            raise ValueError("fixes er ikke en liste")
+    except (ValueError, KeyError, TypeError) as e:
+        log.error("Ugyldigt svar i rettelsesrunden (%s) - ingen rettelser", e)
+        return {}
+    allowed = {pos + 1 for pos in chosen}
+    en_by_i = {pos + 1: en[pos] for pos in chosen}
+    out: dict[int, str] = {}
+    for fix in fixes:
+        ok, why = validate_fix(fix, allowed, en_by_i)
+        if not ok:
+            shown = fix.get("da") if isinstance(fix, dict) else fix
+            log.warning("Rettelse kasseret: %s: %r", why, str(shown)[:120])
+            continue
+        pos = fix["i"] - 1
+        new = fix["da"].replace("\r\n", "\n").replace("\\n", "\n").strip()
+        if new != da[pos].text:
+            out[pos] = new
+    return out
+
+
+# --- ét emne -------------------------------------------------------------------------------------------
+class DirectTranslator:
+    def __init__(
+        self,
+        cfg: Config,
+        bazarr: Bazarr,
+        client,
+        budget: Budget,
+        run_cmd=subprocess.run,
+        sleep=time.sleep,
+        clock=time.monotonic,
+    ):
+        self.cfg, self.bazarr, self.client, self.budget = cfg, bazarr, client, budget
+        self.run_cmd, self.sleep, self.clock = run_cmd, sleep, clock
+
+    def work_path(self, cand: Candidate) -> str:
+        return os.path.join(self.cfg.data_dir, "direkte", cand.key.replace(":", "-") + ".da.srt")
+
+    def translate(self, cand: Candidate, en_cues: list[Cue], desc: str) -> DirectOutcome:
+        cfg = self.cfg
+        started = self.clock()
+        deadline = started + cfg.translate_timeout_minutes * 60
+        spent = {"cost": 0.0}
+
+        def on_usage(model: str, inp: int, out: int) -> None:
+            cost = model_price(model, inp, out)
+            if cost is None:
+                cost = cfg.price(inp, out)
+                log.warning("Ukendt pris for %s - bruger PRICE_INPUT_PER_M/PRICE_OUTPUT_PER_M", model)
+            spent["cost"] += cost
+            self.budget.record(cand.key, inp, out, cost)
+
+        log.info(
+            "Gyldig søgning fandt ikke dansk - oversætter %s selv (%s) med %s (effort %s): %d replikker fra %s",
+            cand.title,
+            cand.reason,
+            cfg.translate_model,
+            cfg.translate_effort,
+            len(en_cues),
+            desc,
+        )
+        en = [c.text for c in en_cues]
+        res = translate_all(
+            en,
+            "anthropic",
+            self.client,
+            cfg.translate_model,
+            cfg.translate_effort,
+            BATCH,
+            CALL_TIMEOUT,
+            fallback_model=cfg.fallback_model,
+            on_usage=on_usage,
+            deadline=deadline,
+            clock=self.clock,
+        )
+        outcome = DirectOutcome(ok=False, model=cfg.translate_model, lines=len(en_cues))
+        outcome.fallback_english, outcome.by_fallback = len(res.fallback), res.by_fallback
+        if res.timed_out:
+            outcome.cost, outcome.seconds = spent["cost"], self.clock() - started
+            outcome.reason = f"tidsgrænsen på {cfg.translate_timeout_minutes:g} minutter blev nået under oversættelsen"
+            return outcome
+        if len(res.fallback) == len(en_cues):
+            outcome.cost, outcome.seconds = spent["cost"], self.clock() - started
+            outcome.reason = "ingen replikker blev oversat (se fejlene ovenfor)"
+            return outcome
+        if res.fallback:
+            log.error(
+                "ADVARSEL: %d af %d replikker i %s beholder den engelske tekst (se ovenfor)",
+                len(res.fallback),
+                len(en_cues),
+                cand.title,
+            )
+
+        da = [replace(c, text=t) for c, t in zip(en_cues, res.da, strict=True)]
+        en_index = EnglishIndex(en_cues)
+        bad_words = cfg.bad_words()
+        kept_english = set(res.fallback)
+        flags = check_all(da, en_index, cfg.max_line_chars, bad_words)
+        flags = {p: f for p, f in flags.items() if p not in kept_english}  # afviste replikker sendes ikke igen
+        outcome.flags_before = len(flags)
+        log.info("Kontrol efter oversættelse: %d replikker flaget", len(flags))
+        if flags:
+            left = deadline - self.clock()
+            if self.budget.spent() >= cfg.monthly_budget_usd:
+                log.warning("Månedens budget på %.2f USD er nået - ingen rettelsesrunde", cfg.monthly_budget_usd)
+            elif left <= 1:
+                log.warning("Tidsgrænsen er nået - rettelsesrunden springes over")
+            else:
+                fixes = fix_flagged(da, en, flags, cfg, self.client, min(CALL_TIMEOUT, left), on_usage)
+                da = [replace(c, text=fixes.get(p, c.text)) for p, c in enumerate(da)]
+                outcome.fixes = len(fixes)
+                sent = min(len(flags), cfg.max_fix_lines)
+                log.info("Rettelsesrunde: %d af %d flagede replikker rettet", len(fixes), sent)
+        after = check_all(da, en_index, cfg.max_line_chars, bad_words)
+        outcome.flags_after = len([p for p in after if p not in kept_english])
+
+        final, outcome.credit = apply_credit(da, cfg.credit_text)
+        work = self.work_path(cand)
+        os.makedirs(os.path.dirname(work), exist_ok=True)
+        write_file_atomic(work, final)
+        outcome.delivery = self.deliver(cand, work, final)
+        outcome.ok = True
+        outcome.cost, outcome.seconds = spent["cost"], self.clock() - started
+        return outcome
+
+    # --- aflevering til Bazarr ---------------------------------------------------------------------------
+    def _bazarr_has_danish(self, cand: Candidate) -> bool:
+        try:
+            item = self.bazarr.item(cand.media_type, cand.media_id) or {}
+        except ApiError:
+            return False
+        return has_danish(item.get("subtitles") or []) is not None
+
+    def _wait_for_bazarr(self, cand: Candidate, before: float | None) -> bool:
+        """Bazarrs upload kører som et job i baggrunden: vent på, at den danske fil er gemt."""
+        until = self.clock() + UPLOAD_WAIT
+        while True:
+            try:
+                mtime = os.path.getmtime(cand.da_path)
+            except OSError:
+                mtime = None
+            if mtime is not None and (before is None or mtime > before):
+                return True
+            if self._bazarr_has_danish(cand):
+                return True
+            if self.clock() >= until:
+                return False
+            self.sleep(POLL_SECONDS)
+
+    def deliver(self, cand: Candidate, work: str, cues: list[Cue]) -> str:
+        with open(work, "rb") as f:
+            content = f.read()
+        filename = os.path.splitext(os.path.basename(cand.video_path))[0] + ".da.srt"
+        try:
+            before = os.path.getmtime(cand.da_path)
+        except OSError:
+            before = None
+        why = ""
+        try:
+            self.bazarr.upload(cand.media_type, cand.media_id, cand.series_id, filename, content, UPLOAD_TIMEOUT)
+            if self._wait_for_bazarr(cand, before):
+                log.info("Uploadet til Bazarr: %s (Bazarr registrerer og synkroniserer teksten)", filename)
+                return "uploadet til Bazarr"
+            why = f"Bazarr har ikke gemt filen efter {UPLOAD_WAIT:g} sekunder"
+        except ApiError as e:
+            why = str(e)
+        log.warning(
+            "ADVARSEL: Upload til Bazarr fejlede for %s (%s) - skriver %s selv og beder Bazarr scanne disken",
+            cand.title,
+            why,
+            cand.da_path,
+        )
+        write_file_atomic(cand.da_path, cues)
+        try:
+            self.bazarr.scan_disk(cand.media_type, cand.media_id, cand.series_id)
+        except ApiError as e:
+            log.warning("Kunne heller ikke bede Bazarr scanne disken for %s: %s", cand.title, e)
+            return "upload fejlede, fil skrevet (scan disk fejlede)"
+        return "upload fejlede, fil skrevet og scan disk bedt om"

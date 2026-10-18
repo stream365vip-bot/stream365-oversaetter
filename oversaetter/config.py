@@ -7,6 +7,15 @@ from dataclasses import dataclass
 
 # Nøgler fra ældre versioner. Står de i .env, ignoreres de (og det logges én gang ved start).
 OLD_KEYS = ("SEERR_DELAY_MINUTES", "TAG_DELAY_HOURS", "FIRST_SEEN_DELAY_HOURS")
+# Korrektur-nøgler fra Lingarr-flowet. I TRANSLATE_MODE=direct ignoreres de (og det logges én gang ved start).
+PROOFREAD_KEYS = (
+    "PROOFREAD_MODEL",
+    "PROOFREAD_EFFORT",
+    "PROOFREAD_BATCH",
+    "PROOFREAD_OVERLAP",
+    "PROOFREAD_CALL_TIMEOUT_MINUTES",
+)
+TRANSLATE_MODES = ("direct", "lingarr")
 # Felter hvor en tom værdi i .env betyder "slået fra" i stedet for "brug standard".
 EMPTY_ALLOWED = ("credit_text",)
 
@@ -60,7 +69,14 @@ class Config:
     translate_tag: str = "oversaet"
     search_timeout_minutes: float = 10.0
     max_searches_per_round: int = 10
-    translate_timeout_minutes: float = 45.0
+    translate_timeout_minutes: float = 45.0  # lingarr: ventetid på Bazarr; direct: højst så længe pr. emne i alt
+
+    # direct (standard): programmet oversætter selv med Claude i bidder. lingarr: det gamle flow via Bazarr/Lingarr.
+    translate_mode: str = "direct"
+    translate_model: str = "claude-opus-5-5"  # valgt 18.10.2026 (se README)
+    translate_effort: str = "medium"
+    fallback_model: str = "claude-sonnet-5-5"  # bruges kun, når en bid afvises (refusal) også efter halvering
+    max_fix_lines: int = 60  # højst så mange flagede replikker i rettelsesrunden
 
     max_line_chars: int = 42
     proofread_batch: int = 50
@@ -82,14 +98,16 @@ class Config:
     data_dir: str = "/data"
     log_level: str = "INFO"
     ignored_keys: tuple[str, ...] = ()  # gamle nøgler fra .env, der ikke bruges længere
+    proofread_keys: tuple[str, ...] = ()  # PROOFREAD_*-nøgler fra .env (ignoreres i direct-tilstand)
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Config:
         env = dict(os.environ if env is None else env)
         cfg = cls()
         cfg.ignored_keys = tuple(k for k in OLD_KEYS if env.get(k, "").strip())
+        cfg.proofread_keys = tuple(k for k in PROOFREAD_KEYS if env.get(k, "").strip())
         for field in cls.__dataclass_fields__:
-            if field == "ignored_keys":
+            if field in ("ignored_keys", "proofread_keys"):
                 continue
             raw = env.get(field.upper())
             if raw is None or (raw == "" and field not in EMPTY_ALLOWED):
@@ -106,7 +124,14 @@ class Config:
             setattr(cfg, field, value)
         for name in ("bazarr_url", "radarr_url", "sonarr_url", "seerr_url"):
             setattr(cfg, name, getattr(cfg, name).rstrip("/"))
+        cfg.translate_mode = cfg.translate_mode.strip().lower()
+        if cfg.translate_mode not in TRANSLATE_MODES:
+            raise ValueError(f"TRANSLATE_MODE={cfg.translate_mode!r} i .env er ukendt - brug direct eller lingarr")
         return cfg
+
+    @property
+    def direct(self) -> bool:
+        return self.translate_mode == "direct"
 
     def anthropic_api_key(self) -> str:
         return read_key(self.anthropic_api_key_file)

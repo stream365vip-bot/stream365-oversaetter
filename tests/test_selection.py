@@ -20,6 +20,8 @@ def make_cfg(tmp_path, **kw):
         seerr_url="http://seerr",
         data_dir=str(tmp_path / "data"),
         dry_run=False,
+        # De ældre tests dækker det gamle flow (TRANSLATE_MODE=lingarr). Det direkte flow testes i test_direct.py.
+        translate_mode="lingarr",
     )
     settings.update(kw)
     return base_cfg(**settings)

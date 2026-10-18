@@ -1,7 +1,8 @@
 """Små klienter til Bazarr, Radarr, Sonarr og Seerr.
 
-Kun læsning - bortset fra tre kald til Bazarr: translate, søg efter dansk til ét emne og synkronisér
-med Radarr/Sonarr. Ingen af dem ændrer indstillinger.
+Kun læsning - bortset fra disse kald til Bazarr: translate (lingarr-tilstand), upload af den danske tekst og
+"scan disk" for ét emne (direct-tilstand), søg efter dansk til ét emne og synkronisér med Radarr/Sonarr.
+Ingen af dem ændrer indstillinger.
 """
 
 from __future__ import annotations
@@ -62,7 +63,7 @@ class _Api:
                 r.status_code,
             ) from None
 
-    def _request(self, method: str, path: str, params, timeout: float) -> httpx.Response:
+    def _request(self, method: str, path: str, params, timeout: float, **body) -> httpx.Response:
         # Fejlteksterne bygges selv, så hverken headers (nøgler) eller httpx' egne beskeder kommer i loggen.
         try:
             r = call_with_timeout(
@@ -73,6 +74,7 @@ class _Api:
                 params=params,
                 headers=self.headers,
                 timeout=httpx.Timeout(timeout),
+                **body,
             )
         except (httpx.TimeoutException, TimeoutError):
             raise ApiError(
@@ -154,6 +156,30 @@ class Bazarr(_Api):
     def sync(self, task_id: str) -> None:
         """Start Bazarrs opgave "Sync with Radarr" (update_movies) eller "Sync with Sonarr" (update_series)."""
         self._request("POST", "/api/system/tasks", {"taskid": task_id}, GET_TIMEOUT)
+
+    def upload(
+        self, media_type: str, media_id: int, series_id: int | None, filename: str, content: bytes, timeout_s: float
+    ) -> None:
+        """Aflever en dansk .srt til Bazarr (samme kald som Upload-knappen i Bazarr 1.6.2).
+
+        POST /api/movies/subtitles?radarrid=.. eller /api/episodes/subtitles?seriesid=..&episodeid=.., multipart med
+        file, language=da, forced=false og hi=false. Bazarr gemmer filen som <video>.da.srt, registrerer den og
+        kører sync/Sub-Zero som ved en manuel upload.
+        """
+        if media_type == "movie":
+            path, params = "/api/movies/subtitles", {"radarrid": media_id}
+        else:
+            path, params = "/api/episodes/subtitles", {"seriesid": series_id, "episodeid": media_id}
+        form = {"language": "da", "forced": "false", "hi": "false"}
+        files = {"file": (filename, content, "application/x-subrip")}
+        self._request("POST", path, params, timeout_s, data=form, files=files)
+
+    def scan_disk(self, media_type: str, media_id: int, series_id: int | None) -> None:
+        """Bed Bazarr læse underteksterne på disken igen for én film (eller hele serien for et afsnit)."""
+        if media_type == "movie":
+            self._request("PATCH", "/api/movies", {"radarrid": media_id, "action": "scan-disk"}, GET_TIMEOUT)
+        else:
+            self._request("PATCH", "/api/series", {"seriesid": series_id, "action": "scan-disk"}, GET_TIMEOUT)
 
     def jobs(self) -> list[dict] | None:
         """Bazarrs jobkø (findes kun i nyere versioner). None hvis den ikke kan læses."""

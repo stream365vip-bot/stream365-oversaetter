@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import email
+import email.policy
 import os
 import threading
 from datetime import UTC, datetime, timedelta
@@ -43,6 +45,10 @@ class FakeArr:
         self.sync_calls: list[str] = []
         self.bazarr_unknown: set[str] = set()  # "movie:1" / "series:50" -> Bazarr kender den ikke endnu
         self.radarr_tags = [{"id": 3, "label": "oversaet"}]
+        self.uploads: list[dict] = []  # felter fra upload-kaldet + "query" og "content" (filens indhold)
+        self.upload_status = 204
+        self.upload_saves = True  # som Bazarr: gem den uploadede fil som <video>.da.srt
+        self.scan_calls: list[dict] = []
         self._job_id = 100
 
     # --- opsætning ----------------------------------------------------------------
@@ -148,7 +154,7 @@ class FakeArr:
             e = self.episodes[int(q["episodeid[]"][0])]
             data = {"path": e["path"], "subtitles": e["subtitles"], "missing_subtitles": self.missing(e)}
             return httpx2.Response(200, json={"data": [data]})
-        if path == "/api/series":
+        if path == "/api/series" and req.method == "GET":
             data = []
             for x in q.get("seriesid[]", []):
                 sid = int(x)
@@ -178,6 +184,11 @@ class FakeArr:
             if self.on_search:
                 self.on_search(params)
             return httpx2.Response(204, text="")
+        if path in ("/api/movies/subtitles", "/api/episodes/subtitles") and req.method == "POST":
+            return self.upload(req, path, q)
+        if path in ("/api/movies", "/api/series") and req.method == "PATCH":
+            self.scan_calls.append({"path": path, **{k: v[0] for k, v in q.items()}})
+            return httpx2.Response(204, text="")
         if path == "/api/system/tasks" and req.method == "POST":
             self.sync_calls.append(q["taskid"][0])
             return httpx2.Response(204, text="")
@@ -192,6 +203,29 @@ class FakeArr:
                 self.on_translate(form)
             return httpx2.Response(self.translate_status, text="")
         return httpx2.Response(404)
+
+    def upload(self, req, path, q):
+        head = f"Content-Type: {req.headers['content-type']}\r\n\r\n".encode()
+        msg = email.message_from_bytes(head + req.content, policy=email.policy.HTTP)
+        fields: dict = {"path": path, "query": {k: v[0] for k, v in q.items()}}
+        for part in msg.iter_parts():
+            name = part.get_param("name", header="content-disposition")
+            if name == "file":
+                fields["filename"] = part.get_filename()
+                fields["content"] = part.get_payload(decode=True).decode("utf-8")
+            else:
+                fields[name] = part.get_content().strip()
+        self.uploads.append(fields)
+        if self.upload_status == 204 and self.upload_saves:
+            if path == "/api/movies/subtitles":
+                item = self.movies[int(q["radarrid"][0])]
+            else:
+                item = self.episodes[int(q["episodeid"][0])]
+            da = os.path.splitext(item["path"])[0] + ".da.srt"
+            with open(da, "w", encoding="utf-8") as f:
+                f.write(fields["content"])
+            item["subtitles"] = [*item["subtitles"], {"code2": "da", "code3": "dan", "path": da, "forced": False}]
+        return httpx2.Response(self.upload_status, text="")
 
     def radarr(self, path):
         self.radarr_calls += 1

@@ -45,8 +45,9 @@ sudo chown -R 1000:1000 /opt/oversaetter/data
 #    Tomme filer er i orden: så virker driften som normalt, og kun oversaet-test melder, at nøglen mangler.
 sudo mkdir -p /opt/oversaetter/secrets
 #    tmdb_api_key.txt er valgfri (filmkontekst fra TMDB, se "Bedre og hurtigere oversættelse").
+#    plex_token.txt er valgfri (Plex scanner mappen efter upload, se "Trin B4g").
 sudo touch /opt/oversaetter/secrets/deepseek_api_key.txt /opt/oversaetter/secrets/gemini_api_key.txt \
-  /opt/oversaetter/secrets/tmdb_api_key.txt
+  /opt/oversaetter/secrets/tmdb_api_key.txt /opt/oversaetter/secrets/plex_token.txt
 sudo chown 1000:1000 /opt/oversaetter/secrets/*.txt
 sudo chmod 600 /opt/oversaetter/secrets/*.txt
 
@@ -184,6 +185,7 @@ Nøgler:
 | deepseek | `/opt/oversaetter/secrets/deepseek_api_key.txt` |
 | gemini | `/opt/oversaetter/secrets/gemini_api_key.txt` |
 | TMDB (kontekst, valgfri) | `/opt/oversaetter/secrets/tmdb_api_key.txt` |
+| Plex (scanning efter upload, valgfri) | `/opt/oversaetter/secrets/plex_token.txt` |
 
 Skriv nøglen i filen med `sudo nano` (kun nøglen, én linje). Mangler en nøgle, stopper kun testtilstanden med en dansk besked – driften kører videre.
 
@@ -302,6 +304,11 @@ Loggen viser, hvad der blev slettet. Passer titlen på flere rækker, slettes in
   4. **`missing_number`**: tal med tusindtalsseparator er samme tal (82,000 = 82.000 = 82 000 = 82000).
   5. **Faste oversættelser** (prompt v4 og `english_word`): "Jesus." (udbrud) -> "Jøsses."/"Åh gud.", lifer -> karrieresoldat, "Copy." (radio) -> "Modtaget." (konsekvent), "Flight deck to cockpit" -> "Flydæk til cockpit".
   6. **`oversaet-test --vis-kontekst`**: filmkonteksten og ordlisten øverst i rapporten.
+
+- **Trin B4g: Plex scanner mappen efter upload** (18.10.2026): Bazarrs egen Plex-opdatering kører kun ved download, ikke når vi uploader den danske tekst. Efter en vellykket upload finder programmet det Plex-bibliotek, hvis mappe indeholder filmens/afsnittets mappe (`GET /library/sections`), og beder om en delvis scanning af netop mappen (`GET /library/sections/<id>/refresh?path=<mappe>`, tokenet i `X-Plex-Token`-headeren). Loggen skriver `Plex: bad om scanning af <mappe>` eller en advarsel; oversættelsen påvirkes aldrig (hård tidsgrænse 15 sekunder).
+  - `PLEX_URL` (fx `https://plex.stream365.vip`) og tokenet i `/opt/oversaetter/secrets/plex_token.txt` (monteres som `/run/secrets/plex_token`, `PLEX_TOKEN_FILE`). Mangler en af dem, springes trinnet over med én INFO-linje.
+  - Stien er den samme som i Radarr/Sonarr (`/mnt/unionfs/...`). Ser Plex mapperne et andet sted, byttes præfikset med `PLEX_PATH_MAP="fra=til"` (standard tom).
+  - Resultatet gemmes i `items.plex_refresh` (1 = bedt om, 0 = fejlede, NULL = ikke forsøgt), fx `SELECT title, plex_refresh FROM items WHERE status = 'faerdig'`.
 
 ## Hvis noget går galt
 

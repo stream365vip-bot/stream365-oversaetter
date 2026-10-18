@@ -329,7 +329,7 @@ def test_report_flags_and_fallback(tmp_path, capsys):
     assert run_translate_test(cfg(), en, out, "anthropic", "claude-sonnet-5-5", effort="low", client=fake) == 0
     report = capsys.readouterr().out
     assert "Faldt tilbage til engelsk: 1 (replik 2)" in report
-    assert "Flag fra kontrollen:" in report and "Model: claude-sonnet-5-5 (effort low)" in report
+    assert "Rettelsesflag fra kontrollen:" in report and "Model: claude-sonnet-5-5 (effort low)" in report
     assert fake.requests[0]["output_config"]["effort"] == "low"
 
 

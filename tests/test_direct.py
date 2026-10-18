@@ -15,7 +15,7 @@ from oversaetter.direct import FIX_PROMPT, pick_stream
 from oversaetter.oversaet import SYSTEM_PROMPT, translate_all
 from oversaetter.runner import Runner
 from tests.fakes import FakeArr, embedded, en_sub
-from tests.helpers import srt
+from tests.helpers import srt, system_text
 from tests.test_selection import make_cfg
 
 EN = srt(
@@ -72,14 +72,14 @@ class FakeAnthropic:
 
     def create(self, **kwargs):
         self.requests.append(kwargs)
-        answer = self.translate if kwargs["system"] == SYSTEM_PROMPT else self.fix
+        answer = self.translate if system_text(kwargs["system"]) == SYSTEM_PROMPT else self.fix
         out = answer(kwargs)
         if isinstance(out, Exception):
             raise out
         return out
 
     def kinds(self) -> list[str]:
-        return ["oversæt" if r["system"] == SYSTEM_PROMPT else "ret" for r in self.requests]
+        return ["oversæt" if system_text(r["system"]) == SYSTEM_PROMPT else "ret" for r in self.requests]
 
 
 class FakeCommands:
@@ -325,7 +325,7 @@ def test_refusal_is_halved_then_sent_to_fallback_model(caplog):
             50,
             60.0,
             fallback_model="claude-sonnet-5-5",
-            on_usage=lambda m, i, o: used.append(m),
+            on_usage=lambda m, *tokens: used.append(m),
         )
     calls = [(r["model"], [x["i"] for x in payload(r)["lines"]]) for r in fake.requests]
     assert calls == [

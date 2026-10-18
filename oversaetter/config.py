@@ -31,12 +31,28 @@ MODEL_PRICES: dict[str, tuple[float, float]] = {
 }
 
 
-def model_price(model: str, input_tokens: int, output_tokens: int) -> float | None:
-    """Pris i USD for en model fra MODEL_PRICES, eller None hvis modellen er ukendt."""
+# Prompt-cache (Anthropic): cache-læsning koster 10 % og cache-skrivning 125 % af inputprisen.
+CACHE_READ_FACTOR = 0.1
+CACHE_WRITE_FACTOR = 1.25
+
+
+def model_price(
+    model: str, input_tokens: int, output_tokens: int, cache_read: int = 0, cache_write: int = 0
+) -> float | None:
+    """Pris i USD for en model fra MODEL_PRICES, eller None hvis modellen er ukendt.
+
+    input_tokens er de almindelige (ikke-cachede) tokens ind; cache_read/cache_write er prompt-cachens tokens.
+    """
     prices = MODEL_PRICES.get(model)
     if prices is None:
         return None
-    return input_tokens * prices[0] / 1_000_000 + output_tokens * prices[1] / 1_000_000
+    inp = prices[0] / 1_000_000
+    return (
+        input_tokens * inp
+        + cache_read * inp * CACHE_READ_FACTOR
+        + cache_write * inp * CACHE_WRITE_FACTOR
+        + output_tokens * prices[1] / 1_000_000
+    )
 
 
 def read_key(path: str) -> str:
@@ -87,6 +103,9 @@ class Config:
     context: bool = False  # CONTEXT=on: filmkontekst (titel, handling, roller) i instruksen
     glossary: bool = False  # GLOSSARY=on: ordliste pr. film før bidderne
     parallel: int = 1  # så mange bidder sendes samtidig
+    # Trin B2 (18.10.2026)
+    reading_speed_max: float = 25.0  # tegn pr. sekund; reading_speed er kun et informationsflag
+    prompt_cache: bool = True  # PROMPT_CACHE: systeminstruksen markeres til Anthropics prompt-cache
 
     max_line_chars: int = 42
     proofread_batch: int = 50
@@ -169,4 +188,9 @@ class Config:
     def price(self, input_tokens: int, output_tokens: int, cache_read: int = 0, cache_write: int = 0) -> float:
         inp = self.price_input_per_m / 1_000_000
         out = self.price_output_per_m / 1_000_000
-        return input_tokens * inp + cache_read * inp * 0.1 + cache_write * inp * 1.25 + output_tokens * out
+        return (
+            input_tokens * inp
+            + cache_read * inp * CACHE_READ_FACTOR
+            + cache_write * inp * CACHE_WRITE_FACTOR
+            + output_tokens * out
+        )

@@ -28,7 +28,9 @@ CREATE TABLE IF NOT EXISTS items (
     search_started_at TEXT,        -- Bazarr er bedt om at søge efter dansk (søgningen er ikke vurderet endnu)
     search_jobs TEXT,              -- id'er på Bazarrs søgejob, kommasepareret
     search_at TEXT,                -- tidspunkt for en gyldig søgning (ingen tjeneste på pause før og efter)
-    en_search_at TEXT              -- tidspunkt for seneste gyldige søgning efter engelsk (ingen dansk, ingen kilde)
+    en_search_at TEXT,             -- tidspunkt for seneste gyldige søgning efter engelsk (ingen dansk, ingen kilde)
+    series_id INTEGER,             -- sonarrSeriesId (kun afsnit), så ordlisten kan genbruges i serien
+    glossary TEXT                  -- ordlisten (JSON) fra GLOSSARY=on
 );
 CREATE TABLE IF NOT EXISTS spend (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,7 +49,14 @@ CREATE TABLE IF NOT EXISTS providers (
 
 # Kolonner tilføjet efter første version. Ældre databaser får dem automatisk, uden at miste rækker.
 NEW_COLUMNS = {
-    "items": {"search_started_at": "TEXT", "search_jobs": "TEXT", "search_at": "TEXT", "en_search_at": "TEXT"}
+    "items": {
+        "search_started_at": "TEXT",
+        "search_jobs": "TEXT",
+        "search_at": "TEXT",
+        "en_search_at": "TEXT",
+        "series_id": "INTEGER",
+        "glossary": "TEXT",
+    }
 }
 
 
@@ -68,7 +77,8 @@ class Database:
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        self.conn = sqlite3.connect(path)
+        # Parallelle bidder registrerer udgifter fra flere tråde; kaldene serialiseres af oversættelsens lås.
+        self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
         self._upgrade()
@@ -100,6 +110,15 @@ class Database:
 
     def with_status(self, status: str) -> list[sqlite3.Row]:
         return list(self.conn.execute("SELECT * FROM items WHERE status = ?", (status,)))
+
+    def series_glossaries(self, series_id: int, exclude_key: str, limit: int = 5) -> list[str]:
+        """Ordlister (JSON) fra tidligere afsnit af samme serie, nyeste først."""
+        rows = self.conn.execute(
+            "SELECT glossary FROM items WHERE series_id = ? AND key != ? AND glossary IS NOT NULL "
+            "ORDER BY updated_at DESC LIMIT ?",
+            (series_id, exclude_key, limit),
+        )
+        return [r["glossary"] for r in rows]
 
     def track_paused(self, paused: list[str], when: datetime | None = None) -> dict[str, datetime]:
         """Husk hvornår hver tjeneste blev sat på pause. Returnerer navn -> siden hvornår (kun dem på pause nu)."""

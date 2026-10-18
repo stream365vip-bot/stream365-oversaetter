@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx2 as httpx
 
+from . import kontekst
 from .clients import GET_TIMEOUT, ApiError, Bazarr, Radarr, Seerr, SeerrIndex, Sonarr, parse_date
 from .config import Config
 from .credit import apply_credit
@@ -435,6 +436,7 @@ class Runner:
             da_path=cand.da_path,
             started_at=iso(),
             reason=cand.reason,
+            series_id=cand.series_id,
         )
         try:
             en, desc = english_cues(cand, self.run_cmd)
@@ -442,8 +444,20 @@ class Runner:
             self._failed(cand.key, cand.title, attempts, str(e), e.permanent)
             self.current = None
             return
-        direct = DirectTranslator(cfg, self.bazarr, self.claude, budget, self.run_cmd, self.sleep, self.clock)
+        direct = DirectTranslator(
+            cfg,
+            self.bazarr,
+            self.claude,
+            budget,
+            self.run_cmd,
+            self.sleep,
+            self.clock,
+            context_for=self.context_for,
+            glossaries_for=self.glossaries_for,
+        )
         out = direct.translate(cand, en, desc)
+        if out.glossary is not None:
+            self.db.upsert(cand.key, glossary=out.glossary.to_json())
         if not out.ok:
             self.db.upsert(cand.key, cost_usd=out.cost)
             self._failed(cand.key, cand.title, attempts, out.reason)
@@ -460,6 +474,18 @@ class Runner:
         )
         log.info("Færdig: %s - %s", cand.title, out.summary())
         self.current = None
+
+    def context_for(self, cand: Candidate) -> str | None:
+        """CONTEXT=on: filmkonteksten fra Radarr/Sonarr (og TMDB, hvis der er en nøgle). Fejler aldrig."""
+        key = self.cfg.tmdb_key()
+        tmdb = kontekst.Tmdb(self.cfg.tmdb_url, key, self.http) if key else None
+        return kontekst.for_candidate(cand, self.radarr, self.sonarr, tmdb)
+
+    def glossaries_for(self, cand: Candidate) -> list[str]:
+        """Ordlister fra tidligere afsnit af samme serie (film: ingen)."""
+        if cand.media_type != "episode" or cand.series_id is None:
+            return []
+        return self.db.series_glossaries(cand.series_id, cand.key)
 
     def _failed(self, key: str, title: str, attempts: int, reason: str, permanent: bool = False) -> None:
         if permanent:
@@ -617,6 +643,7 @@ class Runner:
                 self.cfg.fallback_model,
                 self.cfg.max_fix_lines,
             )
+            log.info("Kontakter: %s", self.cfg.switches())
             if self.cfg.proofread_keys:
                 log.info(
                     "%s i .env bruges ikke i TRANSLATE_MODE=direct og ignoreres", ", ".join(self.cfg.proofread_keys)

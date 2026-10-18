@@ -11,11 +11,14 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 
-from .checks import INTERJECTIONS, NOT_NAMES, WORD_RE, EnglishIndex, check_all, plain
+from . import ordliste
+from .checks import INTERJECTIONS, NOT_NAMES, WORD_RE, EnglishIndex, check_all, only_filler, plain
 from .config import Config, model_price, read_key
 from .deadline import call_with_timeout
 from .srt import Cue, read_file, write_file_atomic
@@ -68,6 +71,82 @@ cues) are only for understanding. Never translate, repeat or return them. Reply 
 Format: keep formatting tags such as <i>...</i>. Keep the line breaks of the source and write a line break as \
 \\n (at most 2 lines, at most 40 characters per line). Reply ONLY with JSON of the form \
 {"lines":[{"i":<number>,"da":"<Danish text>"}]} with exactly one entry for every number in "lines" and no others."""
+
+# Prompt v4 (18.10.2026): v3 med prioritering, færre regler og ét forkert/rigtigt eksempel pr. regel.
+SYSTEM_PROMPT_V4 = """You are an experienced Danish subtitler translating from English to Danish for Danish viewers. \
+You receive a batch of numbered English subtitle cues as JSON in "lines". Translate each number on its own and \
+keep its number "i".
+When rules conflict, this order wins: 1) the meaning is right, 2) at most 2 lines and at most 40 characters per \
+line, 3) natural spoken Danish, 4) style and tone.
+1. Meaning, not words: write Danish the way Danes actually talk. Wrong: "Det er ikke min kop te." Right: "Det er \
+ikke lige mig."
+2. Only Danish words and spelling with æ, ø and å, never Norwegian, Swedish or German. Translate every English word \
+except names; only these may stay: okay, hey, wow, yo, cool, nice, shit, fuck, bro. Wrong: "Uansett hva, please." \
+Right: "Uanset hvad, kom nu."
+3. Anglicisms: translate what is meant. "I mean" -> "altså", "like" (filler) -> leave out or "ligesom", "you know" \
+-> "du ved" or leave out, "whatever" -> "og hvad så"/"lige meget", "deal with it" -> "lev med det", "I'm good" -> \
+"ellers tak"/"jeg klarer mig", "no way" -> "glem det"/"det kan ikke passe", "at the end of the day" -> "når alt \
+kommer til alt", "reach out" -> "kontakte", "off the record" -> "mellem os", "check" (confirming) -> "tjek", \
+"yikes" -> "uha", "please" (begging) -> "kom nu"/"vær sød". Wrong: "Jeg mener, det er fint." Right: "Altså, det er \
+fint."
+4. Generic "you" (anyone) becomes "man". "You" said to a person stays "du"/"I". Wrong: "You never know." -> "Du ved \
+aldrig." Right: "Man ved aldrig."
+5. Compound nouns are one word. Wrong: "bil nøgle", "nattesyns briller". Right: "bilnøgle", "hovednøgle", \
+"nattesynsbriller".
+6. Lower case for weekdays, months, nationalities and languages. Wrong: "på Mandag i Juni", "Han er Svensk." Right: \
+"på mandag i juni", "Han er svensk."
+7. Filler sounds (uh, um, hm, hmm, ah, ugh) are left out. A cue with only filler sounds gets an empty "da": "". \
+"Yeah." / "Okay." / "Right." / "Sure." alone -> "Ja." / "Okay." / "Nemlig." / "Klart." Wrong: "Øh, jeg ved det \
+ikke." Right: "Jeg ved det ikke."
+8. Short: at most 2 lines and at most 40 characters per line. Leave out filler, never information that matters. If \
+the source has two lines, use two lines, and split long sentences at a natural place. Wrong: "Jeg har overhovedet \
+ikke tænkt mig at tage med dig derhen i aften." Right: "Jeg tager ikke med\\ndig derhen i aften."
+9. Half sentences: a cue is often part of a sentence that continues in the next cue. Translate only the words in \
+that cue under its own number, but make the sentence read correctly across cues. Never move words to another \
+number, and never merge or split numbers. Wrong: 12 "Jeg har ikke tid til at vente", 13 "". Right: 12 "Jeg har \
+ikke tid", 13 "til at vente."
+10. Keep <i>...</i> and speaker dashes: "-" at the start of both lines when the source has them, never added \
+otherwise. Wrong: "<i>Hvor er du?" Right: "<i>Hvor er du?</i>"
+11. Numbers keep their value. Digits stay digits, numbers written as words become Danish words. Wrong: "three \
+days" -> "3 dage". Right: "tre dage".
+12. Names of people, places, companies, groups, shows and brands stay unchanged. Song lyrics and signs are \
+translated unless they are names. Wrong: "John" -> "Jens". Right: "John".
+13. Other foreign languages in the source (French, Spanish ...) stay exactly as written. Wrong: "Merci." -> "Tak." \
+Right: "Merci."
+14. Negations stay correct. Wrong: "Do not disrespect my science" -> "Respektér ikke min videnskab." Right: "Vis \
+lidt respekt for min videnskab."
+15. Swearing, insults and slang: same strength as the source, plural stays plural, and translate what the \
+character means. "Sue me." -> "Så sagsøg mig." "Let's go." -> "Kom så." "Executive decision." -> "Det bestemmer \
+jeg." "Bet." -> "Aftale." "beast" -> "uhyre" (never "bestie"). Wrong: "Fancy." -> "Fancy." Right: "Fint."
+16. Consistency: use the same Danish word for a name or recurring term every time. Follow the film glossary (if \
+given) exactly and use its "address" (du/De) between the same characters through the whole film. "glossary" in the \
+request shows how names and recurring terms were translated earlier in this file: follow it. Wrong: "Store Mike" \
+in one cue and "Big Mike" in the next. Right: the same every time.
+17. "context_before" (the previous cues with their finished Danish translation) and "context_after" (the next \
+cues) are only for understanding. Never translate, repeat or return them. Reply with JSON only, no notes.
+
+Format: write a line break as \\n. Reply ONLY with JSON of the form {"lines":[{"i":<number>,"da":"<Danish text>"}]} \
+with exactly one entry for every number in "lines" and no others."""
+
+# Kun for deepseek/gemini i v4: de tænker bedst, når de bliver bedt om det.
+THINK_FIRST = (
+    "First make a rough translation in your own thoughts, review it for anglicisms and for lines that are too long, "
+    "and output only the finished JSON."
+)
+
+
+def build_system(version: str, provider: str, context: str | None = None, glossary=None) -> str:
+    """Systeminstruksen: v3 eller v4, evt. med filmkontekst og ordliste (samme for alle bidder, så den caches)."""
+    parts = [SYSTEM_PROMPT_V4 if version == "v4" else SYSTEM_PROMPT]
+    if version == "v4" and provider in ("deepseek", "gemini"):
+        parts[0] += "\n" + THINK_FIRST
+    if context:
+        parts.append(context)
+    block = glossary.block() if glossary is not None else ""
+    if block:
+        parts.append(block)
+    return "\n\n".join(parts)
+
 
 OUTPUT_SCHEMA = {
     "type": "object",
@@ -144,14 +223,28 @@ def _int(obj, name: str) -> int:
     return int(getattr(obj, name, 0) or 0)
 
 
-def ask_model(provider: str, client, model: str, effort: str | None, system: str, user: str) -> Reply:
+def ask_model(
+    provider: str,
+    client,
+    model: str,
+    effort: str | None,
+    system: str,
+    user: str,
+    schema: dict | None = None,
+    cache: bool = False,
+) -> Reply:
+    """Ét kald. cache=True: systeminstruksen markeres til Anthropics prompt-cache (samme for alle bidder)."""
     if provider == "anthropic":
+        sys_param = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}] if cache else system
         response = client.messages.create(
             model=model,
             max_tokens=MAX_TOKENS,
-            system=system,
+            system=sys_param,
             messages=[{"role": "user", "content": user}],
-            output_config={"effort": effort or "medium", "format": {"type": "json_schema", "schema": OUTPUT_SCHEMA}},
+            output_config={
+                "effort": effort or "medium",
+                "format": {"type": "json_schema", "schema": schema or OUTPUT_SCHEMA},
+            },
         )
         usage = getattr(response, "usage", None)
         inp = sum(_int(usage, n) for n in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
@@ -196,8 +289,11 @@ def clean_da(text: str) -> str:
     return "\n".join(line.strip() for line in text.split("\n") if line.strip())
 
 
-def valid_lines(lines: list, wanted: set[int]) -> tuple[dict[int, str], list[str]]:
-    """Gyldige oversættelser {nummer: tekst} og en liste med problemer (manglende, ekstra eller tomme numre)."""
+def valid_lines(lines: list, wanted: set[int], empty_ok: set[int] = frozenset()) -> tuple[dict[int, str], list[str]]:
+    """Gyldige oversættelser {nummer: tekst} og en liste med problemer (manglende, ekstra eller tomme numre).
+
+    empty_ok: numre, der må få tom tekst (v4: replikker, der kun består af fyldlyde).
+    """
     found: dict[int, str] = {}
     extra: list = []
     empty: list[int] = []
@@ -206,6 +302,9 @@ def valid_lines(lines: list, wanted: set[int]) -> tuple[dict[int, str], list[str
         da = item.get("da") if isinstance(item, dict) else None
         if not isinstance(i, int) or isinstance(i, bool) or i not in wanted:
             extra.append(i)
+            continue
+        if isinstance(da, str) and i in empty_ok and not plain(clean_da(da)).strip():
+            found.setdefault(i, "")
             continue
         if not isinstance(da, str) or not plain(clean_da(da)).strip():
             empty.append(i)
@@ -291,6 +390,45 @@ def build_user(en: list[str], da: list[str | None], start: int, end: int, glossa
     )
 
 
+# --- ordliste og tomme replikker ------------------------------------------------------------------------
+def make_glossary(
+    provider: str,
+    client,
+    model: str,
+    effort: str | None,
+    en: list[str],
+    context: str | None,
+    previous: ordliste.Wordlist | None,
+    timeout: float,
+    on_usage=None,
+) -> ordliste.Wordlist | None:
+    """Ordlisten pr. film med ét kald til samme model som oversættelsen. None (med en WARNING) ved fejl."""
+
+    def ask(system: str, user: str, schema: dict) -> Reply:
+        return call_with_timeout(ask_model, timeout, provider, client, model, effort, system, user, schema)
+
+    def usage(inp: int, out: int) -> None:
+        if on_usage is not None:
+            on_usage(model, inp, out)
+
+    wl = ordliste.build(ask, en, context, previous, usage)
+    if wl is not None:
+        wl.cost = model_price(model, wl.input_tokens, wl.output_tokens)
+    return wl
+
+
+def filler_positions(en: list[str], version: str) -> set[int]:
+    """v4: positioner, hvor replikken kun er fyldlyde og må få tom tekst."""
+    return {p for p, t in enumerate(en) if only_filler(t)} if version == "v4" else set()
+
+
+def drop_empty(da: list[str], fallback: list[int]) -> tuple[list[int], list[int]]:
+    """Positioner der beholdes (tomme replikker fjernes) og fallback-positionerne omregnet til de nye positioner."""
+    kept = [p for p, t in enumerate(da) if plain(t).strip()]
+    new = {p: i for i, p in enumerate(kept)}
+    return kept, sorted(new[p] for p in fallback if p in new)
+
+
 # --- oversættelse --------------------------------------------------------------------------------------
 def translate_all(
     en: list[str],
@@ -304,18 +442,27 @@ def translate_all(
     on_usage=None,
     deadline: float | None = None,
     clock=time.monotonic,
+    system: str | None = None,
+    parallel: int = 1,
+    empty_ok: set[int] = frozenset(),
 ) -> TranslateResult:
     """Oversæt alle replikker i bidder.
 
     fallback_model: afvises en bid (refusal) også efter halvering, prøves den med denne model.
     on_usage(model, tokens_ind, tokens_ud): kaldes efter hvert svar (bruges til budgettet i driften).
     deadline: tidspunkt (efter clock) hvor oversættelsen stopper; resten beholder den engelske tekst.
+    system: systeminstruksen (standard v3 uden kontekst); en anden instruks markeres til prompt-cachen.
+    parallel: så mange bidder sendes samtidig (tråde). De danske "foregående" linjer sendes kun, når de er færdige.
+    empty_ok: positioner (0-baseret), der må få tom tekst (v4: kun fyldlyde).
     """
     n = len(en)
     da: list[str | None] = [None] * n
     result = TranslateResult(da=[])
     fallback: set[int] = set()
     glossary = Glossary(en)
+    system = system or SYSTEM_PROMPT
+    cache = system != SYSTEM_PROMPT
+    lock = threading.RLock()  # bogføring (tokens, budget, da, fallback) fra flere tråde
 
     def attempt(start: int, end: int, use_model: str = model) -> tuple[dict[int, str], list[str], bool]:
         """Ét kald for replik start..end-1. Returnerer (gyldige oversættelser, problemer, afvist med refusal)."""
@@ -324,32 +471,37 @@ def translate_all(
         if timeout <= 0:
             result.timed_out = True
             return {}, ["tidsgrænsen for hele filen er nået"], False
-        user = build_user(en, da, start, end, glossary.pairs(en, da, start, start - CONTEXT_BEFORE, fallback))
-        result.calls += 1
+        with lock:
+            user = build_user(en, da, start, end, glossary.pairs(en, da, start, start - CONTEXT_BEFORE, fallback))
+            result.calls += 1
         try:
-            reply = call_with_timeout(ask_model, timeout, provider, client, use_model, effort, SYSTEM_PROMPT, user)
+            reply = call_with_timeout(
+                ask_model, timeout, provider, client, use_model, effort, system, user, None, cache
+            )
         except TimeoutError:
             return {}, [f"intet svar inden for {timeout:g} sekunder (timeout)"], False
         except Exception as e:  # netværk, API-fejl osv.
             return {}, [f"fejl fra {PROVIDER_NAMES[provider]}: {type(e).__name__}: {str(e)[:200]}"], False
-        result.input_tokens += reply.input_tokens
-        result.output_tokens += reply.output_tokens
-        used = result.usage.setdefault(use_model, [0, 0])
-        used[0] += reply.input_tokens
-        used[1] += reply.output_tokens
-        if on_usage is not None:
-            on_usage(use_model, reply.input_tokens, reply.output_tokens)
+        with lock:
+            result.input_tokens += reply.input_tokens
+            result.output_tokens += reply.output_tokens
+            used = result.usage.setdefault(use_model, [0, 0])
+            used[0] += reply.input_tokens
+            used[1] += reply.output_tokens
+            if on_usage is not None:
+                on_usage(use_model, reply.input_tokens, reply.output_tokens)
         if reply.stop != "ok":
             return {}, [f"svaret blev afbrudt (stop={reply.stop})"], reply.stop == "refusal"
         try:
             lines = parse_lines(reply.text)
         except (ValueError, TypeError) as e:
             return {}, [f"ugyldig JSON ({e})"], False
-        return (*valid_lines(lines, wanted), False)
+        return (*valid_lines(lines, wanted, {p + 1 for p in empty_ok if start <= p < end}), False)
 
     def keep(found: dict[int, str]) -> None:
-        for i, text in found.items():
-            da[i - 1] = text
+        with lock:
+            for i, text in found.items():
+                da[i - 1] = text
 
     def run(start: int, end: int, label: str) -> None:
         found, problems, _ = attempt(start, end)
@@ -411,34 +563,54 @@ def translate_all(
     def give_up(start: int, end: int, found: dict[int, str], problems: list[str]) -> None:
         """Behold de gyldige oversættelser; resten beholder den engelske tekst."""
         keep(found)
-        missing = [p for p in range(start, end) if da[p] is None]
-        if missing:
-            log.error(
-                "Replik %s beholder den engelske tekst (%s)", _numbers([p + 1 for p in missing]), "; ".join(problems)
-            )
-            for p in missing:
-                da[p] = en[p]
-                fallback.add(p)
+        with lock:
+            missing = [p for p in range(start, end) if da[p] is None]
+            if missing:
+                log.error(
+                    "Replik %s beholder den engelske tekst (%s)",
+                    _numbers([p + 1 for p in missing]),
+                    "; ".join(problems),
+                )
+                for p in missing:
+                    da[p] = en[p]
+                    fallback.add(p)
 
     size = max(1, batch)
     starts = list(range(0, n, size))
     result.batches = len(starts)
-    for k, start in enumerate(starts, start=1):
+    stop = threading.Event()  # tidsgrænsen er nået: start ingen nye bidder
+
+    def one_batch(k: int, start: int) -> None:
         end = min(n, start + size)
         label = f"{k}/{len(starts)}"
+        if stop.is_set():
+            return
         if deadline is not None and clock() >= deadline:
             result.timed_out = True
-            log.warning("Tidsgrænsen er nået ved bid %s - replik %d-%d oversættes ikke", label, start + 1, n)
-            break
+            stop.set()
+            log.warning("Tidsgrænsen er nået ved bid %s - replik %d og frem oversættes ikke", label, start + 1)
+            return
         log.info("Oversætter bid %s (replik %d-%d) med %s", label, start + 1, end, model)
         try:
             run(start, end, label)
         except Exception:  # aldrig lade én bid stoppe resten
             log.exception("Uventet fejl i bid %s - replikkerne beholder den engelske tekst", label)
-        for p in range(start, end):
-            if da[p] is None:
-                da[p] = en[p]
-                fallback.add(p)
+        with lock:
+            for p in range(start, end):
+                if da[p] is None:
+                    da[p] = en[p]
+                    fallback.add(p)
+
+    if parallel <= 1 or len(starts) <= 1:
+        for k, start in enumerate(starts, start=1):
+            one_batch(k, start)
+            if stop.is_set():
+                break
+    else:
+        # Bidderne sendes i rækkefølge; højst `parallel` ad gangen. Fejl i én bid stopper ikke de andre.
+        with ThreadPoolExecutor(max_workers=parallel, thread_name_prefix="bid") as pool:
+            for future in [pool.submit(one_batch, k, start) for k, start in enumerate(starts, start=1)]:
+                future.result()
     for p in range(n):
         if da[p] is None:
             da[p] = en[p]
@@ -464,6 +636,12 @@ def run_translate_test(
     batch: int = 50,
     client=None,
     clock=time.monotonic,
+    prompt: str = "v3",
+    context: bool = False,
+    glossary: bool = False,
+    tmdb_id: str | None = None,
+    parallel: int = 1,
+    http=None,
 ) -> int:
     if os.path.abspath(out) == os.path.abspath(en_path):
         log.error("--out må ikke være den samme fil som --en")
@@ -473,6 +651,9 @@ def run_translate_test(
         return 2
     if provider not in PROVIDERS:
         log.error("Ukendt provider %r - brug %s", provider, ", ".join(PROVIDERS))
+        return 2
+    if prompt not in ("v3", "v4"):
+        log.error("Ukendt --prompt %r - brug v3 eller v4", prompt)
         return 2
     try:
         en_cues = read_file(en_path)
@@ -491,20 +672,54 @@ def run_translate_test(
     if effort and provider == "deepseek":
         log.warning("--effort bruges ikke hos DeepSeek og ignoreres")
         effort = None
+    parallel = max(1, parallel)
+    on = {True: "on", False: "off"}
+    switches = f"prompt {prompt}, kontekst {on[context]}, ordliste {on[glossary]}, parallel {parallel}"
 
     started = clock()
-    log.info("oversaet-test: %d replikker, %s/%s, bidder af %d", len(en_cues), provider, model, batch)
+    log.info("oversaet-test: %d replikker, %s/%s, bidder af %d, %s", len(en_cues), provider, model, batch, switches)
     en = [c.text for c in en_cues]
     call_timeout = max(1.0, cfg.proofread_call_timeout_minutes * 60)
-    res = translate_all(en, provider, client, model, effort, batch, call_timeout)
-    da_cues: list[Cue] = [replace(c, text=t) for c, t in zip(en_cues, res.da, strict=True)]
+
+    ctx_text = None
+    if context:
+        ctx_text = _test_context(cfg, tmdb_id, http)
+    wordlist = None
+    if glossary:
+        wordlist = make_glossary(provider, client, model, effort, en, ctx_text, None, call_timeout)
+    system = build_system(prompt, provider, ctx_text, wordlist)
+    res = translate_all(
+        en,
+        provider,
+        client,
+        model,
+        effort,
+        batch,
+        call_timeout,
+        system=system,
+        parallel=parallel,
+        empty_ok=filler_positions(en, prompt),
+    )
+    kept, fallback = drop_empty(res.da, res.fallback)
+    da_cues: list[Cue] = [replace(en_cues[p], text=res.da[p]) for p in kept]
     write_file_atomic(out, da_cues)  # ingen kreditlinje i testfilen
     elapsed = clock() - started
 
-    flags = check_all(da_cues, EnglishIndex(en_cues), cfg.max_line_chars, cfg.bad_words())
+    # De skarpere flag vises altid i rapporten, så v3 og v4 kan sammenlignes på samme kontrol.
+    flags = check_all(da_cues, EnglishIndex(en_cues), cfg.max_line_chars, cfg.bad_words(), wordlist, strict=True)
     counts = Counter(f for fl in flags.values() for f in fl)
-    cost = model_price(model, res.input_tokens, res.output_tokens)
+    inp, outp = res.input_tokens, res.output_tokens
+    if wordlist is not None:
+        inp, outp = inp + wordlist.input_tokens, outp + wordlist.output_tokens
+    cost = model_price(model, inp, outp)
     examples = [f"  #{p + 1} {', '.join(fl)}: {da_cues[p].text.replace(chr(10), ' / ')}" for p, fl in flags.items()]
+    if not glossary:
+        glossary_line = "Ordliste: slået fra"
+    elif wordlist is None:
+        glossary_line = "Ordliste: kunne ikke laves (se loggen)"
+    else:
+        price = "pris ukendt" if wordlist.cost is None else f"{wordlist.cost:.4f} USD"
+        glossary_line = f"Ordliste: {len(wordlist.terms)} termer, {len(wordlist.address)} tiltaler, {price}"
     report = "\n".join(
         [
             "Testrapport (oversaet-test)",
@@ -512,19 +727,41 @@ def run_translate_test(
             f"Resultat: {out}",
             f"Provider: {provider}",
             f"Model: {model} (effort {effort or '-'})",
-            f"Replikker: {len(en_cues)}",
+            f"Kontakter: {switches}",
+            "Filmkontekst: " + (f"{len(ctx_text)} tegn" if ctx_text else "ingen"),
+            glossary_line,
+            f"Replikker: {len(en_cues)}"
+            + (f" (heraf {len(en_cues) - len(kept)} med kun fyldlyde fjernet)" if len(kept) < len(en_cues) else ""),
             f"Bidder: {res.batches} (kald i alt: {res.calls})",
-            f"Tokens ind: {res.input_tokens}",
-            f"Tokens ud: {res.output_tokens}",
+            f"Tokens ind: {inp}",
+            f"Tokens ud: {outp}",
             "Pris: " + ("pris ukendt" if cost is None else f"{cost:.4f} USD"),
             f"Tid: {_duration(elapsed)}",
             f"Flag fra kontrollen: {len(flags)}"
             + (" (" + ", ".join(f"{k}={v}" for k, v in counts.most_common()) + ")" if flags else ""),
             *(["Eksempler:", *examples[:10]] if examples else []),
-            f"Faldt tilbage til engelsk: {len(res.fallback)}"
-            + (f" (replik {_numbers([p + 1 for p in res.fallback])})" if res.fallback else ""),
+            f"Faldt tilbage til engelsk: {len(fallback)}"
+            + (f" (replik {_numbers([p + 1 for p in fallback])})" if fallback else ""),
             "Kreditlinje: ingen (testtilstand)",
         ]
     )
     print(report)
     return 0
+
+
+def _test_context(cfg: Config, tmdb_id: str | None, http) -> str | None:
+    """Kontekst i testtilstanden: kun fra TMDB (--tmdb-id), uden Radarr-opslag."""
+    from . import kontekst
+
+    if not tmdb_id:
+        log.warning("--context on uden --tmdb-id: oversætter uden kontekst")
+        return None
+    key = cfg.tmdb_key()
+    if not key:
+        log.warning("Ingen TMDB-nøgle i %s eller TMDB_API_KEY - oversætter uden kontekst", cfg.tmdb_api_key_file)
+        return None
+    if http is None:
+        import httpx2
+
+        http = httpx2.Client(timeout=httpx2.Timeout(60.0))
+    return kontekst.for_tmdb_id(kontekst.Tmdb(cfg.tmdb_url, key, http), tmdb_id)

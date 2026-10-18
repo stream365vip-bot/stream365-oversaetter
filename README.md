@@ -44,7 +44,9 @@ sudo chown -R 1000:1000 /opt/oversaetter/data
 #    Filerne skal findes, før containeren startes - ellers laver Docker en mappe i stedet.
 #    Tomme filer er i orden: så virker driften som normalt, og kun oversaet-test melder, at nøglen mangler.
 sudo mkdir -p /opt/oversaetter/secrets
-sudo touch /opt/oversaetter/secrets/deepseek_api_key.txt /opt/oversaetter/secrets/gemini_api_key.txt
+#    tmdb_api_key.txt er valgfri (filmkontekst fra TMDB, se "Bedre og hurtigere oversættelse").
+sudo touch /opt/oversaetter/secrets/deepseek_api_key.txt /opt/oversaetter/secrets/gemini_api_key.txt \
+  /opt/oversaetter/secrets/tmdb_api_key.txt
 sudo chown 1000:1000 /opt/oversaetter/secrets/*.txt
 sudo chmod 600 /opt/oversaetter/secrets/*.txt
 
@@ -153,10 +155,24 @@ sudo docker exec oversaetter python -m oversaetter oversaet-test \
 - `--model`: fx `claude-sonnet-5-5`, `claude-opus-5-5`, `deepseek-v4-pro`, `deepseek-flash` eller `gemini-3.8-flash`.
 - `--effort low|medium|high`: grundighed (Anthropic, standard medium; Gemini kun hvis angivet; bruges ikke hos DeepSeek).
 - `--batch 50`: antal replikker pr. bid.
+- `--prompt v3|v4`: instruksen (standard v3).
+- `--context on|off`: filmkontekst fra TMDB (kræver `--tmdb-id` og TMDB-nøglen; standard off).
+- `--tmdb-id 12345`: TMDB-id til konteksten uden Radarr-opslag (`tv:12345` for en serie).
+- `--glossary on|off`: ordliste pr. film før bidderne (standard off).
+- `--parallel 4`: så mange bidder samtidig (standard 1).
+
+Eksempel med alle forbedringer slået til:
+
+```bash
+sudo docker exec oversaetter python -m oversaetter oversaet-test \
+  --en "/mnt/unionfs/Media/Movies/Film (2024)/Film.en.srt" --out "/data/film-v4.da.srt" \
+  --provider anthropic --model claude-opus-5-5 \
+  --prompt v4 --context on --tmdb-id 12345 --glossary on --parallel 4
+```
 
 Sådan virker den: filen oversættes i bidder af 50 replikker. Hver bid får de 5 foregående replikker med deres færdige danske oversættelse, de 3 næste engelske replikker og op til 30 tidligere par med navne og faste udtryk med som kontekst, så oversættelsen hænger sammen og bliver ensartet. Instruksen er Lingarr-prompten v3 (regel 1-15) tilpasset til bidder. Svarer modellen ikke med præcis de rigtige numre, prøves bidden én gang mere, derefter delt i to (25+25). Mangler der stadig replikker, beholder de den engelske tekst, og det står i loggen.
 
-Bagefter køres den gratis kontrol, og rapporten skrives på skærmen (vil du gemme den, så tilføj `> /opt/oversaetter/data/rapport.txt` uden for `docker exec`-anførselstegnene). Rapporten viser model, provider, antal replikker og bidder, tokens ind/ud, pris, tid, antal flag fra kontrollen med eksempler og antal replikker, der faldt tilbage til engelsk. Priserne pr. model står i `MODEL_PRICES` i `oversaetter/config.py`; ukendte modeller giver "pris ukendt".
+Bagefter køres den gratis kontrol (altid med de skarpere flag, så v3 og v4 kan sammenlignes), og rapporten skrives på skærmen (vil du gemme den, så tilføj `> /opt/oversaetter/data/rapport.txt` uden for `docker exec`-anførselstegnene). Rapporten viser model, provider, kontakterne, filmkontekst, ordlistens størrelse og pris, antal replikker og bidder (og fjernede replikker med kun fyldlyde), tokens ind/ud, pris, tid, antal flag fra kontrollen med eksempler og antal replikker, der faldt tilbage til engelsk. Priserne pr. model står i `MODEL_PRICES` i `oversaetter/config.py`; ukendte modeller giver "pris ukendt".
 
 Nøgler:
 
@@ -165,6 +181,7 @@ Nøgler:
 | anthropic | `/opt/lingarr/secrets/anthropic_api_key.txt` (samme som driften) |
 | deepseek | `/opt/oversaetter/secrets/deepseek_api_key.txt` |
 | gemini | `/opt/oversaetter/secrets/gemini_api_key.txt` |
+| TMDB (kontekst, valgfri) | `/opt/oversaetter/secrets/tmdb_api_key.txt` |
 
 Skriv nøglen i filen med `sudo nano` (kun nøglen, én linje). Mangler en nøgle, stopper kun testtilstanden med en dansk besked – driften kører videre.
 
@@ -219,6 +236,16 @@ Skriv nøglen i filen med `sudo nano` (kun nøglen, én linje). Mangler en nøgl
 
   Aflevering til Bazarr 1.6.2: `POST /api/movies/subtitles?radarrid=<id>` for film og `POST /api/episodes/subtitles?seriesid=<id>&episodeid=<id>` for afsnit, multipart med `file`, `language=da`, `forced=false` og `hi=false` – præcis som Bazarrs Upload-knap. Bazarr lægger uploaden i sin jobkø, gemmer filen som `<videonavn>.da.srt` og kører sync/Sub-Zero. Programmet venter op til 3 minutter på, at filen er gemt. Ellers (eller ved en HTTP-fejl) skriver det selv filen og kalder `PATCH /api/movies?radarrid=<id>&action=scan-disk` (afsnit: `PATCH /api/series?seriesid=<id>&action=scan-disk`). Den færdige fil gemmes også i `/opt/oversaetter/data/direkte/`.
 - **Testtilstand til modelsammenligning** (besluttet 18.10.2026): `oversaet-test` oversætter en hel engelsk fil i bidder med sammenhæng, uden Lingarr og uden korrektur. Formålet er at sammenligne modeller (Anthropic, DeepSeek og Gemini) i én gennemgang for at se, om vi kan droppe Lingarrs linje-for-linje-oversættelse og Opus-korrekturen. Beslutningen er taget (se ovenfor), og driften bruger nu samme oversættelse.
+
+- **Bedre og hurtigere oversættelse** (besluttet 18.10.2026). Opus direkte giver 9/10 (*Just Play Dead*: 1.775 replikker, 9 min, 1,59 USD). Målet er 9,5 og under 3 min via:
+
+  1. **Filmkontekst** (`CONTEXT=on`): titel, år, genre, aldersgrænse, originalsprog/land, handling (dansk hvis den findes) og op til 15 roller med køn i systeminstruksen. Kilder: Radarr/Sonarr (ingen ny nøgle) og, hvis `/opt/oversaetter/secrets/tmdb_api_key.txt` (eller `TMDB_API_KEY`) findes, TMDB (dansk handling, rolleliste med køn, for serier også afsnittets titel og handling). Fejler et opslag, oversættes der uden kontekst med en WARNING.
+  2. **Ordliste pr. film** (`GLOSSARY=on`): ét kald før bidderne med hele den engelske tekst (højst 30.000 tokens, ellers de første 2/3) giver navne, kælenavne, steder, gentagne udtryk/slang med dansk oversættelse, tiltale (du/De) og tone – højst 60 termer. Ordlisten står i systeminstruksen for alle bidder (og caches), gemmes i databasen og genbruges i senere afsnit af samme serie. Prisen tæller med i budgettet.
+  3. **Prompt v4** (`PROMPT_VERSION=v4`): v3 med prioritering ved modstrid (betydning, linjelængde, naturligt dansk, stil), "man" for generelt "you", sammensatte ord i ét ord, småt i ugedage/måneder/nationaliteter/sprog, anglicismer, fyldlyde udelades (replikker med kun fyldlyde fjernes fra filen), ensartet tiltale, fremmedsprog bevares og ordlisten bruges konsekvent. Hos DeepSeek/Gemini bedes modellen tænke først.
+  4. **Skarpere kontrol** (med v4): nye flag `compound_space`, `generic_you`, `capitalized_weekday`, `english_word`, `reading_speed` (over 20 tegn/s, og kun hvis den danske tekst ikke er kortere end den engelske) og `inconsistent_term` (afviger fra ordlisten). `identical_to_english` flager ikke længere navne fra ordlisten, tal, enkelte ens ord (Stop, Okay ...) eller andre fremmedsprog. Flagede replikker går til rettelsesrunden som før.
+  5. **Parallelle bidder** (`PARALLEL=4`): op til så mange bidder sendes samtidig, i rækkefølge og med samme retry-regler. De danske "foregående" linjer sendes kun, når de er færdige; ensartethed sikres af ordlisten. Tidsgrænsen gælder stadig, og fejl i én bid stopper ikke de andre.
+
+  **Standard forbliver v3, uden kontekst, uden ordliste og `PARALLEL=1`, indtil Jesper har set en test** med `oversaet-test` (se ovenfor). Søgereglerne, udvælgelsen, uploaden til Bazarr, kreditlinjen og budgettet er uændrede.
 
 ## Hvis noget går galt
 

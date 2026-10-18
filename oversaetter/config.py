@@ -16,6 +16,7 @@ PROOFREAD_KEYS = (
     "PROOFREAD_CALL_TIMEOUT_MINUTES",
 )
 TRANSLATE_MODES = ("direct", "lingarr")
+PROMPT_VERSIONS = ("v3", "v4")
 # Felter hvor en tom værdi i .env betyder "slået fra" i stedet for "brug standard".
 EMPTY_ALLOWED = ("credit_text",)
 
@@ -64,6 +65,10 @@ class Config:
     # Kun til testtilstanden oversaet-test. Mangler filerne, påvirker det ikke driften.
     deepseek_api_key_file: str = "/run/secrets/deepseek_api_key"
     gemini_api_key_file: str = "/run/secrets/gemini_api_key"
+    # Valgfri TMDB-nøgle til filmkonteksten (CONTEXT=on). Mangler den, bruges kun Radarr/Sonarr.
+    tmdb_api_key_file: str = "/run/secrets/tmdb_api_key"
+    tmdb_api_key: str = ""
+    tmdb_url: str = "https://api.themoviedb.org/3"
 
     poll_minutes: float = 15.0
     translate_tag: str = "oversaet"
@@ -77,6 +82,11 @@ class Config:
     translate_effort: str = "medium"
     fallback_model: str = "claude-sonnet-5-5"  # bruges kun, når en bid afvises (refusal) også efter halvering
     max_fix_lines: int = 60  # højst så mange flagede replikker i rettelsesrunden
+    # Forbedringer fra 18.10.2026 - alle slået fra, indtil Jesper har set en test (se README).
+    prompt_version: str = "v3"  # v3 (standard) eller v4
+    context: bool = False  # CONTEXT=on: filmkontekst (titel, handling, roller) i instruksen
+    glossary: bool = False  # GLOSSARY=on: ordliste pr. film før bidderne
+    parallel: int = 1  # så mange bidder sendes samtidig
 
     max_line_chars: int = 42
     proofread_batch: int = 50
@@ -127,6 +137,10 @@ class Config:
         cfg.translate_mode = cfg.translate_mode.strip().lower()
         if cfg.translate_mode not in TRANSLATE_MODES:
             raise ValueError(f"TRANSLATE_MODE={cfg.translate_mode!r} i .env er ukendt - brug direct eller lingarr")
+        cfg.prompt_version = cfg.prompt_version.strip().lower()
+        if cfg.prompt_version not in PROMPT_VERSIONS:
+            raise ValueError(f"PROMPT_VERSION={cfg.prompt_version!r} i .env er ukendt - brug v3 eller v4")
+        cfg.parallel = max(1, cfg.parallel)
         return cfg
 
     @property
@@ -135,6 +149,17 @@ class Config:
 
     def anthropic_api_key(self) -> str:
         return read_key(self.anthropic_api_key_file)
+
+    def tmdb_key(self) -> str:
+        return self.tmdb_api_key.strip() or read_key(self.tmdb_api_key_file)
+
+    def switches(self) -> str:
+        """Kort tekst med kontakterne fra 18.10.2026 til loggen og rapporten."""
+        on = {True: "on", False: "off"}
+        return (
+            f"prompt {self.prompt_version}, kontekst {on[self.context]}, ordliste {on[self.glossary]}, "
+            f"parallel {self.parallel}"
+        )
 
     def bad_words(self) -> frozenset[str]:
         from .checks import known_bad_words

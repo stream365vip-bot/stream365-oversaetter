@@ -103,6 +103,11 @@ def main(argv: list[str] | None = None) -> int:
     o.add_argument("--model", required=True, help="fx claude-sonnet-5-5, deepseek-v4-pro, gemini-3.8-flash")
     o.add_argument("--effort", choices=("low", "medium", "high"), help="ikke for deepseek")
     o.add_argument("--batch", type=int, default=50, help="replikker pr. bid (standard 50)")
+    o.add_argument("--prompt", choices=("v3", "v4"), default="v3", help="instruksen (standard v3)")
+    o.add_argument("--context", choices=("on", "off"), default="off", help="filmkontekst fra TMDB (kræver --tmdb-id)")
+    o.add_argument("--glossary", choices=("on", "off"), default="off", help="ordliste pr. film før bidderne")
+    o.add_argument("--tmdb-id", help="TMDB-id til konteksten, fx 12345 (film) eller tv:12345 (serie)")
+    o.add_argument("--parallel", type=int, default=1, help="så mange bidder samtidig (standard 1)")
     args = parser.parse_args(argv)
 
     cfg = Config.from_env()
@@ -110,7 +115,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "test":
         return run_test(cfg, args.en, args.da, args.out)
     if args.cmd == "oversaet-test":
-        return run_translate_test(cfg, args.en, args.out, args.provider, args.model, args.effort, args.batch)
+        return run_translate_test(
+            cfg,
+            args.en,
+            args.out,
+            args.provider,
+            args.model,
+            args.effort,
+            args.batch,
+            prompt=args.prompt,
+            context=args.context == "on",
+            glossary=args.glossary == "on",
+            tmdb_id=args.tmdb_id,
+            parallel=args.parallel,
+        )
     from .runner import main as run_main
 
     run_main(cfg)

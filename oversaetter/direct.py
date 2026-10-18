@@ -23,7 +23,8 @@ from .clients import ApiError, Bazarr
 from .config import Config, model_price
 from .credit import apply_credit
 from .deadline import call_with_timeout
-from .oversaet import translate_all
+from .ordliste import Wordlist, merge_previous
+from .oversaet import build_system, drop_empty, filler_positions, make_glossary, translate_all
 from .proofread import OUTPUT_SCHEMA as FIX_SCHEMA
 from .proofread import Budget, validate_fix
 from .selection import Candidate, has_danish
@@ -78,13 +79,23 @@ class DirectOutcome:
     delivery: str = ""
     credit: str = ""
     model: str = ""
+    switches: str = ""  # kontakterne fra 18.10.2026, kun når de ikke står på standard
+    removed_empty: int = 0  # replikker med kun fyldlyde (v4), fjernet fra filen
+    glossary_terms: int | None = None  # None = ingen ordliste
+    glossary: Wordlist | None = None
 
     def summary(self) -> str:
+        extra = ""
+        if self.switches:
+            extra += f", {self.switches}"
+            if self.glossary_terms is not None:
+                extra += f", ordliste: {self.glossary_terms} termer"
+            extra += f", tomme fjernet: {self.removed_empty}"
         return (
             f"model: {self.model}, replikker: {self.lines}, flag: {self.flags_before}, rettelser: {self.fixes}, "
             f"flag efter: {self.flags_after}, beholdt engelsk: {self.fallback_english}, "
             f"fallback-model: {self.by_fallback}, pris: {self.cost:.4f} USD, tid: {duration(self.seconds)}, "
-            f"{self.delivery}, {self.credit}"
+            f"{self.delivery}, {self.credit}{extra}"
         )
 
 
@@ -195,8 +206,12 @@ def fix_flagged(
     client,
     timeout: float,
     on_usage,
+    extra: str = "",
 ) -> dict[int, str]:
-    """Ét kald til TRANSLATE_MODEL med de flagede replikker og 2 nabolinjer på hver side. Returnerer rettelser."""
+    """Ét kald til TRANSLATE_MODEL med de flagede replikker og 2 nabolinjer på hver side. Returnerer rettelser.
+
+    extra: filmkontekst og ordliste (CONTEXT/GLOSSARY=on), lægges efter instruksen.
+    """
     chosen = sorted(flags)[: max(0, cfg.max_fix_lines)]
     if not chosen:
         return {}
@@ -222,7 +237,7 @@ def fix_flagged(
             timeout,
             model=cfg.translate_model,
             max_tokens=FIX_MAX_TOKENS,
-            system=FIX_PROMPT.format(max_chars=min(40, cfg.max_line_chars)),
+            system=FIX_PROMPT.format(max_chars=min(40, cfg.max_line_chars)) + (f"\n\n{extra}" if extra else ""),
             messages=[{"role": "user", "content": user}],
             output_config={"effort": cfg.translate_effort, "format": {"type": "json_schema", "schema": FIX_SCHEMA}},
         )
@@ -275,9 +290,13 @@ class DirectTranslator:
         run_cmd=subprocess.run,
         sleep=time.sleep,
         clock=time.monotonic,
+        context_for=None,
+        glossaries_for=None,
     ):
+        """context_for(cand) -> kontekstblok eller None; glossaries_for(cand) -> tidligere ordlister (JSON) i serien."""
         self.cfg, self.bazarr, self.client, self.budget = cfg, bazarr, client, budget
         self.run_cmd, self.sleep, self.clock = run_cmd, sleep, clock
+        self.context_for, self.glossaries_for = context_for, glossaries_for
 
     def work_path(self, cand: Candidate) -> str:
         return os.path.join(self.cfg.data_dir, "direkte", cand.key.replace(":", "-") + ".da.srt")
@@ -306,6 +325,30 @@ class DirectTranslator:
             desc,
         )
         en = [c.text for c in en_cues]
+        outcome = DirectOutcome(ok=False, model=cfg.translate_model, lines=len(en_cues))
+        if cfg.switches() != Config().switches():
+            outcome.switches = cfg.switches()
+            log.info("Kontakter for %s: %s", cand.title, outcome.switches)
+        context = self.context_for(cand) if cfg.context and self.context_for is not None else None
+        wordlist = None
+        if cfg.glossary:
+            previous = merge_previous(self.glossaries_for(cand)) if self.glossaries_for is not None else None
+            if previous is not None and previous.terms:
+                log.info("Ordliste: genbruger %d termer fra tidligere afsnit af serien", len(previous.terms))
+            wordlist = make_glossary(
+                "anthropic",
+                self.client,
+                cfg.translate_model,
+                cfg.translate_effort,
+                en,
+                context,
+                previous,
+                max(1.0, min(CALL_TIMEOUT, deadline - self.clock())),
+                on_usage,
+            )
+            outcome.glossary = wordlist
+            outcome.glossary_terms = len(wordlist.terms) if wordlist is not None else None
+        system = build_system(cfg.prompt_version, "anthropic", context, wordlist)
         res = translate_all(
             en,
             "anthropic",
@@ -318,8 +361,10 @@ class DirectTranslator:
             on_usage=on_usage,
             deadline=deadline,
             clock=self.clock,
+            system=system,
+            parallel=cfg.parallel,
+            empty_ok=filler_positions(en, cfg.prompt_version),
         )
-        outcome = DirectOutcome(ok=False, model=cfg.translate_model, lines=len(en_cues))
         outcome.fallback_english, outcome.by_fallback = len(res.fallback), res.by_fallback
         if res.timed_out:
             outcome.cost, outcome.seconds = spent["cost"], self.clock() - started
@@ -337,11 +382,17 @@ class DirectTranslator:
                 cand.title,
             )
 
-        da = [replace(c, text=t) for c, t in zip(en_cues, res.da, strict=True)]
+        kept, fallback = drop_empty(res.da, res.fallback)
+        outcome.removed_empty = len(res.da) - len(kept)
+        if outcome.removed_empty:
+            log.info("%d replikker med kun fyldlyde er fjernet fra filen", outcome.removed_empty)
+        da = [replace(en_cues[p], text=res.da[p]) for p in kept]
+        en = [en_cues[p].text for p in kept]
         en_index = EnglishIndex(en_cues)
         bad_words = cfg.bad_words()
-        kept_english = set(res.fallback)
-        flags = check_all(da, en_index, cfg.max_line_chars, bad_words)
+        kept_english = set(fallback)
+        strict = cfg.prompt_version == "v4"
+        flags = check_all(da, en_index, cfg.max_line_chars, bad_words, wordlist, strict)
         flags = {p: f for p, f in flags.items() if p not in kept_english}  # afviste replikker sendes ikke igen
         outcome.flags_before = len(flags)
         log.info("Kontrol efter oversættelse: %d replikker flaget", len(flags))
@@ -352,12 +403,13 @@ class DirectTranslator:
             elif left <= 1:
                 log.warning("Tidsgrænsen er nået - rettelsesrunden springes over")
             else:
-                fixes = fix_flagged(da, en, flags, cfg, self.client, min(CALL_TIMEOUT, left), on_usage)
+                extra = "\n\n".join(x for x in (context, wordlist.block() if wordlist else "") if x)
+                fixes = fix_flagged(da, en, flags, cfg, self.client, min(CALL_TIMEOUT, left), on_usage, extra)
                 da = [replace(c, text=fixes.get(p, c.text)) for p, c in enumerate(da)]
                 outcome.fixes = len(fixes)
                 sent = min(len(flags), cfg.max_fix_lines)
                 log.info("Rettelsesrunde: %d af %d flagede replikker rettet", len(fixes), sent)
-        after = check_all(da, en_index, cfg.max_line_chars, bad_words)
+        after = check_all(da, en_index, cfg.max_line_chars, bad_words, wordlist, strict)
         outcome.flags_after = len([p for p in after if p not in kept_english])
 
         final, outcome.credit = apply_credit(da, cfg.credit_text)

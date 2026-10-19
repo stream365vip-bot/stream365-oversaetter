@@ -163,6 +163,8 @@ sudo docker exec oversaetter python -m oversaetter oversaet-test \
 - `--parallel 4`: så mange bidder samtidig (standard 1).
 - `--hi on|off`: rens en hørehæmmede-tekst (HI/SDH) for lydbeskrivelser, musiklinjer og talernavne før bidderne (standard on, se trin B4).
 - `--vis-kontekst`: skriv filmkonteksten og ordlisten (termer, tiltaler og tone) øverst i rapporten, så man kan se, hvad modellen fik (trin B4d).
+- `--batch-api`: send bidderne som én Anthropic Message Batch (50 % rabat på alle tokens, også prompt-cachens) i stedet for direkte kald (trin B5, standard fra). Kun med `--provider anthropic`; med andre providers stopper testen med en besked. Ordlisten og bid 1 laves direkte som før, så bid 2 og frem har kontekst og glossary-par fra bid 1 (som `--parallel`). Resten sendes samlet med samme instruks, prompt-cache, JSON-skema, effort og max_tokens. Scriptet spørger hvert 30. sekund og logger ventetiden hvert 5. minut. En bid, der fejler i batchen, mangler i svarene eller ikke består kontrollen (manglende numre, ugyldig JSON, tomme linjer, refusal/max_tokens), oversættes bagefter direkte med den sædvanlige logik (genforsøg, halvering, fallback-model). Rapporten viser `Batch: N bidder sendt, M lykkedes, K oversat direkte bagefter, ventetid …` og prisen delt i batch og direkte. **Driften bruger ikke batch** – den kalder stadig direkte.
+- `--batch-timeout 90`: så mange minutter ventes der på batchen (standard 90). Udløber tiden, aflyses batchen, og de bidder, der ikke nåede at blive færdige, oversættes direkte.
 
 Eksempel med alle forbedringer slået til:
 

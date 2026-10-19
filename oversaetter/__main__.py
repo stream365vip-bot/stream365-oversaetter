@@ -161,6 +161,10 @@ def main(argv: list[str] | None = None) -> int:
     o.add_argument("--parallel", type=int, default=1, help="så mange bidder samtidig (standard 1)")
     o.add_argument("--hi", choices=("on", "off"), default="on", help="rens HI/SDH-kilden før bidderne (standard on)")
     o.add_argument("--vis-kontekst", action="store_true", help="skriv filmkonteksten og ordlisten øverst i rapporten")
+    o.add_argument(
+        "--batch-api", action="store_true", help="bid 2 og frem som én Anthropic Message Batch (50 %% rabat)"
+    )
+    o.add_argument("--batch-timeout", type=float, default=90, help="minutter før batchen aflyses (standard 90)")
     g = sub.add_parser("glem", help="slet en films række i databasen, så den behandles forfra")
     g.add_argument("what", help='titel, TMDB-id eller nøgle, fx "Idiots", 12345 eller movie:12')
     args = parser.parse_args(argv)
@@ -187,6 +191,8 @@ def main(argv: list[str] | None = None) -> int:
             parallel=args.parallel,
             hi_clean=args.hi == "on",
             show_context=args.vis_kontekst,
+            batch_api=args.batch_api,
+            batch_timeout=args.batch_timeout,
         )
     from .runner import main as run_main
 

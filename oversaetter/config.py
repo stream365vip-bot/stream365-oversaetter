@@ -34,20 +34,28 @@ MODEL_PRICES: dict[str, tuple[float, float]] = {
 # Prompt-cache (Anthropic): cache-læsning koster 10 % og cache-skrivning 125 % af inputprisen.
 CACHE_READ_FACTOR = 0.1
 CACHE_WRITE_FACTOR = 1.25
+# Message Batches (Anthropic): 50 % af prisen på alle tokens, også prompt-cachens (kun oversaet-test --batch-api).
+BATCH_FACTOR = 0.5
 
 
 def model_price(
-    model: str, input_tokens: int, output_tokens: int, cache_read: int = 0, cache_write: int = 0
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read: int = 0,
+    cache_write: int = 0,
+    factor: float = 1.0,
 ) -> float | None:
     """Pris i USD for en model fra MODEL_PRICES, eller None hvis modellen er ukendt.
 
     input_tokens er de almindelige (ikke-cachede) tokens ind; cache_read/cache_write er prompt-cachens tokens.
+    factor ganges på hele prisen (BATCH_FACTOR for svar fra en Message Batch).
     """
     prices = MODEL_PRICES.get(model)
     if prices is None:
         return None
     inp = prices[0] / 1_000_000
-    return (
+    return factor * (
         input_tokens * inp
         + cache_read * inp * CACHE_READ_FACTOR
         + cache_write * inp * CACHE_WRITE_FACTOR

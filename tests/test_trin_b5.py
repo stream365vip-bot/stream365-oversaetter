@@ -305,3 +305,193 @@ def test_batch_json_dump_is_plain_dicts():
     fake, clock = make(translations)
     run_batch(fake, clock)
     json.dumps(fake.batches.requests)  # anmodningerne kan sendes som de er (rene dicts)
+
+
+# --- rettelse: venteløkken og --batch-id ----------------------------------------------------------------
+class SequenceBatches(FakeBatches):
+    """retrieve giver statusserne i rækkefølge (et Exception-objekt kastes); den sidste gentages."""
+
+    def __init__(self, answer, clock, statuses):
+        super().__init__(answer, clock, ready_after=None)
+        self.statuses = list(statuses)
+        self.ids: list[str] = []
+
+    def retrieve(self, batch_id):
+        self.ids.append(batch_id)
+        self.retrieves += 1
+        status = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
+        if isinstance(status, Exception):
+            raise status
+        done = status == "ended"
+        return SimpleNamespace(
+            id=batch_id,
+            processing_status=status,
+            request_counts=SimpleNamespace(
+                processing=0 if done else 3, succeeded=3 if done else 0, errored=0, canceled=0, expired=0
+            ),
+        )
+
+    def results(self, batch_id):
+        self.canceled = False
+        return super().results(batch_id)
+
+
+def make_seq(statuses, answer=translations):
+    clock = FakeClock()
+    fake = FakeProvider("anthropic", translations)
+    fake.batches = SequenceBatches(answer, clock, statuses)
+    return fake, clock
+
+
+def earlier_batch(n: int, tmp_path=None) -> list[dict]:
+    """Anmodningerne fra en tidligere kørsel med --batch-api (den batch, der allerede er betalt)."""
+    fake, clock = make(translations)
+    if tmp_path is None:
+        run_batch(fake, clock, n=n)
+    else:
+        run_translate_test(
+            cfg(),
+            write_long(tmp_path, n),
+            str(tmp_path / "foer.srt"),
+            "anthropic",
+            "claude-opus-5-5",
+            client=fake,
+            clock=clock,
+            sleep=clock.sleep,
+            batch_api=True,
+        )
+        (tmp_path / "foer.srt").unlink()
+    return fake.batches.requests
+
+
+def test_loop_sees_in_progress_twice_then_ended(caplog):
+    fake, clock = make_seq(["in_progress", "in_progress", "ended"])
+    with caplog.at_level(logging.INFO, logger="oversaetter"):
+        res = run_batch(fake, clock)
+    assert fake.batches.retrieves == 3 and clock.now == 90  # spurgt hvert 30. sekund
+    assert res.batch.ok == 3 and res.fallback == [] and direct_firsts(fake) == [1]
+    assert res.da == [f"Dansk {i + 1}" for i in range(200)]
+    asks = [r for r in caplog.records if r.getMessage().startswith("Batch msgbatch_1: status")]
+    assert [r.levelno for r in asks] == [logging.INFO] * 3  # hvert spørgsmål logges på INFO
+    assert "status in_progress (i gang 3, lykkedes 0, fejlet 0" in asks[0].getMessage()
+    assert "status ended (i gang 0, lykkedes 3, fejlet 0" in asks[2].getMessage()
+    assert "er færdig efter 1 min 30 s - henter svarene" in caplog.text
+
+
+def test_retrieve_that_raises_once_does_not_stop_the_loop(caplog):
+    fake, clock = make_seq(["in_progress", RuntimeError("forbindelsen døde"), "ended"])
+    with caplog.at_level(logging.INFO, logger="oversaetter"):
+        res = run_batch(fake, clock)
+    assert fake.batches.retrieves == 3 and res.batch.ok == 3 and res.fallback == []
+    assert "Kunne ikke spørge til batch msgbatch_1 (RuntimeError: forbindelsen døde) - prøver igen" in caplog.text
+
+
+def test_hanging_retrieve_is_abandoned_and_retried(caplog):
+    """Årsagen til fejlen: et opslag, der hænger, må ikke få løkken til at stå stille."""
+    import threading
+
+    release = threading.Event()
+    fake, clock = make_seq(["in_progress", "ended"])
+    seq_retrieve = fake.batches.retrieve
+    calls = {"n": 0}
+
+    def retrieve(batch_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            release.wait(5)  # hænger (som en død forbindelse)
+        return seq_retrieve(batch_id)
+
+    fake.batches.retrieve = retrieve
+    api = BatchApi(fake, 90, sleep=clock.sleep, clock=clock, call_timeout=0.05)
+    with caplog.at_level(logging.INFO, logger="oversaetter"):
+        res = translate_all(english(200), "anthropic", fake, "claude-opus-5-5", None, 50, 60.0, batch_api=api)
+    release.set()
+    assert res.batch.ok == 3 and res.fallback == []
+    assert "Kunne ikke spørge til batch msgbatch_1 (TimeoutError" in caplog.text
+
+
+def test_polling_uses_short_timeout_without_sdk_retries():
+    fake, clock = make_seq(["ended"])
+    seen = {}
+
+    def with_options(**kw):
+        seen.update(kw)
+        return fake
+
+    fake.with_options = with_options
+    BatchApi(fake, 90, call_timeout=60)
+    assert seen == {"timeout": 60, "max_retries": 0}
+
+
+def test_batch_id_fetches_results_and_translates_missing_directly(caplog):
+    fake, clock = make_seq(["ended"], answer=lambda p: None if first_line(p) == 101 else translations(p))
+    fake.batches.requests = earlier_batch(200)
+    api = BatchApi(fake, 90, sleep=clock.sleep, clock=clock, batch_id="msgbatch_gammel")
+    with caplog.at_level(logging.INFO, logger="oversaetter"):
+        res = translate_all(english(200), "anthropic", fake, "claude-opus-5-5", None, 50, 60.0, batch_api=api)
+    assert fake.batches.created is None  # intet sendt
+    assert fake.batches.ids == ["msgbatch_gammel"] and clock.now == 0  # spurgt med det samme
+    assert direct_firsts(fake) == [1, 101]  # bid 1 og den manglende bid direkte
+    assert res.da == [f"Dansk {i + 1}" for i in range(200)] and res.fallback == []
+    assert res.batch.reused and (res.batch.sent, res.batch.ok, res.batch.direct_after) == (3, 2, 1)
+    assert res.calls == 2  # kun de direkte kald
+    assert "Henter svarene fra den eksisterende batch msgbatch_gammel" in caplog.text
+
+
+def test_batch_id_report(tmp_path, capsys):
+    earlier = earlier_batch(120, tmp_path)
+    capsys.readouterr()
+    en = write_long(tmp_path, 120)
+    fake, clock = make_seq(["ended"])
+    fake.batches.requests = earlier
+    code = run_translate_test(
+        cfg(),
+        en,
+        str(tmp_path / "ud.srt"),
+        "anthropic",
+        "claude-opus-5-5",
+        client=fake,
+        clock=clock,
+        sleep=clock.sleep,
+        batch_id="msgbatch_test27",
+    )
+    assert code == 0 and fake.batches.created is None
+    report = capsys.readouterr().out
+    assert "Batch: 2 bidder hentet fra msgbatch_test27, 2 lykkedes, 0 oversat direkte bagefter" in report
+    assert "allerede betalt i den hentede batch" in report and "batch-id msgbatch_test27" in report
+
+
+def test_batch_id_and_batch_api_together_are_rejected(tmp_path, caplog):
+    en = write_en(tmp_path)
+    fake, clock = make_seq(["ended"])
+    with caplog.at_level(logging.ERROR, logger="oversaetter"):
+        code = run_translate_test(
+            cfg(),
+            en,
+            str(tmp_path / "ud.srt"),
+            "anthropic",
+            "claude-opus-5-5",
+            client=fake,
+            batch_api=True,
+            batch_id="msgbatch_1",
+        )
+    assert code == 2 and fake.requests == [] and not (tmp_path / "ud.srt").exists()
+    assert "ikke begge" in caplog.text
+
+
+def test_batch_id_rejected_for_deepseek(tmp_path, caplog):
+    en = write_en(tmp_path)
+    fake = FakeProvider("deepseek", translations)
+    with caplog.at_level(logging.ERROR, logger="oversaetter"):
+        code = run_translate_test(cfg(), en, str(tmp_path / "ud.srt"), "deepseek", "m", client=fake, batch_id="x")
+    assert code == 2 and "--batch-id virker kun med --provider anthropic" in caplog.text
+
+
+def test_cli_passes_batch_id(tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr("oversaetter.__main__.run_translate_test", lambda *a, **kw: seen.update(kw) or 0)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    base = ["oversaet-test", "--en", "a.srt", "--out", "b.srt", "--provider", "anthropic", "--model", "m"]
+    assert main(base) == 0 and seen["batch_id"] is None
+    assert main([*base, "--batch-id", "msgbatch_01MjM5d2aartaJohvrK9TZyB"]) == 0
+    assert seen["batch_id"] == "msgbatch_01MjM5d2aartaJohvrK9TZyB"

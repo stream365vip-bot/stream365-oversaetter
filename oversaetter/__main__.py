@@ -165,6 +165,7 @@ def main(argv: list[str] | None = None) -> int:
         "--batch-api", action="store_true", help="bid 2 og frem som én Anthropic Message Batch (50 %% rabat)"
     )
     o.add_argument("--batch-timeout", type=float, default=90, help="minutter før batchen aflyses (standard 90)")
+    o.add_argument("--batch-id", help="hent svarene fra en eksisterende batch i stedet for at sende en ny")
     g = sub.add_parser("glem", help="slet en films række i databasen, så den behandles forfra")
     g.add_argument("what", help='titel, TMDB-id eller nøgle, fx "Idiots", 12345 eller movie:12')
     args = parser.parse_args(argv)
@@ -193,6 +194,7 @@ def main(argv: list[str] | None = None) -> int:
             show_context=args.vis_kontekst,
             batch_api=args.batch_api,
             batch_timeout=args.batch_timeout,
+            batch_id=args.batch_id,
         )
     from .runner import main as run_main
 

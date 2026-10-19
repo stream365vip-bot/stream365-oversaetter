@@ -236,6 +236,7 @@ class BatchStats:
     direct_after: int = 0  # bidder, der blev oversat direkte bagefter (fejl, manglede, ugyldige eller timeout)
     seconds: float = 0.0  # ventetid fra batchen blev sendt, til svarene var hentet
     canceled: bool = False  # --batch-timeout udløb, og batchen blev aflyst
+    reused: bool = False  # --batch-id: svarene er hentet fra en eksisterende batch (intet sendt)
     input_tokens: int = 0
     output_tokens: int = 0
     cache_read: int = 0
@@ -251,10 +252,13 @@ class BatchOutcome:
 
 
 class BatchApi:
-    """Send bidder som én Anthropic Message Batch og vent på svarene (kun oversaet-test --batch-api).
+    """Send bidder som én Anthropic Message Batch og vent på svarene (kun oversaet-test --batch-api/--batch-id).
 
-    Spørger hvert `poll` sekund, om batchen er færdig ("ended"), og logger hvert `log_every` sekund. Udløber
-    `timeout_minutes`, aflyses batchen (batches.cancel); de svar, der nåede at blive færdige, bruges stadig.
+    Spørger hvert `poll` sekund, om batchen er færdig ("ended"), og logger hvert svar på INFO med status og tællere.
+    Hvert opslag har en hård tidsgrænse (`call_timeout`) og ingen SDK-genforsøg, så en hængende forbindelse aldrig
+    får løkken til at stå stille. Hvert `log_every` sekund logges den samlede ventetid. Udløber `timeout_minutes`,
+    aflyses batchen (batches.cancel); de svar, der nåede at blive færdige, bruges stadig.
+    batch_id (--batch-id): send intet, men hent svarene fra en eksisterende batch.
     """
 
     def __init__(
@@ -266,51 +270,87 @@ class BatchApi:
         poll: float = 30,
         log_every: float = 300,
         cancel_wait: float = 120,
+        batch_id: str | None = None,
+        call_timeout: float = 60,
+        results_timeout: float = 600,
     ):
         self.client, self.timeout = client, max(0.0, timeout_minutes * 60)
         self.sleep, self.clock = sleep, clock
         self.poll, self.log_every, self.cancel_wait = poll, log_every, cancel_wait
+        self.batch_id = batch_id
+        self.call_timeout, self.results_timeout = call_timeout, results_timeout
+        # Opslag (retrieve/cancel): kort SDK-timeout og ingen genforsøg - løkken prøver selv igen om `poll` sekunder.
+        with_options = getattr(client, "with_options", None)
+        self.poll_client = with_options(timeout=call_timeout, max_retries=0) if callable(with_options) else client
+
+    def _call(self, name: str, *args, timeout: float | None = None):
+        fn = getattr(self.poll_client.messages.batches, name)
+        return call_with_timeout(fn, timeout or self.call_timeout, *args)
+
+    def _ask(self, batch_id: str):
+        """Ét opslag (batches.retrieve). Logger status og tællere på INFO. None, hvis opslaget fejlede."""
+        try:
+            batch = self._call("retrieve", batch_id)
+        except Exception as e:  # timeout, netværk, API-fejl: løkken prøver igen
+            log.warning(
+                "Kunne ikke spørge til batch %s (%s: %s) - prøver igen om %g sekunder",
+                batch_id,
+                type(e).__name__,
+                str(e)[:200],
+                self.poll,
+            )
+            return None
+        counts = getattr(batch, "request_counts", None)
+        log.info(
+            "Batch %s: status %s (i gang %d, lykkedes %d, fejlet %d, aflyst %d, udløbet %d)",
+            batch_id,
+            getattr(batch, "processing_status", "?"),
+            _int(counts, "processing"),
+            _int(counts, "succeeded"),
+            _int(counts, "errored"),
+            _int(counts, "canceled"),
+            _int(counts, "expired"),
+        )
+        return batch
 
     def run(self, requests: list[dict]) -> BatchOutcome:
         outcome = BatchOutcome()
         if not requests:
             return outcome
         started = self.clock()
-        batches = self.client.messages.batches
-        try:
-            batch = batches.create(requests=requests)
-        except Exception as e:  # netværk, API-fejl osv.: alle bidder oversættes direkte
-            outcome.problems = {r["custom_id"]: f"batchen kunne ikke sendes ({type(e).__name__})" for r in requests}
-            log.error("Batchen kunne ikke sendes (%s: %s) - oversætter direkte", type(e).__name__, str(e)[:200])
-            return outcome
-        log.info("Batch %s sendt med %d bidder - spørger hvert %g. sekund", batch.id, len(requests), self.poll)
+        if self.batch_id:
+            batch_id, status = self.batch_id, ""
+            log.info("Henter svarene fra den eksisterende batch %s (--batch-id) - intet sendes", batch_id)
+        else:
+            try:
+                batch = self.client.messages.batches.create(requests=requests)
+            except Exception as e:  # netværk, API-fejl osv.: alle bidder oversættes direkte
+                why = f"batchen kunne ikke sendes ({type(e).__name__})"
+                outcome.problems = {r["custom_id"]: why for r in requests}
+                log.error("Batchen kunne ikke sendes (%s: %s) - oversætter direkte", type(e).__name__, str(e)[:200])
+                return outcome
+            batch_id, status = batch.id, str(getattr(batch, "processing_status", ""))
+            log.info("Batch %s sendt med %d bidder - spørger hvert %g. sekund", batch_id, len(requests), self.poll)
         next_log = started + self.log_every
-        status = getattr(batch, "processing_status", "")
+        first = bool(self.batch_id)  # --batch-id: spørg med det samme
         while status != "ended":
             now = self.clock()
             if now - started >= self.timeout:
                 outcome.canceled = True
-                status = self._cancel(batch.id, now - started)
+                status = self._cancel(batch_id, now - started)
                 break
-            self.sleep(self.poll)
-            try:
-                batch = batches.retrieve(batch.id)
-                status = batch.processing_status
-            except Exception as e:  # et enkelt fejlet opslag stopper ikke ventetiden
-                log.warning("Kunne ikke spørge til batch %s (%s) - prøver igen", batch.id, type(e).__name__)
+            if not first:
+                self.sleep(self.poll)
+            first = False
+            batch = self._ask(batch_id)
+            if batch is not None:
+                status = str(getattr(batch, "processing_status", ""))
             if self.clock() >= next_log:
                 next_log += self.log_every
-                counts = getattr(batch, "request_counts", None)
-                log.info(
-                    "Venter stadig på batch %s: %s ventet (status %s, %d færdige, %d i gang)",
-                    batch.id,
-                    _duration(self.clock() - started),
-                    status,
-                    _int(counts, "succeeded") + _int(counts, "errored"),
-                    _int(counts, "processing"),
-                )
+                log.info("Venter stadig på batch %s: %s ventet", batch_id, _duration(self.clock() - started))
         if status == "ended":
-            self._results(batch.id, outcome)
+            log.info("Batch %s er færdig efter %s - henter svarene", batch_id, _duration(self.clock() - started))
+            self._results(batch_id, outcome)
         for r in requests:
             if r["custom_id"] not in outcome.replies and r["custom_id"] not in outcome.problems:
                 outcome.problems[r["custom_id"]] = "manglede i batchens svar"
@@ -324,32 +364,36 @@ class BatchApi:
             batch_id,
             _duration(waited),
         )
-        batches = self.client.messages.batches
         try:
-            status = batches.cancel(batch_id).processing_status
+            status = str(self._call("cancel", batch_id).processing_status)
         except Exception as e:
-            log.error("Kunne ikke aflyse batch %s (%s)", batch_id, type(e).__name__)
+            log.error("Kunne ikke aflyse batch %s (%s: %s)", batch_id, type(e).__name__, str(e)[:200])
             return ""
         until = self.clock() + self.cancel_wait
         while status != "ended" and self.clock() < until:
             self.sleep(min(self.poll, 10))
-            try:
-                status = batches.retrieve(batch_id).processing_status
-            except Exception:
-                pass
+            batch = self._ask(batch_id)
+            if batch is not None:
+                status = str(getattr(batch, "processing_status", ""))
         return status
 
     def _results(self, batch_id: str, outcome: BatchOutcome) -> None:
+        def read() -> list:
+            return list(self.client.messages.batches.results(batch_id))
+
         try:
-            for item in self.client.messages.batches.results(batch_id):
-                result = item.result
-                if result.type == "succeeded":
-                    outcome.replies[item.custom_id] = anthropic_reply(result.message)
-                else:
-                    error = getattr(getattr(getattr(result, "error", None), "error", None), "type", "")
-                    outcome.problems[item.custom_id] = f"{result.type} i batchen" + (f" ({error})" if error else "")
-        except Exception as e:  # de svar, der nåede at blive læst, bruges stadig
+            items = call_with_timeout(read, self.results_timeout)
+        except Exception as e:  # alle bidder oversættes direkte
             log.error("Kunne ikke hente svarene fra batch %s (%s: %s)", batch_id, type(e).__name__, str(e)[:200])
+            return
+        for item in items:
+            result = item.result
+            if result.type == "succeeded":
+                outcome.replies[item.custom_id] = anthropic_reply(result.message)
+            else:
+                error = getattr(getattr(getattr(result, "error", None), "error", None), "type", "")
+                outcome.problems[item.custom_id] = f"{result.type} i batchen" + (f" ({error})" if error else "")
+        log.info("Batch %s: %d svar hentet (%d lykkedes)", batch_id, len(items), len(outcome.replies))
 
 
 # --- klienter ------------------------------------------------------------------------------------------
@@ -830,8 +874,10 @@ def translate_all(
             user = build_user(en, da, start, end, pairs, notes)
             requests.append({"custom_id": str(k), "params": anthropic_params(model, effort, system, user, None, cache)})
         stats.sent = len(requests)
-        result.calls += len(requests)
-        log.info("Sender bid 2-%d (replik %d-%d) som én batch med %s", len(starts), rest[0][1] + 1, n, model)
+        stats.reused = bool(batch_api.batch_id)
+        if not stats.reused:
+            result.calls += len(requests)
+            log.info("Sender bid 2-%d (replik %d-%d) som én batch med %s", len(starts), rest[0][1] + 1, n, model)
         outcome = batch_api.run(requests)
         stats.seconds, stats.canceled = outcome.seconds, outcome.canceled
         again = []
@@ -861,8 +907,9 @@ def translate_all(
             again.append((k, start))
         stats.direct_after = len(again)
         log.info(
-            "Batch: %d bidder sendt, %d lykkedes, %d oversættes direkte, ventetid %s",
+            "Batch: %d bidder %s, %d lykkedes, %d oversættes direkte, ventetid %s",
             stats.sent,
+            "hentet" if stats.reused else "sendt",
             stats.ok,
             stats.direct_after,
             _duration(stats.seconds),
@@ -916,11 +963,14 @@ def run_translate_test(
     batch_api: bool = False,
     batch_timeout: float = 90,
     sleep=time.sleep,
+    batch_id: str | None = None,
 ) -> int:
     """show_context (--vis-kontekst): filmkonteksten og ordlisten (termer og tiltaler) skrives øverst i rapporten.
 
     batch_api (--batch-api, kun anthropic): bid 2 og frem sendes som én Message Batch (50 % rabat); batch_timeout
     (--batch-timeout) er minutter, før batchen aflyses, og resten oversættes direkte.
+    batch_id (--batch-id, kun anthropic): send ingen batch, men hent svarene for bid 2 og frem fra en eksisterende
+    batch (fx en, der allerede er betalt); bidder, der mangler eller fejler, oversættes direkte som ved --batch-api.
     """
     if os.path.abspath(out) == os.path.abspath(en_path):
         log.error("--out må ikke være den samme fil som --en")
@@ -931,11 +981,16 @@ def run_translate_test(
     if provider not in PROVIDERS:
         log.error("Ukendt provider %r - brug %s", provider, ", ".join(PROVIDERS))
         return 2
-    if batch_api and provider != "anthropic":
+    if batch_api and batch_id:
+        log.error("Brug enten --batch-api (send en ny batch) eller --batch-id (hent en eksisterende), ikke begge")
+        return 2
+    if (batch_api or batch_id) and provider != "anthropic":
+        flag = "--batch-api" if batch_api else "--batch-id"
         log.error(
-            "--batch-api virker kun med --provider anthropic (Anthropics Message Batches), ikke %s - "
-            "kør uden --batch-api",
+            "%s virker kun med --provider anthropic (Anthropics Message Batches), ikke %s - kør uden %s",
+            flag,
             provider,
+            flag,
         )
         return 2
     if prompt not in ("v3", "v4"):
@@ -973,6 +1028,8 @@ def run_translate_test(
     switches += f", prompt-cache {on[cache]}, hi {on[hi_clean]}"
     if batch_api:
         switches += f", batch-api on (timeout {batch_timeout:g} min)"
+    if batch_id:
+        switches += f", batch-id {batch_id}"
 
     started = clock()
     log.info("oversaet-test: %d replikker, %s/%s, bidder af %d, %s", len(en_cues), provider, model, batch, switches)
@@ -1002,7 +1059,11 @@ def run_translate_test(
         empty_ok=filler_positions(en, prompt),
         cache=cache,
         notes=notes,
-        batch_api=BatchApi(client, batch_timeout, sleep=sleep, clock=clock) if batch_api else None,
+        batch_api=(
+            BatchApi(client, batch_timeout, sleep=sleep, clock=clock, batch_id=batch_id)
+            if batch_api or batch_id
+            else None
+        ),
     )
     kept, fallback = drop_empty(res.da, res.fallback)
     da_cues: list[Cue] = [replace(en_cues[p], text=res.da[p]) for p in kept]
@@ -1037,11 +1098,13 @@ def run_translate_test(
         cost = None if cost is None or batch_cost is None else cost + batch_cost
         inp, outp = inp + bs.input_tokens, outp + bs.output_tokens
         batch_lines = [
-            f"Batch: {bs.sent} bidder sendt, {bs.ok} lykkedes, {bs.direct_after} oversat direkte bagefter, "
-            f"ventetid {_duration(bs.seconds)}" + (" (aflyst efter --batch-timeout)" if bs.canceled else ""),
+            f"Batch: {bs.sent} bidder {'hentet fra ' + batch_id if bs.reused else 'sendt'}, {bs.ok} lykkedes, "
+            f"{bs.direct_after} oversat direkte bagefter, ventetid {_duration(bs.seconds)}"
+            + (" (aflyst efter --batch-timeout)" if bs.canceled else ""),
             "Pris batch (50 %): "
             + ("pris ukendt" if batch_cost is None else f"{batch_cost:.4f} USD")
-            + f" (tokens ind {bs.input_tokens + bs.cache_read + bs.cache_write}, ud {bs.output_tokens})",
+            + f" (tokens ind {bs.input_tokens + bs.cache_read + bs.cache_write}, ud {bs.output_tokens})"
+            + (" - allerede betalt i den hentede batch" if bs.reused else ""),
             "Pris direkte: " + ("pris ukendt" if direct_cost is None else f"{direct_cost:.4f} USD"),
         ]
     cache_read = res.cache_read + (bs.cache_read if bs else 0)

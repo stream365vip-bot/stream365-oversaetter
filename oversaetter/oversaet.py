@@ -30,7 +30,7 @@ from .checks import (
     only_filler,
     plain,
 )
-from .config import Config, model_price, read_key
+from .config import BATCH_FACTOR, Config, model_price, read_key
 from .deadline import call_with_timeout
 from .srt import Cue, read_file, write_file_atomic
 
@@ -224,6 +224,132 @@ class TranslateResult:
     usage: dict[str, list[int]] = field(default_factory=dict)  # model -> [ind, ud, cache-læs, cache-skriv]
     by_fallback: int = 0  # replikker oversat af fallback-modellen efter refusal
     timed_out: bool = False  # tidsgrænsen (deadline) blev nået, før alle bidder var oversat
+    batch: BatchStats | None = None  # kun med --batch-api (oversaet-test)
+
+
+@dataclass
+class BatchStats:
+    """Bidder sendt som én Anthropic Message Batch. Tokens tælles for sig (de koster BATCH_FACTOR)."""
+
+    sent: int = 0
+    ok: int = 0  # bidder, hvis svar fra batchen bestod kontrollen
+    direct_after: int = 0  # bidder, der blev oversat direkte bagefter (fejl, manglede, ugyldige eller timeout)
+    seconds: float = 0.0  # ventetid fra batchen blev sendt, til svarene var hentet
+    canceled: bool = False  # --batch-timeout udløb, og batchen blev aflyst
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read: int = 0
+    cache_write: int = 0
+
+
+@dataclass
+class BatchOutcome:
+    replies: dict[str, Reply] = field(default_factory=dict)  # custom_id -> svar (kun result.type "succeeded")
+    problems: dict[str, str] = field(default_factory=dict)  # custom_id -> hvorfor der intet svar er
+    seconds: float = 0.0
+    canceled: bool = False
+
+
+class BatchApi:
+    """Send bidder som én Anthropic Message Batch og vent på svarene (kun oversaet-test --batch-api).
+
+    Spørger hvert `poll` sekund, om batchen er færdig ("ended"), og logger hvert `log_every` sekund. Udløber
+    `timeout_minutes`, aflyses batchen (batches.cancel); de svar, der nåede at blive færdige, bruges stadig.
+    """
+
+    def __init__(
+        self,
+        client,
+        timeout_minutes: float = 90,
+        sleep=time.sleep,
+        clock=time.monotonic,
+        poll: float = 30,
+        log_every: float = 300,
+        cancel_wait: float = 120,
+    ):
+        self.client, self.timeout = client, max(0.0, timeout_minutes * 60)
+        self.sleep, self.clock = sleep, clock
+        self.poll, self.log_every, self.cancel_wait = poll, log_every, cancel_wait
+
+    def run(self, requests: list[dict]) -> BatchOutcome:
+        outcome = BatchOutcome()
+        if not requests:
+            return outcome
+        started = self.clock()
+        batches = self.client.messages.batches
+        try:
+            batch = batches.create(requests=requests)
+        except Exception as e:  # netværk, API-fejl osv.: alle bidder oversættes direkte
+            outcome.problems = {r["custom_id"]: f"batchen kunne ikke sendes ({type(e).__name__})" for r in requests}
+            log.error("Batchen kunne ikke sendes (%s: %s) - oversætter direkte", type(e).__name__, str(e)[:200])
+            return outcome
+        log.info("Batch %s sendt med %d bidder - spørger hvert %g. sekund", batch.id, len(requests), self.poll)
+        next_log = started + self.log_every
+        status = getattr(batch, "processing_status", "")
+        while status != "ended":
+            now = self.clock()
+            if now - started >= self.timeout:
+                outcome.canceled = True
+                status = self._cancel(batch.id, now - started)
+                break
+            self.sleep(self.poll)
+            try:
+                batch = batches.retrieve(batch.id)
+                status = batch.processing_status
+            except Exception as e:  # et enkelt fejlet opslag stopper ikke ventetiden
+                log.warning("Kunne ikke spørge til batch %s (%s) - prøver igen", batch.id, type(e).__name__)
+            if self.clock() >= next_log:
+                next_log += self.log_every
+                counts = getattr(batch, "request_counts", None)
+                log.info(
+                    "Venter stadig på batch %s: %s ventet (status %s, %d færdige, %d i gang)",
+                    batch.id,
+                    _duration(self.clock() - started),
+                    status,
+                    _int(counts, "succeeded") + _int(counts, "errored"),
+                    _int(counts, "processing"),
+                )
+        if status == "ended":
+            self._results(batch.id, outcome)
+        for r in requests:
+            if r["custom_id"] not in outcome.replies and r["custom_id"] not in outcome.problems:
+                outcome.problems[r["custom_id"]] = "manglede i batchens svar"
+        outcome.seconds = self.clock() - started
+        return outcome
+
+    def _cancel(self, batch_id: str, waited: float) -> str:
+        """Aflys batchen og vent kort på, at den er "ended", så de færdige svar kan hentes."""
+        log.warning(
+            "Batch %s er ikke færdig efter %s (--batch-timeout) - aflyser den og oversætter resten direkte",
+            batch_id,
+            _duration(waited),
+        )
+        batches = self.client.messages.batches
+        try:
+            status = batches.cancel(batch_id).processing_status
+        except Exception as e:
+            log.error("Kunne ikke aflyse batch %s (%s)", batch_id, type(e).__name__)
+            return ""
+        until = self.clock() + self.cancel_wait
+        while status != "ended" and self.clock() < until:
+            self.sleep(min(self.poll, 10))
+            try:
+                status = batches.retrieve(batch_id).processing_status
+            except Exception:
+                pass
+        return status
+
+    def _results(self, batch_id: str, outcome: BatchOutcome) -> None:
+        try:
+            for item in self.client.messages.batches.results(batch_id):
+                result = item.result
+                if result.type == "succeeded":
+                    outcome.replies[item.custom_id] = anthropic_reply(result.message)
+                else:
+                    error = getattr(getattr(getattr(result, "error", None), "error", None), "type", "")
+                    outcome.problems[item.custom_id] = f"{result.type} i batchen" + (f" ({error})" if error else "")
+        except Exception as e:  # de svar, der nåede at blive læst, bruges stadig
+            log.error("Kunne ikke hente svarene fra batch %s (%s: %s)", batch_id, type(e).__name__, str(e)[:200])
 
 
 # --- klienter ------------------------------------------------------------------------------------------
@@ -258,6 +384,38 @@ def _int(obj, name: str) -> int:
     return int(getattr(obj, name, 0) or 0)
 
 
+def anthropic_params(
+    model: str, effort: str | None, system: str, user: str, schema: dict | None = None, cache: bool = False
+) -> dict:
+    """Parametrene til messages.create - de samme i et direkte kald og i en Message Batch."""
+    sys_param = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}] if cache else system
+    return {
+        "model": model,
+        "max_tokens": MAX_TOKENS,
+        "system": sys_param,
+        "messages": [{"role": "user", "content": user}],
+        "output_config": {
+            "effort": effort or "medium",
+            "format": {"type": "json_schema", "schema": schema or OUTPUT_SCHEMA},
+        },
+    }
+
+
+def anthropic_reply(response) -> Reply:
+    """Et Anthropic-svar (direkte eller fra en Message Batch) som Reply."""
+    usage = getattr(response, "usage", None)
+    text = next((b.text for b in getattr(response, "content", []) if getattr(b, "type", "") == "text"), "")
+    stop = getattr(response, "stop_reason", None)
+    return Reply(
+        text,
+        _int(usage, "input_tokens"),
+        _int(usage, "output_tokens"),
+        "ok" if stop in ("end_turn", None) else str(stop),
+        _int(usage, "cache_read_input_tokens"),
+        _int(usage, "cache_creation_input_tokens"),
+    )
+
+
 def ask_model(
     provider: str,
     client,
@@ -270,28 +428,7 @@ def ask_model(
 ) -> Reply:
     """Ét kald. cache=True: systeminstruksen markeres til Anthropics prompt-cache (samme for alle bidder)."""
     if provider == "anthropic":
-        sys_param = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}] if cache else system
-        response = client.messages.create(
-            model=model,
-            max_tokens=MAX_TOKENS,
-            system=sys_param,
-            messages=[{"role": "user", "content": user}],
-            output_config={
-                "effort": effort or "medium",
-                "format": {"type": "json_schema", "schema": schema or OUTPUT_SCHEMA},
-            },
-        )
-        usage = getattr(response, "usage", None)
-        text = next((b.text for b in getattr(response, "content", []) if getattr(b, "type", "") == "text"), "")
-        stop = getattr(response, "stop_reason", None)
-        return Reply(
-            text,
-            _int(usage, "input_tokens"),
-            _int(usage, "output_tokens"),
-            "ok" if stop in ("end_turn", None) else str(stop),
-            _int(usage, "cache_read_input_tokens"),
-            _int(usage, "cache_creation_input_tokens"),
-        )
+        return anthropic_reply(client.messages.create(**anthropic_params(model, effort, system, user, schema, cache)))
 
     kwargs = {}
     if provider == "gemini" and effort:
@@ -505,6 +642,7 @@ def translate_all(
     empty_ok: set[int] = frozenset(),
     cache: bool | None = None,
     notes: list[str] | None = None,
+    batch_api: BatchApi | None = None,
 ) -> TranslateResult:
     """Oversæt alle replikker i bidder.
 
@@ -516,6 +654,8 @@ def translate_all(
     parallel: så mange bidder sendes samtidig (tråde). De danske "foregående" linjer sendes kun, når de er færdige.
     empty_ok: positioner (0-baseret), der må få tom tekst (v4: kun fyldlyde).
     notes: samme replikker med talernavne som note (hi.HiResult.notes); kun i modellens input, aldrig i filen.
+    batch_api: kun oversaet-test --batch-api (Anthropic): bid 1 direkte, resten som én Message Batch; bidder, der
+        fejler i batchen, oversættes bagefter direkte. Batchens tokens tælles i result.batch, ikke i on_usage.
     """
     n = len(en)
     da: list[str | None] = [None] * n
@@ -529,7 +669,6 @@ def translate_all(
 
     def attempt(start: int, end: int, use_model: str = model) -> tuple[dict[int, str], list[str], bool]:
         """Ét kald for replik start..end-1. Returnerer (gyldige oversættelser, problemer, afvist med refusal)."""
-        wanted = set(range(start + 1, end + 1))
         timeout = call_timeout if deadline is None else min(call_timeout, deadline - clock())
         if timeout <= 0:
             result.timed_out = True
@@ -558,12 +697,17 @@ def translate_all(
             used[3] += reply.cache_write
             if on_usage is not None:
                 on_usage(use_model, reply.input_tokens, reply.output_tokens, reply.cache_read, reply.cache_write)
+        return check(reply, start, end)
+
+    def check(reply: Reply, start: int, end: int) -> tuple[dict[int, str], list[str], bool]:
+        """Kontrollen af et svar - den samme for direkte svar og svar fra en Message Batch."""
         if reply.stop != "ok":
             return {}, [f"svaret blev afbrudt (stop={reply.stop})"], reply.stop == "refusal"
         try:
             lines = parse_lines(reply.text)
         except (ValueError, TypeError) as e:
             return {}, [f"ugyldig JSON ({e})"], False
+        wanted = set(range(start + 1, end + 1))
         return (*valid_lines(lines, wanted, {p + 1 for p in empty_ok if start <= p < end}), False)
 
     def keep(found: dict[int, str]) -> None:
@@ -669,15 +813,72 @@ def translate_all(
                     da[p] = en[p]
                     fallback.add(p)
 
-    if parallel <= 1 or len(starts) <= 1:
-        for k, start in enumerate(starts, start=1):
+    def via_batch() -> list[tuple[int, int]]:
+        """--batch-api: bid 1 direkte, resten som én Message Batch. Returnerer de bidder, der skal oversættes direkte.
+
+        Kontekst og glossary-par for bidderne i batchen bygges kun af det, der findes ved afsendelsen (bid 1).
+        """
+        stats = result.batch = BatchStats()
+        one_batch(1, starts[0])
+        rest = list(enumerate(starts, start=1))[1:]
+        if not rest or stop.is_set():
+            return rest
+        requests = []
+        for k, start in rest:
+            end = min(n, start + size)
+            pairs = glossary.pairs(en, da, start, start - CONTEXT_BEFORE, fallback)
+            user = build_user(en, da, start, end, pairs, notes)
+            requests.append({"custom_id": str(k), "params": anthropic_params(model, effort, system, user, None, cache)})
+        stats.sent = len(requests)
+        result.calls += len(requests)
+        log.info("Sender bid 2-%d (replik %d-%d) som én batch med %s", len(starts), rest[0][1] + 1, n, model)
+        outcome = batch_api.run(requests)
+        stats.seconds, stats.canceled = outcome.seconds, outcome.canceled
+        again = []
+        for k, start in rest:
+            end = min(n, start + size)
+            reply = outcome.replies.get(str(k))
+            if reply is None:
+                problems = [outcome.problems.get(str(k), "manglede i batchens svar")]
+            else:
+                stats.input_tokens += reply.input_tokens
+                stats.output_tokens += reply.output_tokens
+                stats.cache_read += reply.cache_read
+                stats.cache_write += reply.cache_write
+                found, problems, _ = check(reply, start, end)
+                if not problems:
+                    keep(found)
+                    stats.ok += 1
+                    continue
+            log.warning(
+                "Bid %d/%d (replik %d-%d) fra batchen: %s - oversættes direkte",
+                k,
+                len(starts),
+                start + 1,
+                end,
+                "; ".join(problems),
+            )
+            again.append((k, start))
+        stats.direct_after = len(again)
+        log.info(
+            "Batch: %d bidder sendt, %d lykkedes, %d oversættes direkte, ventetid %s",
+            stats.sent,
+            stats.ok,
+            stats.direct_after,
+            _duration(stats.seconds),
+        )
+        return again
+
+    todo = via_batch() if batch_api is not None else list(enumerate(starts, start=1))
+    if parallel <= 1 or len(todo) <= 1:
+        for k, start in todo:
             one_batch(k, start)
             if stop.is_set():
                 break
     else:
         # Bidderne sendes i rækkefølge; højst `parallel` ad gangen. Fejl i én bid stopper ikke de andre.
         with ThreadPoolExecutor(max_workers=parallel, thread_name_prefix="bid") as pool:
-            for future in [pool.submit(one_batch, k, start) for k, start in enumerate(starts, start=1)]:
+            for future in [pool.submit(one_batch, k, start) for k, start in todo]:
                 future.result()
     for p in range(n):
         if da[p] is None:
@@ -712,8 +913,15 @@ def run_translate_test(
     http=None,
     hi_clean: bool = True,
     show_context: bool = False,
+    batch_api: bool = False,
+    batch_timeout: float = 90,
+    sleep=time.sleep,
 ) -> int:
-    """show_context (--vis-kontekst): filmkonteksten og ordlisten (termer og tiltaler) skrives øverst i rapporten."""
+    """show_context (--vis-kontekst): filmkonteksten og ordlisten (termer og tiltaler) skrives øverst i rapporten.
+
+    batch_api (--batch-api, kun anthropic): bid 2 og frem sendes som én Message Batch (50 % rabat); batch_timeout
+    (--batch-timeout) er minutter, før batchen aflyses, og resten oversættes direkte.
+    """
     if os.path.abspath(out) == os.path.abspath(en_path):
         log.error("--out må ikke være den samme fil som --en")
         return 2
@@ -722,6 +930,13 @@ def run_translate_test(
         return 2
     if provider not in PROVIDERS:
         log.error("Ukendt provider %r - brug %s", provider, ", ".join(PROVIDERS))
+        return 2
+    if batch_api and provider != "anthropic":
+        log.error(
+            "--batch-api virker kun med --provider anthropic (Anthropics Message Batches), ikke %s - "
+            "kør uden --batch-api",
+            provider,
+        )
         return 2
     if prompt not in ("v3", "v4"):
         log.error("Ukendt --prompt %r - brug v3 eller v4", prompt)
@@ -756,6 +971,8 @@ def run_translate_test(
     switches = f"prompt {prompt}, kontekst {on[context]}, ordliste {on[glossary]}, parallel {parallel}"
     cache = cfg.prompt_cache and provider == "anthropic"
     switches += f", prompt-cache {on[cache]}, hi {on[hi_clean]}"
+    if batch_api:
+        switches += f", batch-api on (timeout {batch_timeout:g} min)"
 
     started = clock()
     log.info("oversaet-test: %d replikker, %s/%s, bidder af %d, %s", len(en_cues), provider, model, batch, switches)
@@ -785,6 +1002,7 @@ def run_translate_test(
         empty_ok=filler_positions(en, prompt),
         cache=cache,
         notes=notes,
+        batch_api=BatchApi(client, batch_timeout, sleep=sleep, clock=clock) if batch_api else None,
     )
     kept, fallback = drop_empty(res.da, res.fallback)
     da_cues: list[Cue] = [replace(en_cues[p], text=res.da[p]) for p in kept]
@@ -809,6 +1027,25 @@ def run_translate_test(
     if wordlist is not None:
         inp, outp = inp + wordlist.input_tokens, outp + wordlist.output_tokens
     cost = model_price(model, inp, outp, res.cache_read, res.cache_write)
+    bs = res.batch
+    batch_lines = []
+    if bs is not None:
+        batch_cost = model_price(
+            model, bs.input_tokens, bs.output_tokens, bs.cache_read, bs.cache_write, factor=BATCH_FACTOR
+        )
+        direct_cost = cost
+        cost = None if cost is None or batch_cost is None else cost + batch_cost
+        inp, outp = inp + bs.input_tokens, outp + bs.output_tokens
+        batch_lines = [
+            f"Batch: {bs.sent} bidder sendt, {bs.ok} lykkedes, {bs.direct_after} oversat direkte bagefter, "
+            f"ventetid {_duration(bs.seconds)}" + (" (aflyst efter --batch-timeout)" if bs.canceled else ""),
+            "Pris batch (50 %): "
+            + ("pris ukendt" if batch_cost is None else f"{batch_cost:.4f} USD")
+            + f" (tokens ind {bs.input_tokens + bs.cache_read + bs.cache_write}, ud {bs.output_tokens})",
+            "Pris direkte: " + ("pris ukendt" if direct_cost is None else f"{direct_cost:.4f} USD"),
+        ]
+    cache_read = res.cache_read + (bs.cache_read if bs else 0)
+    cache_write = res.cache_write + (bs.cache_write if bs else 0)
     examples = [f"  #{p + 1} {', '.join(fl)}: {da_cues[p].text.replace(chr(10), ' / ')}" for p, fl in fix.items()]
     if not glossary:
         glossary_line = "Ordliste: slået fra"
@@ -835,10 +1072,11 @@ def run_translate_test(
             f"Replikker: {len(en_cues)}"
             + (f" (heraf {len(en_cues) - len(kept)} med kun fyldlyde fjernet)" if len(kept) < len(en_cues) else ""),
             f"Bidder: {res.batches} (kald i alt: {res.calls})",
-            f"Tokens ind: {inp + res.cache_read + res.cache_write}"
-            + (f" (heraf cache-læs {res.cache_read}, cache-skriv {res.cache_write})" if cache else ""),
+            f"Tokens ind: {inp + cache_read + cache_write}"
+            + (f" (heraf cache-læs {cache_read}, cache-skriv {cache_write})" if cache else ""),
             f"Tokens ud: {outp}",
             "Pris: " + ("pris ukendt" if cost is None else f"{cost:.4f} USD"),
+            *batch_lines,
             f"Tid: {_duration(elapsed)}",
             f"Rettelsesflag fra kontrollen: {len(fix)}"
             + (" (" + ", ".join(f"{k}={v}" for k, v in counts.most_common()) + ")" if fix else ""),

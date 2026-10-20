@@ -97,6 +97,8 @@ class Config:
     plex_url: str = ""
     plex_token_file: str = "/run/secrets/plex_token"
     plex_path_map: str = ""  # "fra=til": byt et sti-præfiks ud, hvis Plex ser mapperne et andet sted
+    # Trin B6b: bed Bazarr synkronisere den danske tekst mod lyden efter upload (før Plex-scanningen).
+    sync_after_upload: bool = True
 
     poll_minutes: float = 15.0
     translate_tag: str = "oversaet"

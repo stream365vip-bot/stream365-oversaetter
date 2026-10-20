@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS items (
     glossary TEXT,                 -- ordlisten (JSON) fra GLOSSARY=on
     en_hi INTEGER,                 -- 1 = oversat fra en engelsk HI/SDH-kilde, 0 = almindelig (NULL = ikke vurderet)
     plex_refresh INTEGER,          -- 1 = Plex bedt om at scanne mappen, 0 = fejlede (NULL = ikke forsøgt)
+    bazarr_sync INTEGER,           -- 1 = Bazarr har synkroniseret den danske tekst, 0 = fejlede (NULL = ikke forsøgt)
     batch_id TEXT                  -- Anthropic Message Batch, der er sendt, men hvis svar ikke er hentet (BATCH_API)
 );
 CREATE TABLE IF NOT EXISTS spend (
@@ -61,6 +62,7 @@ NEW_COLUMNS = {
         "glossary": "TEXT",
         "en_hi": "INTEGER",
         "plex_refresh": "INTEGER",
+        "bazarr_sync": "INTEGER",
         "batch_id": "TEXT",
     }
 }

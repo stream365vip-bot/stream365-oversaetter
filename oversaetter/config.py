@@ -34,7 +34,7 @@ MODEL_PRICES: dict[str, tuple[float, float]] = {
 # Prompt-cache (Anthropic): cache-læsning koster 10 % og cache-skrivning 125 % af inputprisen.
 CACHE_READ_FACTOR = 0.1
 CACHE_WRITE_FACTOR = 1.25
-# Message Batches (Anthropic): 50 % af prisen på alle tokens, også prompt-cachens (kun oversaet-test --batch-api).
+# Message Batches (Anthropic): 50 % af prisen på alle tokens, også prompt-cachens (--batch-api og BATCH_API=true).
 BATCH_FACTOR = 0.5
 
 
@@ -120,6 +120,9 @@ class Config:
     prompt_cache: bool = True  # PROMPT_CACHE: systeminstruksen markeres til Anthropics prompt-cache
     # Trin B4c (18.10.2026): linjer, der starter eller slutter med ♪/#, fjernes fra den engelske kilde (sangtekst)
     drop_lyrics: bool = True
+    # Trin B6 (19.10.2026): bid 2 og frem som én Anthropic Message Batch (halv pris). Standard fra.
+    batch_api: bool = False
+    batch_timeout_minutes: float = 90.0  # så længe ventes der på batchen, før den aflyses og resten oversættes direkte
 
     max_line_chars: int = 42
     proofread_batch: int = 50

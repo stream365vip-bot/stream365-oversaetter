@@ -6,6 +6,10 @@ filen - kun en lille rettelsesrunde for de replikker, den gratis kontrol flager.
 Flow for ét emne: hent den engelske tekst (ekstern .srt eller indlejret tekstspor via ffmpeg), oversæt med
 oversaet.translate_all, ret de flagede replikker i ét ekstra kald, sæt kreditlinjen ind, gem filen og upload den
 til Bazarr. Fejler uploaden, skrives filen ved siden af videoen, og Bazarr bedes om at scanne disken.
+
+BATCH_API=true (trin B6): ordlisten og bid 1 direkte, bid 2 og frem som én Anthropic Message Batch til halv pris
+(oversaet.BatchApi). Batchens id gemmes på titlen, til svarene er hentet, så en genstart henter dem i stedet for
+at sende igen.
 """
 
 from __future__ import annotations
@@ -21,11 +25,20 @@ from dataclasses import dataclass, replace
 from . import hi
 from .checks import FLAG_TEXT, EnglishIndex, check_all, count_info, fix_flags, plain
 from .clients import ApiError, Bazarr
-from .config import Config, model_price
+from .config import BATCH_FACTOR, Config, model_price
 from .credit import apply_credit
 from .deadline import call_with_timeout
 from .ordliste import Wordlist, merge_previous
-from .oversaet import build_system, drop_empty, filler_positions, make_glossary, speaker_notes, translate_all
+from .oversaet import (
+    BatchApi,
+    BatchStats,
+    build_system,
+    drop_empty,
+    filler_positions,
+    make_glossary,
+    speaker_notes,
+    translate_all,
+)
 from .proofread import OUTPUT_SCHEMA as FIX_SCHEMA
 from .proofread import Budget, validate_fix
 from .selection import Candidate, has_danish
@@ -41,6 +54,7 @@ POLL_SECONDS = 5
 FIX_CONTEXT = 2
 FIX_MAX_TOKENS = 16000
 BATCH = 50
+BATCH_LOG_EVERY = 120  # BATCH_API: en INFO-linje med batchens status så ofte (sekunder)
 UPLOADED = "uploadet til Bazarr"  # deliver() efter en vellykket upload (så beder runneren Plex scanne, trin B4g)
 
 # Tekstbaserede undertekstformater, som ffmpeg kan lave om til srt. Alt andet (PGS, VobSub, DVB ...) springes over.
@@ -87,6 +101,8 @@ class DirectOutcome:
     en_hi: bool = False  # den engelske kilde var HI/SDH (navn/disposition eller indhold)
     glossary_terms: int | None = None  # None = ingen ordliste
     glossary: Wordlist | None = None
+    batch: BatchStats | None = None  # BATCH_API=true
+    batch_cost: float = 0.0  # den del af cost, der er batchens (med BATCH_FACTOR)
 
     def summary(self) -> str:
         extra = ""
@@ -95,11 +111,19 @@ class DirectOutcome:
             if self.glossary_terms is not None:
                 extra += f", ordliste: {self.glossary_terms} termer"
             extra += f", tomme fjernet: {self.removed_empty}"
+        price = f"pris: {self.cost:.4f} USD"
+        b = self.batch
+        if b is not None:
+            price += (
+                f" (batch {self.batch_cost:.4f} USD, direkte {self.cost - self.batch_cost:.4f} USD), "
+                f"batch: {b.sent} bidder{' fra gemt batch' if b.reused else ''}, {b.ok} lykkedes, "
+                f"{b.direct_after} direkte, ventetid {duration(b.seconds)}"
+            )
         return (
             f"model: {self.model}, replikker: {self.lines}, flag: {self.flags_before}, "
             f"informationsflag: {self.info_flags}, rettelser: {self.fixes}, "
             f"flag efter: {self.flags_after}, beholdt engelsk: {self.fallback_english}, "
-            f"fallback-model: {self.by_fallback}, pris: {self.cost:.4f} USD, tid: {duration(self.seconds)}, "
+            f"fallback-model: {self.by_fallback}, {price}, tid: {duration(self.seconds)}, "
             f"{self.delivery}, {self.credit}{extra}"
         )
 
@@ -319,6 +343,20 @@ def fix_flagged(
 
 
 # --- ét emne -------------------------------------------------------------------------------------------
+class DbBatchIds:
+    """BATCH_API: batchens id på titlen (items.batch_id), fra den er sendt, til svarene er hentet."""
+
+    def __init__(self, db):
+        self.db = db
+
+    def saved(self, key: str) -> str | None:
+        row = self.db.get(key)
+        return row["batch_id"] if row is not None else None
+
+    def save(self, key: str, batch_id: str | None) -> None:
+        self.db.upsert(key, batch_id=batch_id)
+
+
 class DirectTranslator:
     def __init__(
         self,
@@ -331,11 +369,40 @@ class DirectTranslator:
         clock=time.monotonic,
         context_for=None,
         glossaries_for=None,
+        batch_ids: DbBatchIds | None = None,
     ):
-        """context_for(cand) -> kontekstblok eller None; glossaries_for(cand) -> tidligere ordlister (JSON) i serien."""
+        """context_for(cand) -> kontekstblok eller None; glossaries_for(cand) -> tidligere ordlister (JSON) i serien.
+
+        batch_ids: hvor batchens id gemmes (BATCH_API=true); None = intet gemmes.
+        """
         self.cfg, self.bazarr, self.client, self.budget = cfg, bazarr, client, budget
         self.run_cmd, self.sleep, self.clock = run_cmd, sleep, clock
         self.context_for, self.glossaries_for = context_for, glossaries_for
+        self.batch_ids = batch_ids
+
+    def batch_api(self, cand: Candidate) -> BatchApi | None:
+        """BATCH_API=true: Message Batch for bid 2 og frem; en gemt batch (fra før en genstart) hentes i stedet."""
+        if not self.cfg.batch_api:
+            return None
+        saved = self.batch_ids.saved(cand.key) if self.batch_ids is not None else None
+        if saved:
+            log.info("%s har en gemt batch (%s) fra før - svarene hentes derfra", cand.title, saved)
+
+        def on_id(batch_id: str | None) -> None:
+            if self.batch_ids is not None:
+                self.batch_ids.save(cand.key, batch_id)
+
+        return BatchApi(
+            self.client,
+            self.cfg.batch_timeout_minutes,
+            sleep=self.sleep,
+            clock=self.clock,
+            log_every=BATCH_LOG_EVERY,
+            batch_id=saved,
+            on_id=on_id,
+            quiet=True,
+            resend=True,
+        )
 
     def work_path(self, cand: Candidate) -> str:
         return os.path.join(self.cfg.data_dir, "direkte", cand.key.replace(":", "-") + ".da.srt")
@@ -405,6 +472,7 @@ class DirectTranslator:
             outcome.glossary = wordlist
             outcome.glossary_terms = len(wordlist.terms) if wordlist is not None else None
         system = build_system(cfg.prompt_version, "anthropic", context, wordlist)
+        batch_api = self.batch_api(cand)
         res = translate_all(
             en,
             "anthropic",
@@ -422,7 +490,15 @@ class DirectTranslator:
             empty_ok=filler_positions(en, cfg.prompt_version) | hi.markup_positions(en),  # trin B4f
             cache=cfg.prompt_cache,
             notes=speaker_notes(hi_result, cfg.prompt_version),
+            batch_api=batch_api,
         )
+        if batch_api is not None and self.batch_ids is not None:
+            self.batch_ids.save(cand.key, None)  # svarene er hentet (eller opgivet)
+        if res.batch is not None:
+            outcome.batch = res.batch
+            outcome.batch_cost = self.batch_usage(cand, res.batch)
+            spent["cost"] += outcome.batch_cost
+            deadline += res.batch.seconds  # ventetiden på batchen tæller ikke med i TRANSLATE_TIMEOUT_MINUTES
         if res.cache_read or res.cache_write:
             log.info("Prompt-cache: %d tokens læst, %d tokens skrevet", res.cache_read, res.cache_write)
         outcome.fallback_english, outcome.by_fallback = len(res.fallback), res.by_fallback
@@ -495,6 +571,19 @@ class DirectTranslator:
         outcome.ok = True
         outcome.cost, outcome.seconds = spent["cost"], self.clock() - started
         return outcome
+
+    def batch_usage(self, cand: Candidate, b: BatchStats) -> float:
+        """Batchens tokens til halv pris (BATCH_FACTOR) i budgettet. Returnerer prisen."""
+        tokens = (b.input_tokens, b.output_tokens, b.cache_read, b.cache_write)
+        if not any(tokens):
+            return 0.0
+        model = self.cfg.translate_model
+        cost = model_price(model, *tokens, factor=BATCH_FACTOR)
+        if cost is None:
+            cost = BATCH_FACTOR * self.cfg.price(*tokens)
+            log.warning("Ukendt pris for %s - bruger PRICE_INPUT_PER_M/PRICE_OUTPUT_PER_M", model)
+        self.budget.record(cand.key, b.input_tokens + b.cache_read + b.cache_write, b.output_tokens, cost)
+        return cost
 
     # --- aflevering til Bazarr ---------------------------------------------------------------------------
     def _bazarr_has_danish(self, cand: Candidate) -> bool:

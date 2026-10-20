@@ -32,7 +32,7 @@ from .proofread import DbBudget
 from .search import PAUSE_WARN, nice_name, paused_providers, search_jobs, unfinished, wait_for_jobs, waiting_text
 from .selection import Candidate, Selector, Stats, choose_source
 from .srt import read_file, write_file_atomic
-from .synk import sync_after_upload
+from .synk import after_upload
 from .translate import request_translation
 
 log = logging.getLogger("oversaetter")
@@ -486,9 +486,9 @@ class Runner:
         )
         log.info("Færdig: %s - %s", cand.title, out.summary())
         if out.delivery == UPLOADED:
-            # Bazarrs automatiske synk kører heller ikke ved upload: bed om den først, så Plex ser den synkroniserede
-            # fil (trin B6b). Fejler den, får Plex besked alligevel.
-            synced = sync_after_upload(cfg, self.bazarr, cand, self.sleep, self.clock)
+            # Vent på Bazarrs egen synk efter uploaden, tjek HI-mærket og (SYNC_AFTER_UPLOAD) synk selv, før Plex
+            # bedes scanne, så Plex ser den synkroniserede fil (trin B6b). Fejl giver kun advarsler.
+            synced = after_upload(cfg, self.bazarr, cand, self.sleep, self.clock)
             if synced is not None:
                 self.db.upsert(cand.key, bazarr_sync=int(synced))
             # Bazarrs egen Plex-opdatering kører kun ved download, ikke ved upload (trin B4g).

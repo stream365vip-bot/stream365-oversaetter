@@ -48,6 +48,7 @@ class FakeArr:
         self.uploads: list[dict] = []  # felter fra upload-kaldet + "query" og "content" (filens indhold)
         self.upload_status = 204
         self.upload_saves = True  # som Bazarr: gem den uploadede fil som <video>.da.srt
+        self.upload_sync_job: str | None = None  # Bazarrs egen synk efter upload: status på jobbet (None = intet)
         self.scan_calls: list[dict] = []
         # Synk af den danske tekst mod lyden (PATCH /api/subtitles, action=sync)
         self.subtitle_syncs: list[dict] = []
@@ -245,6 +246,9 @@ class FakeArr:
             with open(da, "w", encoding="utf-8") as f:
                 f.write(fields["content"])
             item["subtitles"] = [*item["subtitles"], {"code2": "da", "code3": "dan", "path": da, "forced": False}]
+            if self.upload_sync_job is not None and self.jobs is not None:
+                self._job_id += 1
+                self.jobs.append({"job_id": self._job_id, "job_name": f"Syncing {da}", "status": self.upload_sync_job})
         return httpx2.Response(self.upload_status, text="")
 
     def radarr(self, path):

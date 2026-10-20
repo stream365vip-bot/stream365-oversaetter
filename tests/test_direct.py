@@ -160,12 +160,8 @@ def test_external_english_is_translated_fixed_and_uploaded(arr, tmp_path, caplog
     assert claude.requests[0]["output_config"]["effort"] == "medium"
     assert commands.calls == []  # ekstern fil: ingen ffmpeg
     assert arr.translate_calls == []
-    # Kun søgningen, uploaden og synken af den danske tekst ændrer noget i Bazarr
-    assert arr.writes == [
-        ("PATCH", "bazarr/api/movies/subtitles"),
-        ("POST", "bazarr/api/movies/subtitles"),
-        ("PATCH", "bazarr/api/subtitles"),
-    ]
+    # Kun søgningen og uploaden ændrer noget i Bazarr (Bazarr synkroniserer selv ved upload, trin B6b)
+    assert arr.writes == [("PATCH", "bazarr/api/movies/subtitles"), ("POST", "bazarr/api/movies/subtitles")]
     up = arr.uploads[0]
     assert up["query"] == {"radarrid": "1"}
     assert (up["language"], up["forced"], up["hi"]) == ("da", "false", "false")

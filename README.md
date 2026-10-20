@@ -106,9 +106,9 @@ Tryk `Ctrl+C` for at stoppe visningen (programmet kører videre). Hver linje er 
 2026-10-17 20:15:40 INFO Runde: 6 mangler dansk, 1 oversættes, 1 søgt nu, 1 venter, 1 fandt dansk ved søgning, 1 ikke valgt, ...
 2026-10-17 20:15:40 INFO Gyldig søgning fandt ikke dansk - oversætter Filmnavn selv (Seerr) med claude-opus-5-5 (effort medium): 1412 replikker fra ekstern engelsk: Filmnavn.en.srt
 2026-10-17 20:18:31 INFO Rettelsesrunde: 19 af 23 flagede replikker rettet
-2026-10-17 20:18:33 INFO Uploadet til Bazarr: Filmnavn.da.srt (Bazarr registrerer teksten)
+2026-10-17 20:18:33 INFO Uploadet til Bazarr: Filmnavn.da.srt (Bazarr registrerer og synkroniserer teksten)
 2026-10-17 20:18:33 INFO Færdig: Filmnavn - model: claude-opus-5-5, replikker: 1412, flag: 23, rettelser: 19, flag efter: 4, beholdt engelsk: 0, fallback-model: 0, pris: 1.2800 USD, tid: 2 min 53 s, uploadet til Bazarr, kreditlinje indsat
-2026-10-17 20:19:51 INFO Bazarr har synkroniseret den danske tekst til Filmnavn mod lyden (/mnt/unionfs/Media/Movies/Film/Filmnavn (2026)/Filmnavn.da.srt)
+2026-10-17 20:19:51 INFO Bazarr er færdig med upload/synk af den danske tekst til Filmnavn (Synced /mnt/unionfs/Media/Movies/Film/Filmnavn (2026)/Filmnavn.da.srt)
 ```
 
 Hver runde viser først Bazarrs egne tal og op til 5 eksempler på, hvorfor noget blev valgt eller fravalgt. Ser du
@@ -323,11 +323,13 @@ Loggen viser, hvad der blev slettet. Passer titlen på flere rækker, slettes in
   - **Genstart**: batchens id gemmes på titlen (`items.batch_id`), så snart batchen er sendt, og slettes, når svarene er hentet. Stoppes containeren midt i ventetiden, sættes titlen ved opstart til `forsoeg_igen` (genstarten tæller ikke som et forsøg), og i første runde hentes svarene fra den gemte batch i stedet for at sende igen (loggen: `… har en gemt batch (msgbatch_…) fra før - svarene hentes derfra`). Ordlisten og bid 1 laves direkte igen (som `--batch-id`). Er batchen ukendt hos Anthropic, udløbet eller aflyst uden et eneste brugbart svar, logges det, feltet nulstilles, og bidderne sendes som en ny batch. Feltet oprettes automatisk i en ældre database ved opstart. Se gemte batcher: `SELECT title, batch_id FROM items WHERE batch_id IS NOT NULL`.
   - **Kendt begrænsning**: titlerne behandles én ad gangen. Mens scriptet venter på en batch, venter de andre titler også, så en sæson på 10 afsnit tager 10 ventetider i træk (ca. 10 × 9 minutter).
 
-- **Trin B6b: aldrig HI ved upload, og synk mod lyden** (20.10.2026, efter Clean Hands):
-  1. **HI**: den danske tekst uploades altid med `language=da`, `forced=false`, `hi=false` og navnet `<video>.da.srt`, uanset kilde (hentet .srt, indlejret spor, HI/SDH). Der findes kun ét upload-kald (`Bazarr.upload`), og det har bevidst ingen hi-parameter. Registrerer Bazarr alligevel den danske tekst som HI (Bazarrs `hi`-felt eller et `.hi.`/`.sdh.` i stien), skriver loggen `ADVARSEL: Bazarr har registreret den danske tekst til <titel> som HI (...)`.
-  2. **Synk efter upload**: Bazarrs automatiske synk kører kun, når Bazarr selv henter en tekst, ikke ved upload. Efter en vellykket upload beder scriptet derfor Bazarr synkronisere den danske tekst mod lyden, samme kald som Sync-knappen: `PATCH /api/subtitles` med `action=sync`, `language=da`, `path=<den danske fil, som Bazarr har registreret den>`, `type=movie|episode`, `id=<radarrId|sonarrEpisodeId>`, `forced=False`, `hi=False`. Nyere Bazarr lægger synken i jobkøen; scriptet venter på jobbet (opslag hvert 10. sekund), højst 10 minutter i alt. Loggen skriver `Bazarr har synkroniseret den danske tekst til <titel> mod lyden (...)` eller en `ADVARSEL: ...`-linje (fejl, fejlet job eller timeout). Først derefter bedes Plex scanne (trin B4g), så Plex ser den synkroniserede fil. Fejler synken, får Plex besked alligevel, og emnet er stadig færdigt. Gælder film og afsnit.
-  - `.env`: `SYNC_AFTER_UPLOAD=true|false` (standard `true`). `false` springer synken over med én INFO-linje.
-  - Resultatet gemmes i `items.bazarr_sync` (1 = synkroniseret, 0 = fejlede/timeout, NULL = ikke forsøgt), fx `SELECT title, bazarr_sync, plex_refresh FROM items WHERE status = 'faerdig'`.
+- **Trin B6b: aldrig HI ved upload, HI-tjek efter Bazarrs synk** (20.10.2026, efter Clean Hands):
+  1. **HI**: den danske tekst uploades altid med `language=da`, `forced=false`, `hi=false` og navnet `<video>.da.srt`, uanset kilde (hentet .srt, indlejret spor, HI/SDH). Der findes kun ét upload-kald (`Bazarr.upload`), og det har bevidst ingen hi-parameter.
+  2. **Bazarr synkroniserer selv ved upload**: Bazarrs log viser, at Bazarr starter en synkronisering (ffsubsync) umiddelbart efter vores upload (The Fix og Clean Hands). Efter en vellykket upload venter scriptet derfor på Bazarrs job for titlen i joblisten (`Uploading/Syncing/Synced <video>.da.srt`, opslag hvert 10. sekund, højst 10 minutter). Loggen skriver `Bazarr er færdig med upload/synk af den danske tekst til <titel> (...)` eller ved timeout `ADVARSEL: Bazarrs egen synk ... er ikke færdig efter 10 minutter`. Kan joblisten ikke læses, ventes der ikke.
+  3. **HI-tjek**: først når Bazarrs synk er færdig, slås det op, hvordan Bazarr har registreret den danske tekst. Er den HI (Bazarrs `hi`-felt eller `.hi.`/`.sdh.` i filnavnet), skriver loggen `ADVARSEL: Bazarr har registreret den danske tekst til <titel> som HI, gemt som <filnavn> (<sti>), selv om den blev uploadet med hi=false`.
+  4. Derefter bedes Plex scanne (trin B4g), så Plex ser den synkroniserede fil. Intet af dette kan få emnet til at fejle.
+  - `.env`: `SYNC_AFTER_UPLOAD=true|false` (standard `false`). Kontakten er **kun til, hvis Bazarr holder op med at synkronisere ved upload**. Med `true` beder scriptet desuden selv om det samme som Sync-knappen, efter HI-tjekket og før Plex: `PATCH /api/subtitles` med `action=sync`, `language=da`, `path=<den danske fil, som Bazarr har registreret den>`, `type=movie|episode`, `id=<radarrId|sonarrEpisodeId>`, `forced=False`, `hi=False`. Scriptet venter højst 10 minutter på jobbet, og en fejl giver `ADVARSEL: Bazarr ... ikke synkroniseret`. Plex får besked alligevel.
+  - Resultatet af scriptets egen synk gemmes i `items.bazarr_sync` (1 = synkroniseret, 0 = fejlede/timeout, NULL = ikke forsøgt, fx fordi kontakten er fra).
 
 ## Hvis noget går galt
 
@@ -335,7 +337,8 @@ Loggen viser, hvad der blev slettet. Passer titlen på flere rækker, slettes in
 - Billedbaserede undertekster (PGS/VobSub) kan ikke oversættes og springes over. Mangler ffmpeg, eller fejler udtrækningen, prøves emnet igen i næste runde.
 - Når en replik ender med at beholde den engelske tekst (afvist af begge modeller eller ugyldigt svar), står det som `ERROR ... beholder den engelske tekst` og `ADVARSEL: N af M replikker ... beholder den engelske tekst` i loggen.
 - Fejler uploaden til Bazarr, står der `ADVARSEL: Upload til Bazarr fejlede` i loggen; filen er så skrevet ved siden af videoen, og Bazarr er bedt om at scanne disken.
-- Fejler synken efter upload (eller tager over 10 minutter), står der `ADVARSEL: Bazarr ... ikke synkroniseret` i loggen. Teksten er uploadet, Plex har fået besked, og synken kan tages med Sync-knappen i Bazarr (se "Trin B6b").
+- Bliver Bazarrs egen synk efter upload ikke færdig inden for 10 minutter, står der `ADVARSEL: Bazarrs egen synk ... er ikke færdig` i loggen. Teksten er uploadet, og Plex har fået besked. Synken kan tages med Sync-knappen i Bazarr (se "Trin B6b").
+- `ADVARSEL: Bazarr har registreret den danske tekst ... som HI, gemt som <filnavn>`: tjek filen i Bazarr (vores tekst uploades altid uden HI).
 - Bliver en oversættelse ikke færdig inden for `TRANSLATE_TIMEOUT_MINUTES`, gemmes intet, og emnet prøves igen i næste runde (direct).
 - Alle kald til Anthropic, Bazarr, Radarr, Sonarr og Seerr har en fast tidsgrænse, så intet kan vente for evigt.
 - (lingarr) Afviser korrekturmodellen en bid (refusal), prøves den én gang mere delt i to halvdele. Afvises en halvdel igen, eller giver en bid et ugyldigt svar eller timeout, springes den over (Haikus tekst beholdes), og der fortsættes med næste bid.

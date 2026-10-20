@@ -622,7 +622,7 @@ class DirectTranslator:
             # Vores danske tekst er altid almindelig, aldrig HI - også når den engelske kilde var HI (trin B4f).
             self.bazarr.upload(cand.media_type, cand.media_id, cand.series_id, filename, content, UPLOAD_TIMEOUT)
             if self._wait_for_bazarr(cand, before):
-                log.info("Uploadet til Bazarr: %s (Bazarr registrerer teksten)", filename)
+                log.info("Uploadet til Bazarr: %s (Bazarr registrerer og synkroniserer teksten)", filename)
                 return UPLOADED
             why = f"Bazarr har ikke gemt filen efter {UPLOAD_WAIT:g} sekunder"
         except ApiError as e:

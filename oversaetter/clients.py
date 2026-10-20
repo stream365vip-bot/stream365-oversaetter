@@ -165,7 +165,7 @@ class Bazarr(_Api):
 
         POST /api/movies/subtitles?radarrid=.. eller /api/episodes/subtitles?seriesid=..&episodeid=.., multipart med
         file, language=da, forced=false og hi=false. Bazarr gemmer filen som <video>.da.srt, registrerer den og
-        kører Sub-Zero som ved en manuel upload (synk mod lyden beder vi selv om bagefter, trin B6b).
+        kører Sub-Zero og synk mod lyden (ffsubsync) som ved en manuel upload (trin B6b venter på synken).
         """
         if media_type == "movie":
             path, params = "/api/movies/subtitles", {"radarrid": media_id}

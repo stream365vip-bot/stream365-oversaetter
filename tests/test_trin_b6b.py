@@ -1,4 +1,7 @@
-"""Trin B6b (20.10.2026): rettelser efter Clean Hands - aldrig HI ved upload, og synk mod lyden før Plex.
+"""Trin B6b (20.10.2026): rettelser efter Clean Hands.
+
+Den danske tekst uploades aldrig som HI. Bazarr synkroniserer selv ved upload: vi venter på Bazarrs job, tjekker
+derefter HI-mærket og beder først så Plex scanne. Vores egen synk (SYNC_AFTER_UPLOAD) er slået fra som standard.
 
 Alle tekster er selvskrevne.
 """
@@ -46,10 +49,39 @@ def recorder(seen):
     return wrap
 
 
+def bazarr_sync_finishes(arr, after_polls=3, mark_hi=False, plex_check=True):
+    """Bazarrs egen synk efter upload bliver færdig efter nogle opslag i joblisten (og kan omdøbe til .da.hi.srt)."""
+    polls = []
+
+    def finish():
+        job = next(j for j in arr.jobs if j["job_name"].startswith("Syncing "))
+        job["status"] = "completed"
+        if mark_hi:
+            for s in arr.movies[1]["subtitles"]:
+                if s.get("code2") == "da":
+                    hi_path = s["path"].replace(".da.srt", ".da.hi.srt")
+                    os.replace(s["path"], hi_path)
+                    s.update(path=hi_path, hi=True)
+
+    def wrap(handle):
+        def wrapped(req):
+            if req.url.path == "/api/system/jobs" and arr.uploads:
+                polls.append(1)
+                if len(polls) == after_polls:
+                    finish()
+            if plex_check and req.url.host == "plex":
+                assert len(polls) >= after_polls, "Plex må først kaldes, når Bazarrs synk er færdig"
+            return handle(req)
+
+        return wrapped
+
+    return wrap, polls
+
+
 # --- 1) den danske tekst uploades altid uden HI -------------------------------------------------------------
 def test_embedded_english_sdh_track_gives_upload_without_hi(arr, tmp_path):
     """Clean Hands: indlejret engelsk SDH-spor (ffmpeg) -> dansk upload med hi=false og navnet .da.srt."""
-    video = arr.add_movie(1, 101, {"days": 2}, [{**embedded("en", 11225, track=3), "hi": True}])
+    arr.add_movie(1, 101, {"days": 2}, [{**embedded("en", 11225, track=3), "hi": True}])
     commands = FakeCommands(streams=[stream(3, title="English [SDH]", hi=1)])
     r, db = runner(arr, tmp_path, claude=FakeAnthropic(), commands=commands)
     r.run_once()
@@ -58,9 +90,6 @@ def test_embedded_english_sdh_track_gives_upload_without_hi(arr, tmp_path):
     up = arr.uploads[0]
     assert (up["language"], up["forced"], up["hi"]) == ("da", "false", "false")
     assert up["filename"] == "Film 1.da.srt"
-    sync = arr.subtitle_syncs[0]
-    assert (sync["language"], sync["forced"], sync["hi"]) == ("da", "False", "False")
-    assert sync["path"] == os.path.splitext(video)[0] + ".da.srt"
 
 
 def test_downloaded_english_hi_srt_gives_upload_without_hi(arr, tmp_path):
@@ -74,10 +103,9 @@ def test_downloaded_english_hi_srt_gives_upload_without_hi(arr, tmp_path):
     assert db.get("movie:1")["status"] == "faerdig"
     up = arr.uploads[0]
     assert up["hi"] == "false" and up["forced"] == "false" and up["filename"] == "Film 1.da.srt"
-    assert arr.subtitle_syncs[0]["hi"] == "False"
 
 
-def test_episode_upload_and_sync_without_hi(arr, tmp_path):
+def test_episode_upload_without_hi(arr, tmp_path):
     video = arr.add_episode(5, 50, 500, {"days": 2}, [], tags=[7])
     en_path = os.path.splitext(video)[0] + ".en.sdh.srt"
     with open(en_path, "w", encoding="utf-8") as f:
@@ -88,36 +116,93 @@ def test_episode_upload_and_sync_without_hi(arr, tmp_path):
     assert db.get("episode:5")["status"] == "faerdig"
     assert arr.uploads[0]["hi"] == "false"
     assert arr.uploads[0]["query"] == {"seriesid": "50", "episodeid": "5"}
-    sync = arr.subtitle_syncs[0]
-    assert (sync["type"], sync["id"], sync["hi"]) == ("episode", "5", "False")
-    assert db.get("episode:5")["bazarr_sync"] == 1
 
 
-def test_warning_when_bazarr_registers_danish_as_hi(arr, tmp_path, caplog):
+# --- 2) vent på Bazarrs egen synk, så HI-tjek, så Plex ------------------------------------------------------
+def test_default_no_own_sync_but_waits_for_bazarr_before_plex(arr, tmp_path, caplog):
     movie_with_english(arr)
-    handle = arr.handle
+    arr.upload_sync_job = "running"
+    wrap, polls = bazarr_sync_finishes(arr)
+    r, db, fake = plex_runner(arr, tmp_path, wrap=wrap, claude=FakeAnthropic())
+    with caplog.at_level(logging.INFO, logger="oversaetter"):
+        r.run_once()
+    assert arr.subtitle_syncs == []  # standard: ingen egen synk
+    row = db.get("movie:1")
+    assert row["bazarr_sync"] is None and row["plex_refresh"] == 1
+    assert len(polls) >= 3 and fake.calls
+    assert "Bazarr er færdig med upload/synk af den danske tekst til Film 1" in caplog.text
+    assert "ADVARSEL" not in caplog.text
 
-    def wrapped(req):
-        resp = handle(req)
-        if req.method == "POST":  # lige efter uploaden: Bazarr har registreret teksten som HI
-            for s in arr.movies[1]["subtitles"]:
-                if s.get("code2") == "da":
-                    s["hi"] = True
-        return resp
 
-    arr.handle = wrapped
+def test_hi_check_runs_after_bazarr_sync_and_names_file(arr, tmp_path, caplog):
+    """Bazarr registrerer først teksten som HI, når dens egen synk er færdig: tjekket skal vente på det."""
+    video, _ = movie_with_english(arr)
+    arr.upload_sync_job = "running"
+    wrap, _ = bazarr_sync_finishes(arr, mark_hi=True)
+    r, db, fake = plex_runner(arr, tmp_path, wrap=wrap, claude=FakeAnthropic())
+    with caplog.at_level(logging.INFO, logger="oversaetter"):
+        r.run_once()
+    warning = next(x for x in caplog.records if x.levelname == "WARNING")
+    assert warning.message.startswith("ADVARSEL: Bazarr har registreret den danske tekst til Film 1 som HI")
+    assert "gemt som Film 1.da.hi.srt" in warning.message
+    assert os.path.splitext(video)[0] + ".da.hi.srt" in warning.message
+    row = db.get("movie:1")
+    assert row["status"] == "faerdig" and row["plex_refresh"] == 1
+
+
+def test_no_hi_warning_for_plain_danish(arr, tmp_path, caplog):
+    movie_with_english(arr)
+    arr.upload_sync_job = "completed"
     r, db = runner(arr, tmp_path, claude=FakeAnthropic())
     with caplog.at_level(logging.INFO, logger="oversaetter"):
         r.run_once()
-    assert "Bazarr har registreret den danske tekst til Film 1 som HI" in caplog.text
+    assert "som HI" not in caplog.text and db.get("movie:1")["status"] == "faerdig"
+
+
+def test_bazarr_sync_timeout_warns_checks_hi_and_calls_plex(arr, tmp_path, caplog):
+    movie_with_english(arr)
+    arr.upload_sync_job = "running"  # bliver aldrig færdig
+    r, db, fake = plex_runner(arr, tmp_path, claude=FakeAnthropic())
+    with caplog.at_level(logging.INFO, logger="oversaetter"):
+        r.run_once()
+    assert "Bazarrs egen synk af den danske tekst til Film 1 er ikke færdig efter 10 minutter" in caplog.text
+    row = db.get("movie:1")
+    assert row["status"] == "faerdig" and row["plex_refresh"] == 1
+    assert fake.calls[-1][0] == "/library/sections/1/refresh"
+
+
+def test_job_for_other_title_is_not_waited_for(arr, tmp_path):
+    movie_with_english(arr)
+    arr.jobs.append({"job_id": 1, "job_name": "Syncing /x/Film 10/Film 10.da.srt", "status": "running"})
+    r, db = runner(arr, tmp_path, claude=FakeAnthropic())
+    r.run_once()
     assert db.get("movie:1")["status"] == "faerdig"
+    assert r.clock() < synk.BAZARR_WAIT  # ventede ikke på "Film 10"
 
 
-# --- 2) synk efter upload, før Plex ---------------------------------------------------------------------------
-def test_sync_is_called_after_upload_and_before_plex(arr, tmp_path, caplog):
+def test_unreadable_job_list_does_not_block(arr, tmp_path, caplog):
+    movie_with_english(arr)
+    arr.jobs = None  # gammel Bazarr uden jobkø
+    r, db, fake = plex_runner(arr, tmp_path, claude=FakeAnthropic())
+    with caplog.at_level(logging.INFO, logger="oversaetter"):
+        r.run_once()
+    assert "Bazarrs jobliste kan ikke læses" in caplog.text
+    assert db.get("movie:1")["plex_refresh"] == 1
+
+
+def test_failed_upload_does_not_wait_or_sync(arr, tmp_path):
+    movie_with_english(arr)
+    arr.upload_status = 500
+    r, db = runner(arr, tmp_path, claude=FakeAnthropic(), sync_after_upload=True)
+    r.run_once()
+    assert arr.subtitle_syncs == [] and db.get("movie:1")["bazarr_sync"] is None
+
+
+# --- 3) vores egen synk, kun med SYNC_AFTER_UPLOAD=true -----------------------------------------------------
+def test_own_sync_after_bazarr_and_before_plex(arr, tmp_path, caplog):
     video, _ = movie_with_english(arr)
     seen = []
-    r, db, fake = plex_runner(arr, tmp_path, wrap=recorder(seen), claude=FakeAnthropic())
+    r, db, fake = plex_runner(arr, tmp_path, wrap=recorder(seen), claude=FakeAnthropic(), sync_after_upload=True)
     with caplog.at_level(logging.INFO, logger="oversaetter"):
         r.run_once()
     order = [(h, m, p) for h, m, p in seen if p != "/api/movies/subtitles" or m == "POST"]
@@ -127,8 +212,7 @@ def test_sync_is_called_after_upload_and_before_plex(arr, tmp_path, caplog):
         ("plex", "GET", "/library/sections"),
         ("plex", "GET", "/library/sections/1/refresh"),
     ]
-    sync = arr.subtitle_syncs[0]
-    assert sync == {
+    assert arr.subtitle_syncs[0] == {
         "action": "sync",
         "language": "da",
         "path": os.path.splitext(video)[0] + ".da.srt",
@@ -142,7 +226,20 @@ def test_sync_is_called_after_upload_and_before_plex(arr, tmp_path, caplog):
     assert "Bazarr har synkroniseret den danske tekst til Film 1 mod lyden" in caplog.text
 
 
-def test_waits_for_sync_job_before_plex(arr, tmp_path):
+def test_own_sync_for_episode(arr, tmp_path):
+    video = arr.add_episode(5, 50, 500, {"days": 2}, [], tags=[7])
+    en_path = os.path.splitext(video)[0] + ".en.srt"
+    with open(en_path, "w", encoding="utf-8") as f:
+        f.write(EN)
+    arr.episodes[5]["subtitles"] = [en_sub(en_path)]
+    r, db = runner(arr, tmp_path, claude=FakeAnthropic(), sync_after_upload=True)
+    r.run_once()
+    sync = arr.subtitle_syncs[0]
+    assert (sync["type"], sync["id"], sync["hi"], sync["forced"]) == ("episode", "5", "False", "False")
+    assert db.get("episode:5")["bazarr_sync"] == 1
+
+
+def test_own_sync_waits_for_its_job(arr, tmp_path):
     movie_with_english(arr)
     arr.subtitle_sync_job = "running"
     polls = []
@@ -151,7 +248,7 @@ def test_waits_for_sync_job_before_plex(arr, tmp_path):
         def wrapped(req):
             if req.url.path == "/api/system/jobs" and arr.subtitle_syncs:
                 polls.append(1)
-                if len(polls) == 3:  # jobbet bliver færdigt efter et par opslag
+                if len(polls) == 3:
                     arr.jobs[-1]["status"] = "completed"
             if req.url.host == "plex":
                 assert arr.jobs[-1]["status"] == "completed", "Plex må først kaldes, når synken er færdig"
@@ -159,28 +256,28 @@ def test_waits_for_sync_job_before_plex(arr, tmp_path):
 
         return wrapped
 
-    r, db, fake = plex_runner(arr, tmp_path, wrap=wrap, claude=FakeAnthropic())
+    r, db, fake = plex_runner(arr, tmp_path, wrap=wrap, claude=FakeAnthropic(), sync_after_upload=True)
     r.run_once()
     assert len(polls) >= 3 and fake.calls
     assert db.get("movie:1")["bazarr_sync"] == 1
 
 
-def test_bazarr_without_sync_job_counts_as_synced(arr, tmp_path):
+def test_own_sync_without_job_counts_as_synced(arr, tmp_path):
     movie_with_english(arr)
     arr.subtitle_sync_job = None  # gammel Bazarr: synken er færdig, når kaldet svarer
-    r, db = runner(arr, tmp_path, claude=FakeAnthropic())
+    r, db = runner(arr, tmp_path, claude=FakeAnthropic(), sync_after_upload=True)
     r.run_once()
     assert db.get("movie:1")["bazarr_sync"] == 1
 
 
 @pytest.mark.parametrize("fail", [500, "job"])
-def test_sync_failure_is_warned_and_plex_still_called(arr, tmp_path, caplog, fail):
+def test_own_sync_failure_is_warned_and_plex_still_called(arr, tmp_path, caplog, fail):
     movie_with_english(arr)
     if fail == "job":
         arr.subtitle_sync_job = "failed"
     else:
         arr.subtitle_sync_status = fail
-    r, db, fake = plex_runner(arr, tmp_path, claude=FakeAnthropic())
+    r, db, fake = plex_runner(arr, tmp_path, claude=FakeAnthropic(), sync_after_upload=True)
     with caplog.at_level(logging.INFO, logger="oversaetter"):
         r.run_once()
     row = db.get("movie:1")
@@ -191,10 +288,10 @@ def test_sync_failure_is_warned_and_plex_still_called(arr, tmp_path, caplog, fai
     assert fake.calls[-1][0] == "/library/sections/1/refresh"
 
 
-def test_sync_timeout_is_warned_and_plex_still_called(arr, tmp_path, caplog):
+def test_own_sync_timeout_is_warned_and_plex_still_called(arr, tmp_path, caplog):
     movie_with_english(arr)
     arr.subtitle_sync_job = "running"  # bliver aldrig færdig
-    r, db, fake = plex_runner(arr, tmp_path, claude=FakeAnthropic())
+    r, db, fake = plex_runner(arr, tmp_path, claude=FakeAnthropic(), sync_after_upload=True)
     with caplog.at_level(logging.INFO, logger="oversaetter"):
         r.run_once()
     row = db.get("movie:1")
@@ -203,12 +300,12 @@ def test_sync_timeout_is_warned_and_plex_still_called(arr, tmp_path, caplog):
     assert fake.calls[-1][0] == "/library/sections/1/refresh"
 
 
-def test_hanging_sync_call_hits_timeout(arr, tmp_path, caplog, monkeypatch):
+def test_hanging_own_sync_call_hits_timeout(arr, tmp_path, caplog, monkeypatch):
     monkeypatch.setattr(synk, "SYNC_TIMEOUT", 0.2)
     monkeypatch.setattr(clients, "HARD_MARGIN", 0.2)
     movie_with_english(arr)
     arr.on_subtitle_sync = lambda form: arr.release.wait(30)
-    r, db, fake = plex_runner(arr, tmp_path, claude=FakeAnthropic())
+    r, db, fake = plex_runner(arr, tmp_path, claude=FakeAnthropic(), sync_after_upload=True)
     try:
         with caplog.at_level(logging.INFO, logger="oversaetter"):
             r.run_once()
@@ -219,26 +316,7 @@ def test_hanging_sync_call_hits_timeout(arr, tmp_path, caplog, monkeypatch):
     assert "ADVARSEL: Bazarr kunne ikke synkronisere den danske tekst til Film 1" in caplog.text
 
 
-def test_sync_after_upload_false_skips_sync(arr, tmp_path, caplog):
-    movie_with_english(arr)
-    r, db, fake = plex_runner(arr, tmp_path, claude=FakeAnthropic(), sync_after_upload=False)
-    with caplog.at_level(logging.INFO, logger="oversaetter"):
-        r.run_once()
-    assert arr.subtitle_syncs == []
-    row = db.get("movie:1")
-    assert row["bazarr_sync"] is None and row["plex_refresh"] == 1
-    assert "SYNC_AFTER_UPLOAD=false" in caplog.text
-
-
-def test_failed_upload_does_not_sync(arr, tmp_path):
-    movie_with_english(arr)
-    arr.upload_status = 500
-    r, db = runner(arr, tmp_path, claude=FakeAnthropic())
-    r.run_once()
-    assert arr.subtitle_syncs == [] and db.get("movie:1")["bazarr_sync"] is None
-
-
-def test_config_switch():
-    assert Config.from_env({}).sync_after_upload is True
-    assert Config.from_env({"SYNC_AFTER_UPLOAD": "false"}).sync_after_upload is False
+def test_config_switch_default_off():
+    assert Config.from_env({}).sync_after_upload is False
     assert Config.from_env({"SYNC_AFTER_UPLOAD": "true"}).sync_after_upload is True
+    assert Config.from_env({"SYNC_AFTER_UPLOAD": "false"}).sync_after_upload is False

@@ -1,7 +1,8 @@
 """Små klienter til Bazarr, Radarr, Sonarr og Seerr.
 
-Kun læsning - bortset fra disse kald til Bazarr: translate (lingarr-tilstand), upload af den danske tekst og
-"scan disk" for ét emne (direct-tilstand), søg efter dansk til ét emne og synkronisér med Radarr/Sonarr.
+Kun læsning - bortset fra disse kald til Bazarr: translate (lingarr-tilstand), upload, synk mod lyden og
+"scan disk" for den danske tekst til ét emne (direct-tilstand), søg efter dansk til ét emne og synkronisér med
+Radarr/Sonarr.
 Ingen af dem ændrer indstillinger.
 """
 
@@ -164,16 +165,35 @@ class Bazarr(_Api):
 
         POST /api/movies/subtitles?radarrid=.. eller /api/episodes/subtitles?seriesid=..&episodeid=.., multipart med
         file, language=da, forced=false og hi=false. Bazarr gemmer filen som <video>.da.srt, registrerer den og
-        kører sync/Sub-Zero som ved en manuel upload.
+        kører Sub-Zero som ved en manuel upload (synk mod lyden beder vi selv om bagefter, trin B6b).
         """
         if media_type == "movie":
             path, params = "/api/movies/subtitles", {"radarrid": media_id}
         else:
             path, params = "/api/episodes/subtitles", {"seriesid": series_id, "episodeid": media_id}
-        # Altid hi=false: vores danske tekst er almindelig, også når den engelske kilde var HI (trin B4f).
+        # Altid hi=false: vores danske tekst er almindelig, også når den engelske kilde var HI (trin B4f/B6b).
+        # Der er bevidst ingen hi-parameter: ingen kilde (hentet .srt, indlejret spor, HI/SDH) kan ændre det.
         form = {"language": "da", "forced": "false", "hi": "false"}
         files = {"file": (filename, content, "application/x-subrip")}
         self._request("POST", path, params, timeout_s, data=form, files=files)
+
+    def sync_subtitle(self, media_type: str, media_id: int, path: str, timeout_s: float) -> None:
+        """Bed Bazarr synkronisere den danske tekst mod lyden (samme kald som Sync-knappen, trin B6b).
+
+        PATCH /api/subtitles med action=sync, language=da, path=<tekstfilen som Bazarr ser den>, type=movie/episode,
+        id=radarrId/sonarrEpisodeId og samme forced=False/hi=False som uploaden. Nyere Bazarr lægger synken i
+        jobkøen og svarer med det samme.
+        """
+        form = {
+            "action": "sync",
+            "language": "da",
+            "path": path,
+            "type": "movie" if media_type == "movie" else "episode",
+            "id": str(media_id),
+            "forced": "False",
+            "hi": "False",
+        }
+        self._request("PATCH", "/api/subtitles", None, timeout_s, data=form)
 
     def scan_disk(self, media_type: str, media_id: int, series_id: int | None) -> None:
         """Bed Bazarr læse underteksterne på disken igen for én film (eller hele serien for et afsnit)."""

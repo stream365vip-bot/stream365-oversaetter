@@ -49,6 +49,11 @@ class FakeArr:
         self.upload_status = 204
         self.upload_saves = True  # som Bazarr: gem den uploadede fil som <video>.da.srt
         self.scan_calls: list[dict] = []
+        # Synk af den danske tekst mod lyden (PATCH /api/subtitles, action=sync)
+        self.subtitle_syncs: list[dict] = []
+        self.subtitle_sync_status = 204
+        self.subtitle_sync_job: str | None = "completed"  # status på synkjobbet; None = intet job (gammel Bazarr)
+        self.on_subtitle_sync = None  # funktion(form), fx til at notere rækkefølgen af kald
         self._job_id = 100
 
     # --- opsætning ----------------------------------------------------------------
@@ -198,11 +203,26 @@ class FakeArr:
             return httpx2.Response(200, json={"data": self.jobs})
         if path == "/api/subtitles" and req.method == "PATCH":
             form = {k: v[0] for k, v in parse_qs(req.content.decode()).items()}
+            if form.get("action") == "sync":
+                return self.subtitle_sync(form)
             self.translate_calls.append(form)
             if self.on_translate:
                 self.on_translate(form)
             return httpx2.Response(self.translate_status, text="")
         return httpx2.Response(404)
+
+    def subtitle_sync(self, form):
+        self.subtitle_syncs.append(form)
+        if self.on_subtitle_sync:
+            self.on_subtitle_sync(form)
+        if self.subtitle_sync_status != 204:
+            return httpx2.Response(self.subtitle_sync_status, text="nej")
+        if self.subtitle_sync_job is not None and self.jobs is not None:
+            self._job_id += 1
+            self.jobs.append(
+                {"job_id": self._job_id, "job_name": f"Syncing {form['path']}", "status": self.subtitle_sync_job}
+            )
+        return httpx2.Response(204, text="")
 
     def upload(self, req, path, q):
         head = f"Content-Type: {req.headers['content-type']}\r\n\r\n".encode()

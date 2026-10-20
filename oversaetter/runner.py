@@ -17,7 +17,15 @@ from .clients import GET_TIMEOUT, ApiError, Bazarr, Radarr, Seerr, SeerrIndex, S
 from .config import Config
 from .credit import apply_credit
 from .db import Database, iso
-from .direct import CALL_TIMEOUT, UPLOADED, DirectTranslator, NoEnglish, english_cues, english_source
+from .direct import (
+    CALL_TIMEOUT,
+    UPLOADED,
+    DbBatchIds,
+    DirectTranslator,
+    NoEnglish,
+    english_cues,
+    english_source,
+)
 from .plex import refresh_folder
 from .postprocess import make_client, postprocess
 from .proofread import DbBudget
@@ -455,6 +463,7 @@ class Runner:
             self.clock,
             context_for=self.context_for,
             glossaries_for=self.glossaries_for,
+            batch_ids=DbBatchIds(self.db),
         )
         out = direct.translate(cand, en, desc, label, by_name)
         self.db.upsert(cand.key, en_hi=int(out.en_hi))
@@ -590,7 +599,21 @@ class Runner:
         if self.cfg.direct and mtime and started and mtime > started.timestamp():
             # Filen nåede at blive afleveret (af Bazarr eller os selv) - den er allerede efterbehandlet.
             log.info("%s blev afleveret, før programmet stoppede - markeres som færdig", row["title"])
-            self.db.upsert(row["key"], status="faerdig", reason="direkte: afleveret før genstart")
+            self.db.upsert(row["key"], status="faerdig", reason="direkte: afleveret før genstart", batch_id=None)
+        elif self.cfg.direct and row["batch_id"]:
+            # BATCH_API: programmet stoppede, mens det ventede på batchen. Den er betalt - svarene hentes i første
+            # runde i stedet for at sende igen, og genstarten tæller ikke som et forsøg.
+            log.info(
+                "%s ventede på batch %s, da programmet stoppede - svarene hentes i første runde",
+                row["title"],
+                row["batch_id"],
+            )
+            self.db.upsert(
+                row["key"],
+                status="forsoeg_igen",
+                attempts=max(0, (row["attempts"] or 0) - 1),
+                reason=f"programmet blev stoppet under ventetiden på batch {row['batch_id']}",
+            )
         elif mtime and started and mtime > started.timestamp():
             log.info("Genoptager efterbehandling af %s", row["title"])
             source = row["source"] if row["source"] and not row["source"].startswith("subtitles_id:") else None
@@ -651,6 +674,11 @@ class Runner:
                 self.cfg.max_fix_lines,
             )
             log.info("Kontakter: %s", self.cfg.switches())
+            if self.cfg.batch_api:
+                log.info(
+                    "BATCH_API=true: bid 2 og frem sendes som én Message Batch (halv pris), højst %g min ventetid",
+                    self.cfg.batch_timeout_minutes,
+                )
             if self.cfg.proofread_keys:
                 log.info(
                     "%s i .env bruges ikke i TRANSLATE_MODE=direct og ignoreres", ", ".join(self.cfg.proofread_keys)

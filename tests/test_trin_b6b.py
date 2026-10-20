@@ -6,15 +6,27 @@ derefter HI-mærket og beder først så Plex scanne. Vores egen synk (SYNC_AFTER
 Alle tekster er selvskrevne.
 """
 
+import json
 import logging
 import os
 
 import pytest
 
-from oversaetter import clients, synk
+from oversaetter import clients, hi, synk
 from oversaetter.config import Config
 from tests.fakes import FakeArr, embedded, en_sub
-from tests.test_direct import EN, FakeAnthropic, FakeCommands, movie_with_english, runner, stream
+from tests.helpers import cue, srt
+from tests.test_direct import (
+    DANISH,
+    EN,
+    FakeAnthropic,
+    FakeCommands,
+    movie_with_english,
+    payload,
+    reply,
+    runner,
+    stream,
+)
 from tests.test_trin_b4g import TOKEN, FakePlex, with_plex
 
 
@@ -320,3 +332,115 @@ def test_config_switch_default_off():
     assert Config.from_env({}).sync_after_upload is False
     assert Config.from_env({"SYNC_AFTER_UPLOAD": "true"}).sync_after_upload is True
     assert Config.from_env({"SYNC_AFTER_UPLOAD": "false"}).sync_after_upload is False
+
+
+# --- 4) ♪ ud før oversættelsen, uanset kilde og placering - og aldrig til Bazarr --------------------------------
+LYRICS_SDH = srt(
+    ("00:00:10,000", "00:00:12,000", "Where is the car?"),
+    ("00:00:13,000", "00:00:15,000", "♪ Oh, Brookie, we love you ♪"),  # begge ender
+    ("00:00:16,000", "00:00:18,000", "♪ I've been"),  # først
+    ("00:00:19,000", "00:00:21,000", "inside my head ♪"),  # sidst
+    ("00:00:22,000", "00:00:24,000", "‪♪ Brookie, Brookie ♪‬"),  # Amazons usynlige retningstegn
+    ("00:00:25,000", "00:00:27,000", '"♪ Happy birthday ♪"'),  # i citationstegn
+    ("00:00:28,000", "00:00:30,000", "She sang ♪ la la ♪ all night."),  # midt i
+    ("00:00:31,000", "00:00:33,000", "- ♪ Oh, Brookie ♪\n- Thank you."),
+    ("00:00:34,000", "00:00:36,000", "# Lyric line with hash #"),
+    ("00:00:37,000", "00:00:39,000", "I have 3 sisters."),
+)
+
+
+def keeps_notes(kwargs):
+    """Falsk model, der beholder ♪ i oversættelsen, hvis den engelske replik har dem."""
+    lines = [
+        {"i": x["i"], "da": f"♪ Dansk {x['i']} ♪" if "♪" in x["en"] else DANISH.get(x["en"], f"Dansk {x['i']}")}
+        for x in payload(kwargs)["lines"]
+    ]
+    return reply(json.dumps({"lines": lines}, ensure_ascii=False))
+
+
+def assert_no_notes(arr, claude, video):
+    sent = [x["en"] for r in claude.requests if "lines" in payload(r) for x in payload(r)["lines"]]
+    assert sent and not any("♪" in t or "#" in t for t in sent), sent  # ingen sang sendt til modellen
+    assert sent == ["Where is the car?", "I have 3 sisters."]
+    content = arr.uploads[0]["content"]
+    assert "♪" not in content and "♫" not in content
+    assert "Hvor er bilen?" in content and "Jeg har 3 søstre." in content
+    assert open(os.path.splitext(video)[0] + ".da.srt", encoding="utf-8").read() == content
+
+
+def test_embedded_sdh_track_with_lyrics_gives_no_notes(arr, tmp_path):
+    video = arr.add_movie(1, 101, {"days": 2}, [{**embedded("en", 11225, track=3), "hi": True}])
+    commands = FakeCommands(streams=[stream(3, title="English [SDH]", hi=1)], track_srt=LYRICS_SDH)
+    claude = FakeAnthropic(translate=keeps_notes)
+    r, db = runner(arr, tmp_path, claude=claude, commands=commands)
+    r.run_once()
+    assert [c[0] for c in commands.calls] == ["ffprobe", "ffmpeg"]
+    assert db.get("movie:1")["status"] == "faerdig"
+    assert_no_notes(arr, claude, video)
+
+
+def test_downloaded_en_hi_srt_with_lyrics_gives_no_notes(arr, tmp_path):
+    video = arr.add_movie(1, 101, {"days": 2}, [])
+    en_path = os.path.splitext(video)[0] + ".en.hi.srt"
+    with open(en_path, "w", encoding="utf-8") as f:
+        f.write(LYRICS_SDH)
+    arr.movies[1]["subtitles"] = [en_sub(en_path, hi=True)]
+    claude = FakeAnthropic(translate=keeps_notes)
+    r, db = runner(arr, tmp_path, claude=claude)
+    r.run_once()
+    assert db.get("movie:1")["status"] == "faerdig"
+    assert_no_notes(arr, claude, video)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "♪ Oh, Brookie ♪",
+        "♪ I've been",
+        "inside my head ♪",
+        "‪♪ Brookie ♪‬",
+        '"♪ Happy birthday ♪"',
+        "She sang ♪ la la ♪ all night.",
+        "♫ Oh, Brookie ♫",
+        "<i>♪ Oh, Brookie ♪</i>",
+        "{\\an8}♪ Oh, Brookie ♪",
+        "– ♪ Oh, Brookie ♪",
+        "♪ I've been\ninside my head ♪",
+        "Okay.\n♪ la la",
+    ],
+)
+def test_clean_drops_every_cue_with_notes(text):
+    r = hi.clean([cue(0, 1, text), cue(2, 3, "Hello.")], quiet=True)
+    assert [c.text for c in r.cues] == ["Hello."]
+
+
+def test_clean_keeps_numbers_and_hashtags():
+    r = hi.clean([cue(0, 1, "#1 fan"), cue(2, 3, "Call me, #2.")], quiet=True)
+    assert [c.text for c in r.cues] == ["#1 fan", "Call me, #2."]
+
+
+def test_notes_added_by_model_are_removed_before_upload(arr, tmp_path, caplog):
+    """Sidste sikkerhed: selv hvis modellen skriver ♪ i en almindelig replik, får Bazarr den aldrig."""
+    video, _ = movie_with_english(arr)
+
+    def adds_notes(kwargs):
+        lines = [
+            {"i": x["i"], "da": "♪ Hvor er bilen? ♪" if x["en"] == "Where is the car?" else DANISH[x["en"]]}
+            for x in payload(kwargs)["lines"]
+        ]
+        return reply(json.dumps({"lines": lines}, ensure_ascii=False))
+
+    r, db = runner(arr, tmp_path, claude=FakeAnthropic(translate=adds_notes))
+    with caplog.at_level(logging.INFO, logger="oversaetter"):
+        r.run_once()
+    assert db.get("movie:1")["status"] == "faerdig"
+    content = arr.uploads[0]["content"]
+    assert "♪" not in content and "Hvor er bilen?" not in content and "Jeg har 3 søstre." in content
+    warning = next(x for x in caplog.records if x.levelname == "WARNING")
+    assert warning.message.startswith("ADVARSEL: 1 danske replikker i Film 1 indeholdt stadig ♪")
+    assert "♪ Hvor er bilen? ♪" in warning.message
+
+
+def test_drop_note_cues():
+    kept, removed = hi.drop_note_cues([cue(0, 1, "Hej."), cue(2, 3, "♪ la"), cue(4, 5, "Nej ♫")])
+    assert [c.text for c in kept] == ["Hej."] and [c.text for c in removed] == ["♪ la", "Nej ♫"]

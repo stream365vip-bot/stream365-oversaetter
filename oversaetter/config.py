@@ -120,7 +120,7 @@ class Config:
     # Trin B2 (18.10.2026)
     reading_speed_max: float = 25.0  # tegn pr. sekund; reading_speed er kun et informationsflag
     prompt_cache: bool = True  # PROMPT_CACHE: systeminstruksen markeres til Anthropics prompt-cache
-    # Trin B4c (18.10.2026): linjer, der starter eller slutter med ♪/#, fjernes fra den engelske kilde (sangtekst)
+    # Trin B4c/B6b: replikker med ♪/♫ et sted eller # først/sidst fjernes fra den engelske kilde (sangtekst)
     drop_lyrics: bool = True
     # Trin B6 (19.10.2026): bid 2 og frem som én Anthropic Message Batch (halv pris). Standard fra.
     batch_api: bool = False

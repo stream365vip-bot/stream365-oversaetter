@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import unicodedata
 from dataclasses import dataclass, field, replace
 
 from .srt import Cue
@@ -131,7 +132,9 @@ _SOUND_RE = re.compile(r"^(?:" + "|".join(re.escape(w) for w in SOUND_WORDS) + r
 BRACKET_RE = re.compile(r"\[([^\[\]]*)\]|\(([^()]*)\)")
 TAG_RE = re.compile(r"<[^>]+>|\{[^}]*\}")
 EMPTY_TAG_RE = re.compile(r"<(i|b|u)>(\s*)</\1>", re.IGNORECASE)
-MUSIC = "♪#"
+MUSIC = "♪♫#"
+NOTES = "♪♫"  # nodetegn: en replik med et af dem et sted er altid sang (trin B6b), Bazarr mærker dem som HI
+QUOTES = "\"'“”„«»"
 
 # "NAVN:" eller "- NAVN:" først i linjen: 1-3 ord med store bogstaver, mindst to bogstaver i alt. Efter første ord
 # må et tal stå ("REPORTER 1:", trin B4c).
@@ -212,20 +215,35 @@ def _remove_sounds(text: str, stats: HiStats) -> str:
     return text.replace("\x00", " ")
 
 
+def _bare(text: str) -> str:
+    """Teksten uden tags, usynlige formattegn (fx Amazons retningstegn U+202A/U+202C), citationstegn og
+    indledende talerstreg - så "\u202a♪ Oh ♪\u202c" og '"♪ Oh ♪"' ses som sang (trin B6b)."""
+    p = "".join(c for c in _plain(text) if unicodedata.category(c) != "Cf")
+    p = p.strip().strip(QUOTES).strip()
+    return re.sub(r"^[-–]\s*", "", p).strip(QUOTES).strip()
+
+
+def has_notes(text: str) -> bool:
+    """Teksten indeholder et nodetegn (♪/♫) et eller andet sted."""
+    return any(n in text for n in NOTES)
+
+
 def _is_music(line: str, drop_lyrics: bool = True) -> bool:
     """Linjen består kun af ♪/# eller er en sanglinje markeret med ♪ ... ♪ (eller # ... #).
 
-    drop_lyrics (DROP_LYRICS, trin B4c): også linjer, der kun starter eller kun slutter med ♪/#
-    ("♪ Oh say can you see"). Har én linje i en replik det, droppes hele replikken (trin B4d).
+    drop_lyrics (DROP_LYRICS, trin B4c): også linjer, der kun starter eller kun slutter med #, og (trin B6b) alle
+    linjer med ♪/♫ et sted - først, sidst, i begge ender eller midt i. Har én linje i en replik det, droppes hele
+    replikken (trin B4d).
     """
-    p = _plain(line).strip()
-    p = re.sub(r"^-\s*", "", p)
+    p = _bare(line)
     if not p:
         return False
     if all(c in MUSIC or c.isspace() for c in p):
         return True
     if drop_lyrics:
-        return (p[0] in MUSIC and not p[1:2].isdigit()) or p[-1] in MUSIC  # "#1 fan" er ikke sang
+        if has_notes(p):
+            return True
+        return (p[0] == "#" and not p[1:2].isdigit()) or p[-1] == "#"  # "#1 fan" er ikke sang
     return p[0] in MUSIC and p[-1] in MUSIC
 
 
@@ -269,7 +287,7 @@ def _clean_cue(text: str, stats: HiStats, drop_lyrics: bool = True) -> tuple[lis
     """Rens én replik. Returnerer (linjer, taler pr. linje)."""
     text = _remove_sounds(text, stats)
     lines = text.split("\n")
-    whole = _plain(" ".join(lines)).strip()
+    whole = _bare(" ".join(lines))
     if len(lines) > 1 and whole and whole[0] in MUSIC and whole[-1] in MUSIC:
         stats.music += len([x for x in lines if _plain(x).strip()])
         lines = []  # sang over flere linjer: ♪ første linje / anden linje ♪
@@ -345,7 +363,8 @@ def clean(cues: list[Cue], quiet: bool = False, drop_lyrics: bool = True) -> HiR
     """Rens den engelske kilde. Logger tallene én gang, hvis der blev fjernet noget (ikke med quiet=True).
 
     drop_lyrics=False (DROP_LYRICS=false): kun linjer med kun ♪/# eller ♪ ... ♪ fjernes, som før trin B4c.
-    drop_lyrics=True: har én linje i en replik ♪/# i starten eller slutningen, droppes hele replikken (trin B4d).
+    drop_lyrics=True: har én linje i en replik # i starten eller slutningen eller ♪/♫ et sted, droppes hele replikken
+    (trin B4d/B6b).
     """
     stats = HiStats()
     out: list[Cue] = []
@@ -362,6 +381,13 @@ def clean(cues: list[Cue], quiet: bool = False, drop_lyrics: bool = True) -> HiR
     if stats.any() and not quiet:
         log.info("HI-rensning: %s", stats.text())
     return HiResult(out, notes, list(names), stats)
+
+
+def drop_note_cues(cues: list[Cue]) -> tuple[list[Cue], list[Cue]]:
+    """Sidste sikkerhed før upload (trin B6b): fjern danske replikker, der stadig har ♪/♫. Returnerer (beholdt,
+    fjernet). Bazarr mærker en tekst med ♪ ... ♪ som HI, når den gemmer den."""
+    kept = [c for c in cues if not has_notes(c.text)]
+    return kept, [c for c in cues if has_notes(c.text)]
 
 
 def passthrough(cues: list[Cue]) -> HiResult:

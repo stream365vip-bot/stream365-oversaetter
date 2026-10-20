@@ -563,6 +563,15 @@ class DirectTranslator:
         after = fix_flags(check_all(da, en_index, cfg.max_line_chars, bad_words, wordlist, strict, speed))
         outcome.flags_after = len([p for p in after if p not in kept_english])
 
+        # Sidste sikkerhed (trin B6b): Bazarr må aldrig få ♪ - den mærker ellers teksten som HI, når den gemmer den.
+        da, notes = hi.drop_note_cues(da)
+        if notes:
+            log.warning(
+                "ADVARSEL: %d danske replikker i %s indeholdt stadig ♪ og er fjernet før upload: %s",
+                len(notes),
+                cand.title,
+                " | ".join(c.text.replace("\n", " / ") for c in notes[:3]),
+            )
         final, outcome.credit = apply_credit(da, cfg.credit_text)
         work = self.work_path(cand)
         os.makedirs(os.path.dirname(work), exist_ok=True)

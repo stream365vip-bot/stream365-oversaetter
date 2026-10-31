@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx2 as httpx
 
-from . import feed, kontekst
+from . import feed, kontekst, status
 from .clients import GET_TIMEOUT, ApiError, Bazarr, Radarr, Seerr, SeerrIndex, Sonarr, parse_date
 from .config import Config
 from .credit import apply_credit
@@ -76,6 +76,10 @@ class Runner:
         self.pause_until: float | None = None
         self.pause_kind = ""
         self.pause_at: datetime | None = None
+        # Trin B11 (læses af status-jobbet): titler valgt til oversættelse, der ikke er behandlet endnu, og hvornår
+        # (time.time) den igangværende titels Message Batch blev sendt (None = venter ikke på en batch).
+        self.queue = 0
+        self.batch_since: float | None = None
 
     # --- én runde -----------------------------------------------------------------
     def run_once(self) -> list[Candidate]:
@@ -116,10 +120,12 @@ class Runner:
             stats.lookup_errors,
             stats.unknown,
         )
+        self.queue = len(candidates)
         for cand in candidates:
             if self.stopping or self.in_pause():
                 break
             self.process(cand)
+            self.queue = max(0, self.queue - 1)
         return candidates
 
     # --- pause ved udgiftsgrænse/nøglefejl (trin B8) ------------------------------------------------
@@ -507,6 +513,7 @@ class Runner:
                 f"{self.pause_at:%H:%M}",
             )
         self.current = None
+        self.batch_since = None
 
     def _translate_direct(self, cand: Candidate, cfg: Config, budget: DbBudget, attempts: int) -> None:
         try:
@@ -524,7 +531,7 @@ class Runner:
             self.clock,
             context_for=self.context_for,
             glossaries_for=self.glossaries_for,
-            batch_ids=DbBatchIds(self.db),
+            batch_ids=DbBatchIds(self.db, on_save=self._batch_saved),
         )
         out = direct.translate(cand, en, desc, label, by_name)
         self.db.upsert(cand.key, en_hi=int(out.en_hi))
@@ -560,6 +567,12 @@ class Runner:
         # Trin B7: til sidst, så en HI-advarsel fra synken kommer med. Fejler aldrig.
         note = "; ".join(warnings) or f"{out.flags_before} flag"
         self._feed(cand.title, cand.media_type, "done", out.lines, out.seconds, out.cost, note)
+
+    def _batch_saved(self, batch_id: str | None) -> None:
+        if batch_id is None:
+            self.batch_since = None
+        elif self.batch_since is None:
+            self.batch_since = time.time()
 
     def context_for(self, cand: Candidate) -> str | None:
         """CONTEXT=on: filmkonteksten fra Radarr/Sonarr (og TMDB, hvis der er en nøgle). Fejler aldrig."""
@@ -749,6 +762,7 @@ class Runner:
     def _unexpected(self, e: Exception) -> None:
         """Uventet fejl i løkken: log hele fejlen, markér emnet til nyt forsøg, og fortsæt med næste runde."""
         log.exception("Uventet fejl i hovedløkken: %s: %s - fortsætter med næste runde", type(e).__name__, e)
+        self.batch_since = None
         if self.current is None:
             return
         key, title = self.current
@@ -819,4 +833,6 @@ class Runner:
 def main(cfg: Config) -> None:
     db = Database(os.path.join(cfg.data_dir, "oversaetter.db"))
     client = make_client(cfg, CALL_TIMEOUT / 60 if cfg.direct else None)
-    Runner(cfg, db, claude=client).loop()
+    runner = Runner(cfg, db, claude=client)
+    status.start(cfg, runner)  # trin B11: egen tråd, påvirker aldrig driften
+    runner.loop()

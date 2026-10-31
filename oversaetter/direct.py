@@ -351,8 +351,9 @@ def fix_flagged(
 class DbBatchIds:
     """BATCH_API: batchens id på titlen (items.batch_id), fra den er sendt, til svarene er hentet."""
 
-    def __init__(self, db):
+    def __init__(self, db, on_save=None):
         self.db = db
+        self.on_save = on_save  # trin B11: kaldes med id'et (eller None), så status-jobbet kan se batch-ventetiden
 
     def saved(self, key: str) -> str | None:
         row = self.db.get(key)
@@ -360,6 +361,8 @@ class DbBatchIds:
 
     def save(self, key: str, batch_id: str | None) -> None:
         self.db.upsert(key, batch_id=batch_id)
+        if self.on_save is not None:
+            self.on_save(batch_id)
 
 
 class DirectTranslator:

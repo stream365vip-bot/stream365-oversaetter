@@ -49,9 +49,10 @@ sudo mkdir -p /opt/oversaetter/secrets
 #    tmdb_api_key.txt er valgfri (filmkontekst fra TMDB, se "Bedre og hurtigere oversættelse").
 #    plex_token.txt er valgfri (Plex scanner mappen efter upload, se "Trin B4g").
 #    feed_token.txt er valgfri (færdige oversættelser sendes til appen, se "Trin B7").
+#    qbittorrent.txt er valgfri ("bruger:kode" til download-hastigheden i serverstatus, se "Trin B11").
 sudo touch /opt/oversaetter/secrets/deepseek_api_key.txt /opt/oversaetter/secrets/gemini_api_key.txt \
   /opt/oversaetter/secrets/tmdb_api_key.txt /opt/oversaetter/secrets/plex_token.txt \
-  /opt/oversaetter/secrets/feed_token.txt
+  /opt/oversaetter/secrets/feed_token.txt /opt/oversaetter/secrets/qbittorrent.txt
 sudo chown 1000:1000 /opt/oversaetter/secrets/*.txt
 sudo chmod 600 /opt/oversaetter/secrets/*.txt
 
@@ -195,7 +196,8 @@ Nøgler:
 | gemini | `/opt/oversaetter/secrets/gemini_api_key.txt` |
 | TMDB (kontekst, valgfri) | `/opt/oversaetter/secrets/tmdb_api_key.txt` |
 | Plex (scanning efter upload, valgfri) | `/opt/oversaetter/secrets/plex_token.txt` |
-| Appens backend (feed, valgfri) | `/opt/oversaetter/secrets/feed_token.txt` |
+| Appens backend (feed og serverstatus, valgfri) | `/opt/oversaetter/secrets/feed_token.txt` |
+| qBittorrent (serverstatus, valgfri, `bruger:kode`) | `/opt/oversaetter/secrets/qbittorrent.txt` |
 
 Skriv nøglen i filen med `sudo nano` (kun nøglen, én linje). Mangler en nøgle, stopper kun testtilstanden med en dansk besked – driften kører videre.
 
@@ -396,6 +398,30 @@ Loggen viser, hvad der blev slettet. Passer titlen på flere rækker, slettes in
   - `.env`: `PROVIDER_WAIT=true|false` (standard `true`; `false` = ingen ventetid som før B9), `PROVIDER_WAIT_DAYS_MOVIES` og `PROVIDER_WAIT_DAYS_SERIES`. Reglen om dansk lyd gælder altid.
   - Se ventende titler: `SELECT title, dk_providers, wait_started_at FROM items WHERE status = 'venter_paa_dansk'`.
 
+- **Trin B11: serverstatus til appen** (31.10.2026): hvert 5. minut sendes **ét** `POST` til `STATUS_URL` (i drift `https://stream365-backend-production.up.railway.app/status/feeder`) med headeren `X-Oversaetter-Token` (samme token som feedet, `FEED_TOKEN_FILE`) og JSON med serverens tilstand. Jobbet kører i sin egen tråd ved siden af driften og **må aldrig påvirke oversættelsen**: det læser kun, databasen åbnes skrivebeskyttet på sin egen forbindelse, alle fejl fanges, hvert kald har en grænse på 10 sekunder, alle målinger kører samtidig med en fælles frist på 45 sekunder, og hele jobbet tager højst 60 sekunder. Hænger en måling (fx et hængende mount), udelades feltet, og der startes ikke en ny måling, før den gamle er færdig.
+  - **Felter** (alle valgfri – et felt, der ikke kan læses, udelades, og årsagen logges én gang: `Status: seerr_pending udelades - Seerr svarede med HTTP 401 ...`; virker det igen: `Status: seerr_pending virker igen`):
+
+  | Felt | Kilde |
+  |---|---|
+  | `disk_free_gb` | ledig plads på `STATUS_DISK_PATH` (standard `/`, containerens rod = serverens Docker-disk) |
+  | `unionfs_free_gb` | ledig plads på `STATUS_UNIONFS_PATH` (standard `/mnt/unionfs`) |
+  | `mount_ok` | `STATUS_MOUNT_FILE` (eller mappen `/mnt/unionfs/Media`) kan læses inden for 5 sekunder |
+  | `containers_down` | navne fra `STATUS_CONTAINERS`, der ikke kører (kun via en docker-socket-proxy, se nedenfor) |
+  | `cpu_pct`, `ram_pct`, `load`, `uptime_days` | `/proc/stat`, `/proc/meminfo`, `/proc/loadavg`, `/proc/uptime`. Uden lxcfs viser de serverens egne tal, også inde i containeren. CPU er gennemsnittet siden forrige besked (første gang over 1 sekund) |
+  | `radarr_queue`, `sonarr_queue` | `GET /api/v3/queue` → `totalRecords` |
+  | `failed_downloads` | køposter (Radarr + Sonarr, de første 500 af hver) med `status` warning/failed eller `trackedDownloadStatus` warning/error |
+  | `download_speed_mbps` | qBittorrent `GET /api/v2/transfer/info` (`dl_info_speed` × 8 / 1.000.000) |
+  | `seerr_pending` | Seerr-ønsker med status pending |
+  | `bazarr_wanted_movies`, `bazarr_wanted_episodes` | Bazarrs wanted-lister (`total`) |
+  | `bazarr_no_english` | titler, scriptet har noteret uden engelsk kilde (`status = 'mangler_engelsk'`) |
+  | `plex_streams`, `plex_transcodes`, `plex_bandwidth_mbps` | Plex `GET /status/sessions` (afspilninger, video-transcodes, samlet båndbredde). Bruger `PLEX_URL` og `plex_token.txt` fra trin B4g. Erstatter en Tautulli/Tracearr-widget. Standard `STATUS_PLEX=false` (udelades), indtil backenden kender felterne |
+  | `translator` | `state` (`i_gang`, `venter` = venter på en Message Batch, `pause` = trin B8-pause, `ledig`), `title`, `batch_wait_min`, `queue` (titler valgt til oversættelse i runden, der ikke er behandlet endnu), `waiting_for_danish`, `failed` (status `fejlet`, ændret i denne måned), `month_usd` (scriptets eget forbrug, som budgettet), `budget_usd`, `pause_until` |
+
+  - **Docker** (`containers_down`): Docker-socket'en monteres **ikke** i oversætteren (`:ro` begrænser ikke Docker-API'et – den, der kan bruge socket'en, kan styre alle containere). Feltet virker kun via en docker-socket-proxy på Docker-netværket, fx `tecnativa/docker-socket-proxy` med kun `CONTAINERS=1` (alt andet slået fra), og `STATUS_DOCKER=http://dockerproxy:2375` i `.env`. Jobbet laver kun `GET /containers/json`. Standard er `STATUS_DOCKER` tom: så udelades feltet med én INFO-linje (`Status: containers_down udelades - STATUS_DOCKER er tom ...`). En værdi, der ikke er en http-adresse (fx en socket-sti), afvises på samme måde.
+  - **qBittorrent**: `QBITTORRENT_URL` (Web UI-adressen på Docker-netværket, fx `http://qbittorrent:8080`) og `bruger:kode` i `/opt/oversaetter/secrets/qbittorrent.txt` (kun det første `:` deler). Mangler en af dem, udelades `download_speed_mbps` med én INFO-linje. Login og kode logges aldrig.
+  - **Backenden**: ingen genforsøg (næste besked kommer om 5 minutter). Svarer backenden med fejl (fx HTTP 500) eller ikke inden for 10 sekunder, logges én WARNING (`Status: POST udelades - backenden svarede med HTTP 500`) – og først igen, hvis årsagen ændrer sig. Virker det igen: `Status: sendt igen til ...`. Driften er upåvirket.
+  - `.env`: `STATUS_URL` (standard tom = slået fra, én INFO-linje ved opstart), `STATUS_CONTAINERS`, `STATUS_DOCKER` (standard tom), `STATUS_DISK_PATH`, `STATUS_UNIONFS_PATH`, `STATUS_MOUNT_FILE`, `STATUS_PLEX` (standard `false`), `QBITTORRENT_URL` og `QBITTORRENT_FILE` (se `.env.example`).
+
 ## Hvis noget går galt
 
 - Mislykkes en oversættelse, prøves den igen ved næste runde. Går det galt igen, markeres den som "fejlet" og prøves ikke igen automatisk.
@@ -412,6 +438,7 @@ Loggen viser, hvad der blev slettet. Passer titlen på flere rækker, slettes in
 - Rammer hovedløkken en uventet fejl, logges hele fejlen, emnet markeres som "forsoeg_igen", og løkken fortsætter med næste runde.
 - Ved opstart genoptages emner, der stod som "i_gang" (fx efter genstart), og loggen skriver hvilke.
 - `Feed: kunne ikke sende ...` – appen har ikke fået linjen til RSS-widgeten (se "Trin B7"). Oversættelsen er ikke påvirket. Ved `HTTP 401` er tokenet i `/opt/oversaetter/secrets/feed_token.txt` forkert eller tomt.
+- `Status: ... udelades - ...` – ét felt i serverstatus kunne ikke læses (se "Trin B11"). Oversættelsen er ikke påvirket. `Status: POST udelades - backenden svarede med HTTP 401` betyder, at tokenet i `feed_token.txt` ikke er det samme som `OVERSAETTER_TOKEN` i backenden.
 - (BATCH_API) Stoppede programmet, mens det ventede på en batch, hentes svarene fra den gemte batch i første runde efter opstart - der sendes ikke en ny (se "Trin B6").
 
 ## For udviklere

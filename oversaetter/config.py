@@ -18,7 +18,7 @@ PROOFREAD_KEYS = (
 TRANSLATE_MODES = ("direct", "lingarr")
 PROMPT_VERSIONS = ("v3", "v4")
 # Felter hvor en tom værdi i .env betyder "slået fra" i stedet for "brug standard".
-EMPTY_ALLOWED = ("credit_text", "feed_url")
+EMPTY_ALLOWED = ("credit_text", "feed_url", "status_url", "qbittorrent_url", "status_mount_file", "status_docker")
 
 # Priser i USD pr. million tokens (ind, ud) til testtilstanden oversaet-test. Ukendt model = "pris ukendt".
 MODEL_PRICES: dict[str, tuple[float, float]] = {
@@ -103,6 +103,16 @@ class Config:
     feed_url: str = ""
     feed_token_file: str = "/run/secrets/feed_token"
     usd_to_dkk: float = 6.7  # cost_dkk = cost_usd × USD_TO_DKK
+    # Trin B11: serverstatus til appens backend hvert 5. minut (samme token som feedet). Tom STATUS_URL = slået fra.
+    status_url: str = ""
+    status_containers: str = "plex,bazarr,radarr,sonarr2,qbittorrent,autoscan,seerr"
+    status_docker: str = ""  # docker-socket-proxy (http://...) til containers_down; tom = feltet udelades
+    status_disk_path: str = "/"
+    status_unionfs_path: str = "/mnt/unionfs"
+    status_mount_file: str = ""  # tom = mappen <unionfs>/Media skal kunne læses
+    status_plex: bool = False  # plex_streams/plex_transcodes/plex_bandwidth_mbps - til, når backenden kender dem
+    qbittorrent_url: str = ""
+    qbittorrent_file: str = "/run/secrets/qbittorrent"  # "bruger:kode"
     # Trin B8: Anthropic afviser kontoen (udgiftsgrænse, ingen credits, ugyldig nøgle) - så længe holdes der pause.
     account_pause_minutes: float = 30.0
     # Trin B9: titler på en dansk streamingtjeneste (TMDB, DK) venter så mange dage på en officiel dansk tekst.
@@ -180,9 +190,10 @@ class Config:
             else:
                 value = raw
             setattr(cfg, field, value)
-        for name in ("bazarr_url", "radarr_url", "sonarr_url", "seerr_url", "plex_url"):
+        for name in ("bazarr_url", "radarr_url", "sonarr_url", "seerr_url", "plex_url", "qbittorrent_url"):
             setattr(cfg, name, getattr(cfg, name).rstrip("/"))
         cfg.feed_url = cfg.feed_url.strip()
+        cfg.status_url = cfg.status_url.strip()
         cfg.translate_mode = cfg.translate_mode.strip().lower()
         if cfg.translate_mode not in TRANSLATE_MODES:
             raise ValueError(f"TRANSLATE_MODE={cfg.translate_mode!r} i .env er ukendt - brug direct eller lingarr")

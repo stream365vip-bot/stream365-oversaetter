@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS items (
     media_id INTEGER NOT NULL,
     title TEXT,
     status TEXT NOT NULL,          -- soeger, soegt, mangler_engelsk, i_gang, faerdig, forsoeg_igen, fejlet,
-                                   -- sprunget_over, ikke_muligt
+                                   -- sprunget_over, ikke_muligt, venter_paa_dansk
     attempts INTEGER NOT NULL DEFAULT 0,
     reason TEXT,
     video_path TEXT,
@@ -35,7 +35,10 @@ CREATE TABLE IF NOT EXISTS items (
     plex_refresh INTEGER,          -- 1 = Plex bedt om at scanne mappen, 0 = fejlede (NULL = ikke forsøgt)
     bazarr_sync INTEGER,           -- 1 = Bazarr har synkroniseret den danske tekst, 0 = fejlede (NULL = ikke forsøgt)
     batch_id TEXT,                 -- Anthropic Message Batch, der er sendt, men hvis svar ikke er hentet (BATCH_API)
-    disk_scan_at TEXT              -- Bazarr er bedt om "Scan Disk", fordi der ikke var nogen engelsk kilde (trin B8)
+    disk_scan_at TEXT,             -- Bazarr er bedt om "Scan Disk", fordi der ikke var nogen engelsk kilde (trin B8)
+    dk_providers TEXT,             -- danske streamingtjenester (JSON-liste) fra TMDB, seneste opslag (trin B9)
+    providers_checked_at TEXT,     -- tidspunkt for seneste opslag af tjenesterne (trin B9)
+    wait_started_at TEXT           -- titlen begyndte at vente på en officiel dansk tekst (trin B9)
 );
 CREATE TABLE IF NOT EXISTS spend (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,6 +48,11 @@ CREATE TABLE IF NOT EXISTS spend (
     input_tokens INTEGER,
     output_tokens INTEGER,
     cost_usd REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS lookups (
+    key TEXT PRIMARY KEY,          -- trin B9, fx "providers:tv:1399", "lang:movie:550", "audio:episode:12"
+    value TEXT,                    -- svaret som JSON
+    checked_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS providers (
     name TEXT PRIMARY KEY,         -- Bazarrs navn på tjenesten, fx "opensubtitlescom"
@@ -66,6 +74,9 @@ NEW_COLUMNS = {
         "bazarr_sync": "INTEGER",
         "batch_id": "TEXT",
         "disk_scan_at": "TEXT",
+        "dk_providers": "TEXT",
+        "providers_checked_at": "TEXT",
+        "wait_started_at": "TEXT",
     }
 }
 
@@ -123,8 +134,31 @@ class Database:
         return list(self.conn.execute("SELECT * FROM items WHERE lower(title) = lower(?)", (title.strip(),)))
 
     def delete(self, key: str) -> None:
-        """Slet emnets række (med ordlisten), så næste runde behandler det forfra (`glem`, trin B4f)."""
+        """Slet emnets række (med ordlisten), så næste runde behandler det forfra (`glem`, trin B4f).
+
+        Ventetiden (trin B9) står på rækken og nulstilles dermed; filens lydspor undersøges også forfra.
+        """
         self.conn.execute("DELETE FROM items WHERE key = ?", (key,))
+        self.conn.execute("DELETE FROM lookups WHERE key = ?", (f"audio:{key}",))
+        self.conn.commit()
+
+    def lookup(self, key: str) -> tuple[str | None, datetime | None] | None:
+        """Gemt opslag (trin B9): (værdi som JSON, tidspunkt), eller None hvis det ikke er gemt."""
+        row = self.conn.execute("SELECT value, checked_at FROM lookups WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return None
+        try:
+            when = datetime.fromisoformat(row["checked_at"])
+        except ValueError:
+            when = None
+        return row["value"], when
+
+    def save_lookup(self, key: str, value: str | None) -> None:
+        self.conn.execute(
+            "INSERT INTO lookups (key, value, checked_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, checked_at = excluded.checked_at",
+            (key, value, iso()),
+        )
         self.conn.commit()
 
     def with_status(self, status: str) -> list[sqlite3.Row]:

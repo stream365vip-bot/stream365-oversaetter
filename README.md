@@ -11,15 +11,17 @@ Hvert kvarter gør programmet dette:
    - film og serier/sæsoner, som nogen har ønsket via **Seerr** (programmet spørger Seerr direkte), og
    - film med mærket **oversaet** i Radarr og afsnit af serier med mærket **oversaet** i Sonarr.
 3. Springer over, hvis der allerede findes danske undertekster (som fil eller inde i videoen).
-4. Sørger for en **gyldig søgning**: beder Bazarr søge efter dansk til netop det emne og tjekker, at ingen af Bazarrs undertekst-tjenester var sat på pause lige før eller lige efter. Fandt søgningen dansk, er der intet at gøre.
-5. Fandt en gyldig søgning ikke dansk, og findes der en engelsk tekst, **oversætter programmet selv** med Claude (standard Opus 5.5, `TRANSLATE_MODE=direct`):
+4. Springer over, hvis titlen har **dansk lyd** (dansk originalsprog eller et dansk lydspor i filen) – der skal ingen tekst til (trin B9).
+5. Sørger for en **gyldig søgning**: beder Bazarr søge efter dansk til netop det emne og tjekker, at ingen af Bazarrs undertekst-tjenester var sat på pause lige før eller lige efter. Fandt søgningen dansk, er der intet at gøre.
+6. Ligger titlen på en **dansk streamingtjeneste**, venter den først nogle dage på en officiel dansk tekst (trin B9).
+7. Fandt en gyldig søgning ikke dansk, og findes der en engelsk tekst, **oversætter programmet selv** med Claude (standard Opus 5.5, `TRANSLATE_MODE=direct`):
    - Den engelske tekst hentes: en ekstern `.en.srt` læses direkte, et indlejret engelsk tekstspor trækkes ud af videoen med ffmpeg (helst SDH/HI, aldrig forced). Billedbaserede spor (PGS/VobSub) springes over.
    - Teksten oversættes i bidder af 50 replikker med sammenhæng (som i testtilstanden `oversaet-test`). Afviser modellen en bid (refusal) også efter halvering, prøves den med `FALLBACK_MODEL` (standard Sonnet 5.5). Lykkes det heller ikke, beholder de replikker den engelske tekst, og det står tydeligt i loggen.
    - **Gratis kontrol** af hver replik (engelske rester, norske/svenske ord, kendte forkerte ord som "bestie" og "please", for lange linjer, manglende tal osv.). De flagede replikker (højst `MAX_FIX_LINES`, standard 60) rettes i **ét ekstra kald** med 2 nabolinjer på hver side.
    - Kreditlinjen sættes ind, og filen **uploades til Bazarr** (samme kald som Upload-knappen). Så registrerer Bazarr teksten, kører sync/Sub-Zero og kan senere udskifte den. Fejler uploaden, skriver programmet selv `<videonavn>.da.srt` ved siden af videoen og beder Bazarr om "scan disk".
 
    Er der heller ingen engelsk tekst, beder programmet Bazarr søge efter engelsk (se "Ingen engelsk tekst" nedenfor).
-6. Husker i en lille database, hvad der er lavet, så intet bliver søgt eller oversat to gange.
+8. Husker i en lille database, hvad der er lavet, så intet bliver søgt eller oversat to gange.
 
 Med `TRANSLATE_MODE=lingarr` kører det gamle flow: Bazarr oversætter med Lingarr og Claude Haiku, og programmet laver bagefter kontrol, korrektur med korrekturmodellen (`PROOFREAD_*`) og kreditlinje. Det er beholdt, så vi kan rulle tilbage.
 
@@ -206,7 +208,7 @@ Hvilke titler `glem` må slette (trin B8):
 | Status | glem |
 |---|---|
 | `fejlet`, `sprunget_over`, `ikke_muligt` | slettes uden flag |
-| alle andre (`faerdig`, `forsoeg_igen`, `i_gang`, `soeger`, `soegt`, `mangler_engelsk`) | kun med `--alle` – ellers afvises det med en forklaring, så fx en færdig titel ikke slettes ved en fejl og oversættes igen for penge |
+| alle andre (`faerdig`, `forsoeg_igen`, `i_gang`, `soeger`, `soegt`, `mangler_engelsk`, `venter_paa_dansk`) | kun med `--alle` – ellers afvises det med en forklaring, så fx en færdig titel ikke slettes ved en fejl og oversættes igen for penge |
 
 ```bash
 sudo docker exec oversaetter python -m oversaetter glem "Idiots"
@@ -214,6 +216,8 @@ sudo docker exec oversaetter python -m oversaetter glem 12345      # TMDB-id (sl
 sudo docker exec oversaetter python -m oversaetter glem movie:12   # nøglen fra loggen
 sudo docker exec oversaetter python -m oversaetter glem "Idiots" --alle   # uanset status, også færdig
 ```
+
+`glem` på en titel, der venter på dansk (trin B9), nulstiller ventetiden: næste runde begynder den forfra.
 
 Loggen viser, hvad der blev slettet. Passer titlen på flere rækker, slettes intet, og nøglerne vises.
 
@@ -377,6 +381,20 @@ Loggen viser, hvad der blev slettet. Passer titlen på flere rækker, slettes in
      - loggen viser `HI-mærke: omdøbt ...` og `HI-mærke rettet: ...`, eller `ADVARSEL: Bazarr ser stadig ikke ... som almindelig`
      - feedet (trin B7) får stadig noten om HI.
   7. **Scan disk før "ingen engelsk tekstkilde".** Finder programmet ingen engelsk kilde i Bazarrs liste, beder det først Bazarr om "Scan Disk" for filmen/serien (samme kald som knappen) og læser listen igen, før det giver op og søger efter engelsk. Det sker én gang pr. titel (tidspunktet gemmes i `items.disk_scan_at`; `glem` nulstiller det). Årsag: Bazarr havde ikke indekseret Gold Rush sæson 17, selv om filerne havde et indlejret engelsk SDH-spor. Loggen viser `Ingen engelsk tekstkilde til X i Bazarr - beder Bazarr scanne disken og tjekker igen` og derefter `Efter scan disk har Bazarr en engelsk kilde til X: ...` eller `Heller ingen engelsk tekstkilde til X efter scan disk`. I prøvetilstand scannes der ikke.
+
+- **Trin B9: dansk lyd og venteregel med danske streamingtjenester** (besluttet af Jesper 31.10.2026): titler, der ligger på en dansk streamingtjeneste, skal have chancen for at få en officiel dansk tekst, før vi oversætter. Titler uden udsigt til dansk oversættes med det samme.
+  1. **Dansk lyd oversættes aldrig.** Før søgning og venteregel tjekkes, om titlen har dansk lyd: originalsproget fra Radarr/Sonarr (gratis og lokalt; kun hvis feltet mangler, spørges TMDB, `original_language == "da"`), og ellers et dansk lydspor i filen (ffprobe, samme værktøj som ved indlejrede tekster – fx en dansk dub). Så får titlen status `ikke_muligt` med loglinjen `Springer over: X - dansk lyd, ingen tekst nødvendig (originalsprog dansk ifølge Radarr)` eller `(dansk lydspor i filen)`. Der søges ikke i Bazarr, tjenesterne slås ikke op, og intet sendes til feedet. Gælder også mærkede titler og Seerr-ønsker. Lydsporene undersøges én gang pr. fil (en ulæselig fil prøves igen efter et døgn). Som ekstra sikkerhed bør Bazarr-profilen "Dansk" have **Exclude If Matching Audio** slået til, så Bazarr slet ikke melder titler med dansk lyd som manglende.
+  2. **Opslag af tjenester**: TMDB `movie/{id}/watch/providers` og `tv/{id}/watch/providers`, landet DK, typerne `flatrate` (abonnement), `free` og `ads` – ikke `rent`/`buy`. Nøglen er den eksisterende `tmdb_api_key.txt`. Serier slås op på serieniveau (tmdbId fra Sonarr, ellers via tvdbId og TMDB find), og alle afsnit deler svaret. Svaret gemmes i databasen (`items.dk_providers`, `items.providers_checked_at` og tabellen `lookups`) og slås op igen højst én gang i døgnet. Felterne oprettes automatisk ved opstart.
+  3. **Reglen**, når en gyldig søgning ikke fandt dansk, og der er en engelsk tekst:
+     - ingen dansk tjeneste: oversæt som før
+     - mindst én dansk tjeneste: status `venter_paa_dansk`, og der oversættes ikke endnu. Én gang i døgnet bedes Bazarr søge dansk igen (samme kald som altid). Findes dansk, er titlen færdig uden oversættelse, med tjenesten i loggen (`... ventede på dansk; ligger på Netflix`). Finder Bazarr selv dansk imens, ses det også.
+     - efter ventetiden uden dansk: oversæt alligevel, med loglinjen `Ventetiden udløb: X har ventet 7 dage på dansk (ligger på Viaplay) - oversætter alligevel`
+     - ventetid: `PROVIDER_WAIT_DAYS_MOVIES` (standard 7) for film og `PROVIDER_WAIT_DAYS_SERIES` (standard 3) for afsnit, regnet fra første gang titlen kom til at vente
+  4. **Fejl**: fejler TMDB-opslaget (netværk, titlen ikke fundet, intet TMDB-id), regnes titlen for at være uden dansk tjeneste og oversættes straks. Det logges én gang pr. titel (`Kunne ikke slå danske streamingtjenester op for X hos TMDB ...`). Uden TMDB-nøgle står det én gang i loggen ved opstart, og ingen titler venter.
+  5. **Log**: `Venter på dansk: X ligger på Netflix (højst 7 dage)` skrives kun første gang, og derefter kun ved ændring (dansk fundet, ventetid udløbet, ikke længere på en dansk tjeneste). `Runde:` har tallet `N venter på dansk`. En titel, der fik en officiel tekst, sendes ikke til feedet (det er ikke en oversættelse).
+  6. **Hvad TMDB kan og ikke kan**: TMDB (via JustWatch) viser kun, hvad der ligger på tjenesterne **nu** – ikke hvad der kommer. En film, der først kommer på Netflix om en måned, oversættes altså straks. TMDB siger heller ikke, om tjenesten har en dansk tekst; det er netop det, ventetiden giver Bazarr tid til at finde.
+  - `.env`: `PROVIDER_WAIT=true|false` (standard `true`; `false` = ingen ventetid som før B9), `PROVIDER_WAIT_DAYS_MOVIES` og `PROVIDER_WAIT_DAYS_SERIES`. Reglen om dansk lyd gælder altid.
+  - Se ventende titler: `SELECT title, dk_providers, wait_started_at FROM items WHERE status = 'venter_paa_dansk'`.
 
 ## Hvis noget går galt
 

@@ -83,15 +83,25 @@ class FakeAnthropic:
 
 
 class FakeCommands:
-    """Falske ffprobe/ffmpeg: streams er ffprobes spor, track_srt teksten som ffmpeg trækker ud."""
+    """Falske ffprobe/ffmpeg: streams er ffprobes spor, track_srt teksten som ffmpeg trækker ud.
 
-    def __init__(self, streams=(), track_srt=EN):
+    Trin B9: ffprobe af lydsporene (dansk lyd) noteres for sig i audio_calls og svarer med audio (sprogkoder),
+    så calls kun indeholder kaldene til den engelske tekst.
+    """
+
+    def __init__(self, streams=(), track_srt=EN, audio=("eng",)):
         self.streams = list(streams)
         self.track_srt = track_srt
+        self.audio = list(audio)
         self.calls: list[list[str]] = []
+        self.audio_calls: list[list[str]] = []
 
     def __call__(self, args, **kwargs):
         assert kwargs["timeout"] > 0  # alle kald har en tidsgrænse
+        if args[0] == "ffprobe" and args[args.index("-select_streams") + 1] == "a":
+            self.audio_calls.append(args)
+            streams = [{"index": i + 1, "tags": {"language": lang}} for i, lang in enumerate(self.audio)]
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"streams": streams}).encode(), stderr=b"")
         self.calls.append(args)
         if args[0] == "ffprobe":
             return SimpleNamespace(returncode=0, stdout=json.dumps({"streams": self.streams}).encode(), stderr=b"")

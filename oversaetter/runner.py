@@ -31,7 +31,7 @@ from .plex import refresh_folder
 from .postprocess import make_client, postprocess
 from .proofread import DbBudget
 from .search import PAUSE_WARN, nice_name, paused_providers, search_jobs, unfinished, wait_for_jobs, waiting_text
-from .selection import Candidate, Selector, Stats, choose_source
+from .selection import WAITING, Candidate, Selector, Stats, choose_source
 from .srt import read_file, write_file_atomic
 from .synk import fix_hi_after_upload, sync_after_upload
 from .translate import request_translation
@@ -86,7 +86,7 @@ class Runner:
         except Exception as e:
             log.warning("Kunne ikke hente ønsker fra Seerr: %s - kun mærkede serier behandles i denne runde", e)
             seerr_index = SeerrIndex([])
-        selector = Selector(self.cfg, self.bazarr, self.radarr, self.sonarr, seerr_index, self.db)
+        selector = Selector(self.cfg, self.bazarr, self.radarr, self.sonarr, seerr_index, self.db, self.run_cmd)
         try:
             self.sync_new_tags(selector)
         except Exception as e:
@@ -101,12 +101,14 @@ class Runner:
         candidates += self.search_round(selector, selector.need_english, stats, language="en")
         self._log_round(stats)
         log.info(
-            "Runde: %d mangler dansk, %d oversættes, %d søgt nu, %d venter, %d fandt dansk ved søgning, "
-            "%d ikke valgt, %d allerede behandlet, %d sprunget over, %d fejl ved opslag, %d ukendt i Bazarr",
+            "Runde: %d mangler dansk, %d oversættes, %d søgt nu, %d venter, %d venter på dansk, "
+            "%d fandt dansk ved søgning, %d ikke valgt, %d allerede behandlet, %d sprunget over, %d fejl ved opslag, "
+            "%d ukendt i Bazarr",
             stats.wanted,
             len(candidates),
             stats.searched,
             stats.waiting,
+            stats.waiting_danish,
             stats.found_danish,
             stats.not_selected,
             stats.done_before,
@@ -287,6 +289,9 @@ class Runner:
                 if self.stopping:
                     break
                 why = "ingen dansk og ingen engelsk kilde" if english else f"{cand.reason}, ingen gyldig søgning endnu"
+                row = self.db.get(cand.key)
+                if not english and row is not None and row["status"] == WAITING:
+                    why = f"{cand.reason}, venter på dansk - daglig søgning"
                 if self.cfg.dry_run:
                     if not english:
                         stats.example("søger nu", cand.title, f"ville søge nu ({why})")
@@ -782,6 +787,20 @@ class Runner:
                 log.info(
                     "%s i .env bruges ikke i TRANSLATE_MODE=direct og ignoreres", ", ".join(self.cfg.proofread_keys)
                 )
+        if not self.cfg.provider_wait:
+            log.info("PROVIDER_WAIT=false: titler på danske streamingtjenester oversættes uden at vente")
+        elif not self.cfg.tmdb_key():
+            log.info(
+                "Ingen TMDB-nøgle i %s - danske streamingtjenester kan ikke slås op, så der oversættes uden at vente",
+                self.cfg.tmdb_api_key_file,
+            )
+        else:
+            log.info(
+                "Venteregel: titler på en dansk streamingtjeneste venter højst %g dage (film) og %g dage (afsnit) "
+                "på en officiel dansk tekst",
+                self.cfg.provider_wait_days_movies,
+                self.cfg.provider_wait_days_series,
+            )
         if self.cfg.feed_url:
             log.info("Feed: færdige og fejlede oversættelser sendes til %s", self.cfg.feed_url)
         else:

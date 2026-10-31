@@ -105,6 +105,10 @@ class Config:
     usd_to_dkk: float = 6.7  # cost_dkk = cost_usd × USD_TO_DKK
     # Trin B8: Anthropic afviser kontoen (udgiftsgrænse, ingen credits, ugyldig nøgle) - så længe holdes der pause.
     account_pause_minutes: float = 30.0
+    # Trin B9: titler på en dansk streamingtjeneste (TMDB, DK) venter så mange dage på en officiel dansk tekst.
+    provider_wait: bool = True
+    provider_wait_days_movies: float = 7.0
+    provider_wait_days_series: float = 3.0
 
     poll_minutes: float = 15.0
     translate_tag: str = "oversaet"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass, field
@@ -11,6 +12,8 @@ from .clients import ApiError, Bazarr, Radarr, SeerrIndex, Sonarr, parse_date
 from .config import Config
 from .db import Database, iso
 from .hi import hi_filename
+from .kontekst import Tmdb
+from .tjenester import Lookups, arr_language
 
 log = logging.getLogger("oversaetter")
 
@@ -21,6 +24,9 @@ MAX_EXAMPLES = 5
 DANISH_TAGS = {"da", "dan", "danish", "dansk"}
 SKIP_RECHECK = timedelta(hours=24)
 EN_SEARCH_AGAIN = timedelta(hours=24)  # mindste tid mellem to søgninger efter engelsk til samme emne
+WAIT_SEARCH_AGAIN = timedelta(hours=24)  # trin B9: en titel, der venter på dansk, søges igen én gang i døgnet
+WAITING = "venter_paa_dansk"
+NO_TEXT_NEEDED = "dansk lyd, ingen tekst nødvendig"
 
 
 @dataclass
@@ -56,6 +62,7 @@ class Stats:
     done_before: int = 0
     lookup_errors: int = 0  # trin B8: fejl ved opslag i Radarr/Sonarr/Bazarr (egne tal i Runde-linjen)
     unknown: int = 0  # trin B8: Bazarr kender ikke emnet
+    waiting_danish: int = 0  # trin B9: ligger på en dansk streamingtjeneste og venter på en officiel dansk tekst
     skipped: list[str] = field(default_factory=list)
     # Bazarrs rå tal (hele wanted-listen) og hvor mange af dem der mangler dansk.
     bazarr_movies: int = 0
@@ -156,8 +163,21 @@ def missing_hi(entry: dict) -> bool:
 
 
 class Selector:
-    def __init__(self, cfg: Config, bazarr: Bazarr, radarr: Radarr, sonarr: Sonarr, seerr: SeerrIndex, db: Database):
+    def __init__(
+        self,
+        cfg: Config,
+        bazarr: Bazarr,
+        radarr: Radarr,
+        sonarr: Sonarr,
+        seerr: SeerrIndex,
+        db: Database,
+        run_cmd=None,
+    ):
         self.cfg, self.bazarr, self.radarr, self.sonarr, self.seerr, self.db = cfg, bazarr, radarr, sonarr, seerr, db
+        # Trin B9: TMDB (originalsprog og tjenester) og ffprobe (lydspor). run_cmd None = lydsporene tjekkes ikke.
+        key = cfg.tmdb_key()
+        tmdb = Tmdb(cfg.tmdb_url, key, bazarr.http) if key else None
+        self.lookups = Lookups(db, tmdb, run_cmd, cfg.dry_run)
         self._series: dict[int, dict] = {}
         self._movies: dict[int, dict] | None = None
         self._tag_ids: dict[str, int | None] = {}  # "radarr"/"sonarr" -> id på mærket (None = findes ikke)
@@ -246,12 +266,140 @@ class Selector:
             )
 
     def found_danish(self, cand: Candidate, stats: Stats) -> None:
-        why = "gyldig søgning fandt dansk - intet at gøre"
+        why = "gyldig søgning fandt dansk - intet at gøre" + self._after_wait(cand)
         stats.found_danish += 1
         stats.example("fandt dansk", cand.title, why)
         log.info("%s: %s", cand.title, why)
         if not self.cfg.dry_run:
             self.db.upsert(cand.key, status="faerdig", reason="gyldig søgning fandt dansk")
+
+    # --- trin B9: dansk lyd og danske streamingtjenester ---------------------------------------------------
+    def _after_wait(self, cand: Candidate) -> str:
+        """Tekst til loggen, når dansk dukker op, mens titlen venter: " (ventede på dansk; ligger på Netflix)"."""
+        row = self.db.get(cand.key)
+        if row is None or row["status"] != WAITING:
+            return ""
+        try:
+            names = json.loads(row["dk_providers"] or "[]")
+        except ValueError:
+            names = []
+        return f" (ventede på dansk; ligger på {', '.join(names) or 'en dansk tjeneste'})"
+
+    def danish_audio(self, cand: Candidate) -> str | None:
+        """Hvorfor titlen har dansk lyd (originalsproget eller et dansk lydspor), eller None.
+
+        Originalsproget tages først fra Radarr/Sonarr (gratis og lokalt) og kun fra TMDB, hvis feltet mangler.
+        """
+        if cand.media_type == "movie":
+            media, source, kind = self.movie(cand.media_id), "Radarr", "movie"
+            tmdb_id = media.get("tmdbId")
+        else:
+            media, source, kind = self.series(int(cand.series_id)), "Sonarr", "tv"
+            tmdb_id = None
+        lang = arr_language(media)
+        if lang is None:
+            if kind == "tv":
+                tmdb_id = self.lookups.tv_id(media)
+            lang, source = self.lookups.tmdb_language(kind, tmdb_id), "TMDB"
+        if lang == "da":
+            return f"originalsprog dansk ifølge {source}"
+        if self.lookups.danish_audio_track(cand.key, cand.video_path):
+            return "dansk lydspor i filen"
+        return None
+
+    def no_text_needed(self, cand: Candidate, why: str, stats: Stats) -> None:
+        """Dansk lyd: aldrig oversættelse, ingen søgning og intet opslag af tjenester (status ikke_muligt)."""
+        full = f"{NO_TEXT_NEEDED} ({why})"
+        stats.skipped.append(f"{cand.title}: {full}")
+        stats.example("sprunget over: dansk lyd", cand.title, full)
+        log.info("Springer over: %s - %s", cand.title, full)
+        if not self.cfg.dry_run:
+            self.db.upsert(
+                cand.key,
+                media_type=cand.media_type,
+                media_id=cand.media_id,
+                title=cand.title,
+                status="ikke_muligt",
+                reason=full,
+                video_path=cand.video_path,
+            )
+
+    def providers_for(self, cand: Candidate) -> list[str]:
+        """Danske tjenester for filmen eller serien (alle afsnit deler seriens svar). Fejl = ingen."""
+        if cand.media_type == "movie":
+            kind, tmdb_id = "movie", self.movie(cand.media_id).get("tmdbId")
+            label = cand.title
+        else:
+            series = self.series(int(cand.series_id))
+            kind, tmdb_id = "tv", self.lookups.tv_id(series)
+            label = str(series.get("title") or cand.title)
+        return self.lookups.providers(kind, tmdb_id, label) or []
+
+    def provider_wait(self, cand: Candidate, stats: Stats) -> bool:
+        """Ventereglen: True = titlen ligger på en dansk tjeneste og venter stadig på en officiel dansk tekst."""
+        if not self.cfg.provider_wait:
+            return False
+        names = self.providers_for(cand)
+        row = self.db.get(cand.key)
+        waiting = row is not None and row["status"] == WAITING
+        value = json.dumps(names, ensure_ascii=False)
+        checked = parse_date(row["providers_checked_at"]) if row is not None else None
+        stale = checked is None or datetime.now(UTC) - checked >= WAIT_SEARCH_AGAIN
+        if not self.cfg.dry_run and row is not None and (stale or row["dk_providers"] != value):
+            self.db.upsert(cand.key, dk_providers=value, providers_checked_at=iso())
+        if not names:
+            if waiting:
+                log.info("%s ligger ikke længere på en dansk streamingtjeneste - oversætter", cand.title)
+            return False
+        movie = cand.media_type == "movie"
+        days = self.cfg.provider_wait_days_movies if movie else self.cfg.provider_wait_days_series
+        text = ", ".join(names)
+        now = datetime.now(UTC)
+        started = parse_date(row["wait_started_at"]) if row is not None else None
+        if started is None:
+            log.info("Venter på dansk: %s ligger på %s (højst %g dage)", cand.title, text, days)
+            if not self.cfg.dry_run:
+                self.db.upsert(cand.key, status=WAITING, reason=f"venter på dansk ({text})", wait_started_at=iso(now))
+        elif now - started >= timedelta(days=days):
+            if waiting:
+                log.info(
+                    "Ventetiden udløb: %s har ventet %g dage på dansk (ligger på %s) - oversætter alligevel",
+                    cand.title,
+                    days,
+                    text,
+                )
+                self.db.upsert(cand.key, status="soegt", reason="ventetiden på dansk udløb")
+            return False
+        stats.waiting_danish += 1
+        stats.example("venter på dansk", cand.title, f"venter på dansk: ligger på {text} (højst {days:g} dage)")
+        return True
+
+    def research_due(self, row, now: datetime) -> bool:
+        """En titel, der venter på dansk, skal have en ny gyldig søgning efter dansk én gang i døgnet."""
+        if row is None or row["status"] != WAITING:
+            return False
+        last = parse_date(row["search_at"])
+        return last is None or now - last >= WAIT_SEARCH_AGAIN
+
+    def sweep_waiting(self, seen: set[str], stats: Stats) -> None:
+        """Titler, der ventede på dansk, men ikke længere mangler dansk ifølge Bazarr (typisk fundet af Bazarr selv)."""
+        if self.cfg.dry_run:
+            return
+        for row in self.db.with_status(WAITING):
+            if row["key"] in seen:
+                continue
+            cand = Candidate(row["media_type"], int(row["media_id"]), row["title"] or row["key"], reason="")
+            cand.video_path = row["video_path"] or ""
+            try:
+                item = self.bazarr.item(cand.media_type, cand.media_id)
+            except ApiError as e:
+                log.debug("Kunne ikke spørge Bazarr om %s: %s", cand.title, e)
+                continue
+            subs = (item or {}).get("subtitles") or []
+            if has_danish(subs) or (cand.video_path and danish_on_disk(cand.video_path)):
+                self.skip(cand, "har allerede dansk" + self._after_wait(cand), stats)
+            else:
+                self.skip(cand, "mangler ikke længere dansk ifølge Bazarr" + self._after_wait(cand), stats)
 
     def no_english(self, cand: Candidate, why: str, stats: Stats) -> None:
         """Ingen dansk og ingen brugbar engelsk kilde: søg efter engelsk, eller spring over til næste runde.
@@ -333,6 +481,8 @@ class Selector:
             return None
         cand.source_path, cand.subtitles_id, cand.source_desc = path, sub_id, desc
         cand.source_hi = any(external_hi(s) for s in subtitles if path and s.get("path") == path)
+        if self.provider_wait(cand, stats):
+            return None
         row = self.db.get(cand.key)
         if row is not None and row["status"] == "mangler_engelsk":
             log.info("Engelsk fundet til %s - oversætter", cand.title)
@@ -348,6 +498,7 @@ class Selector:
         movies, episodes = self.bazarr.wanted_movies(), self.bazarr.wanted_episodes()
         stats.bazarr_movies, stats.bazarr_episodes = len(movies), len(episodes)
         entries = [("movie", e) for e in movies] + [("episode", e) for e in episodes]
+        seen: set[str] = set()
         for media_type, entry in entries:
             if not wants_danish(entry):
                 continue
@@ -363,6 +514,7 @@ class Selector:
                 title = f"{entry.get('seriesTitle', 'serie')} {entry.get('episode_number', '')}".strip()
                 series_id = int(entry["sonarrSeriesId"])
             cand = Candidate(media_type, media_id, title, reason="", series_id=series_id, hi=missing_hi(entry))
+            seen.add(cand.key)
             if self._db_blocks(cand.key, now, stats):
                 row = self.db.get(cand.key)
                 stats.example("allerede behandlet", title, f"allerede behandlet (status {row['status']})")
@@ -395,17 +547,27 @@ class Selector:
             da = has_danish(item.get("subtitles") or [])
             if da:
                 kind = "ekstern" if da.get("path") else "indlejret"
-                self.skip(cand, f"har allerede dansk ({kind}{', forced' if da.get('forced') else ''})", stats)
+                forced = ", forced" if da.get("forced") else ""
+                self.skip(cand, f"har allerede dansk ({kind}{forced}){self._after_wait(cand)}", stats)
                 continue
             on_disk = danish_on_disk(cand.video_path) if cand.video_path else None
             if on_disk:
-                self.skip(cand, f"har allerede dansk fil: {os.path.basename(on_disk)}", stats)
+                self.skip(cand, f"har allerede dansk fil: {os.path.basename(on_disk)}{self._after_wait(cand)}", stats)
+                continue
+            try:
+                audio = self.danish_audio(cand)  # trin B9: før søgning og venteregel
+            except ApiError as e:
+                log.debug("Kunne ikke tjekke originalsproget for %s: %s", title, e)
+                audio = None
+            if audio:
+                self.no_text_needed(cand, audio, stats)
                 continue
             row = self.db.get(cand.key)
-            if row is None or not row["search_at"]:
+            if row is None or not row["search_at"] or self.research_due(row, now):
                 to_search.append(cand)  # regel: aldrig oversættelse uden en gyldig søgning
                 continue
             ready = self.after_search(cand, item, stats)
             if ready:
                 candidates.append(ready)
+        self.sweep_waiting(seen, stats)
         return candidates, to_search, stats

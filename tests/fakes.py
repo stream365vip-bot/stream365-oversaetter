@@ -54,6 +54,10 @@ class FakeArr:
         self.subtitle_sync_status = 204
         self.subtitle_sync_job: str | None = "completed"  # status på synkjobbet; None = intet job (gammel Bazarr)
         self.on_subtitle_sync = None  # funktion(form), fx til at notere rækkefølgen af kald
+        # Trin B9: TMDB. "movie:101"/"tv:500" -> {"original_language": "en", "DK": {"flatrate": ["Netflix"]}}
+        self.tmdb: dict[str, dict] = {}
+        self.tmdb_tvdb: dict[int, int] = {}  # tvdbId -> TMDB-id (find)
+        self.tmdb_calls: list[str] = []
         self._job_id = 100
 
     # --- opsætning ----------------------------------------------------------------
@@ -116,6 +120,8 @@ class FakeArr:
             return self.radarr(path)
         if host == "sonarr":
             return self.sonarr(path)
+        if host == "tmdb":
+            return self.tmdb_api(path, q)
         if host == "seerr":
             return httpx2.Response(200, json={"pageInfo": {"pages": 1}, "results": self.seerr_requests})
         return httpx2.Response(404)
@@ -247,6 +253,21 @@ class FakeArr:
             item["subtitles"] = [*item["subtitles"], {"code2": "da", "code3": "dan", "path": da, "forced": False}]
         return httpx2.Response(self.upload_status, text="")
 
+    def tmdb_api(self, path, q):
+        self.tmdb_calls.append(path)
+        assert q.get("api_key") == ["tmdb-key"]
+        parts = path.strip("/").split("/")  # ["3", "movie", "101", ("watch", "providers")]
+        if parts[1] == "find":
+            tmdb_id = self.tmdb_tvdb.get(int(parts[2]))
+            return httpx2.Response(200, json={"tv_results": [{"id": tmdb_id}] if tmdb_id else []})
+        data = self.tmdb.get(f"{parts[1]}:{parts[2]}")
+        if data is None:
+            return httpx2.Response(404, json={"status_message": "not found"})
+        if parts[3:] == ["watch", "providers"]:
+            dk = {kind: [{"provider_name": n} for n in names] for kind, names in (data.get("DK") or {}).items()}
+            return httpx2.Response(200, json={"id": int(parts[2]), "results": {"DK": dk} if dk else {}})
+        return httpx2.Response(200, json={"id": int(parts[2]), "original_language": data.get("original_language")})
+
     def radarr(self, path):
         self.radarr_calls += 1
 
@@ -259,6 +280,7 @@ class FakeArr:
                 "tags": m["tags"],
                 "hasFile": True,
                 "movieFile": {"path": m["path"], "dateAdded": m["dateAdded"]},
+                **({"originalLanguage": m["originalLanguage"]} if "originalLanguage" in m else {}),
             }
 
         if path == "/api/v3/tag":

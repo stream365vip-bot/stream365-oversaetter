@@ -46,8 +46,10 @@ sudo chown -R 1000:1000 /opt/oversaetter/data
 sudo mkdir -p /opt/oversaetter/secrets
 #    tmdb_api_key.txt er valgfri (filmkontekst fra TMDB, se "Bedre og hurtigere oversættelse").
 #    plex_token.txt er valgfri (Plex scanner mappen efter upload, se "Trin B4g").
+#    feed_token.txt er valgfri (færdige oversættelser sendes til appen, se "Trin B7").
 sudo touch /opt/oversaetter/secrets/deepseek_api_key.txt /opt/oversaetter/secrets/gemini_api_key.txt \
-  /opt/oversaetter/secrets/tmdb_api_key.txt /opt/oversaetter/secrets/plex_token.txt
+  /opt/oversaetter/secrets/tmdb_api_key.txt /opt/oversaetter/secrets/plex_token.txt \
+  /opt/oversaetter/secrets/feed_token.txt
 sudo chown 1000:1000 /opt/oversaetter/secrets/*.txt
 sudo chmod 600 /opt/oversaetter/secrets/*.txt
 
@@ -191,6 +193,7 @@ Nøgler:
 | gemini | `/opt/oversaetter/secrets/gemini_api_key.txt` |
 | TMDB (kontekst, valgfri) | `/opt/oversaetter/secrets/tmdb_api_key.txt` |
 | Plex (scanning efter upload, valgfri) | `/opt/oversaetter/secrets/plex_token.txt` |
+| Appens backend (feed, valgfri) | `/opt/oversaetter/secrets/feed_token.txt` |
 
 Skriv nøglen i filen med `sudo nano` (kun nøglen, én linje). Mangler en nøgle, stopper kun testtilstanden med en dansk besked – driften kører videre.
 
@@ -329,6 +332,23 @@ Loggen viser, hvad der blev slettet. Passer titlen på flere rækker, slettes in
   - `.env`: `SYNC_AFTER_UPLOAD=true|false` (standard `true`). `false` springer synken over med én INFO-linje.
   - Resultatet gemmes i `items.bazarr_sync` (1 = synkroniseret, 0 = fejlede/timeout, NULL = ikke forsøgt), fx `SELECT title, bazarr_sync, plex_refresh FROM items WHERE status = 'faerdig'`.
 
+- **Trin B7: færdige og fejlede oversættelser til appen** (31.10.2026): appens backend viser de seneste oversættelser som RSS (`GET /oversaettelser`), så en widget kan vise dem. Når en titel ender som `Færdig` eller `fejlet` i driften (direct og lingarr), sendes **ét** `POST` til `FEED_URL` med headeren `X-Oversaetter-Token` og JSON:
+
+  | Felt | Indhold |
+  |---|---|
+  | `title` | filmens titel, eller seriens titel for et afsnit |
+  | `media_type` | `movie` eller `episode` |
+  | `episode_label` | fx `S5E2` (kun afsnit) |
+  | `status` | `done` eller `failed` |
+  | `cues` | antal replikker |
+  | `minutes` | samlet tid i hele minutter (afrundet; tiden fra `Færdig`-linjen) |
+  | `cost_usd`, `cost_dkk` | prisen i dollars og `cost_usd × USD_TO_DKK` med 2 decimaler |
+  | `note` | ved fejl den korte årsag fra loggen; ved succes fx `11 flag`, eller HI-advarslen fra trin B6b, hvis den blev logget |
+
+  - `.env`: `FEED_URL` (standard tom = slået fra, med én INFO-linje ved opstart; i drift `https://stream365-backend-production.up.railway.app/oversaettelser`), `FEED_TOKEN_FILE` (standard `/run/secrets/feed_token`, monteres fra `/opt/oversaetter/secrets/feed_token.txt` via `compose.yaml`; samme værdi som `OVERSAETTER_TOKEN` på Railway) og `USD_TO_DKK` (standard 6,7).
+  - Kun den endelige status sendes: `forsoeg_igen` (første fejl), `ikke_muligt` (fx billedbaseret tekst) og prøvetilstand sender intet. `oversaet-test` sender aldrig.
+  - **Må aldrig skade oversættelsen**: sendingen sker til sidst (efter synk og Plex), hvert forsøg har en hård grænse på 10 sekunder, og ved netværksfejl, timeout eller serverfejl (5xx) prøves der én gang mere. Lykkes det, logges `Feed: sendt <titel>`. Fejler det, logges en WARNING (`Feed: kunne ikke sende <titel> (HTTP 500)`), og titlen er stadig færdig. HTTP 401/403 prøves ikke igen; advarslen siger, at tokenet i `feed_token.txt` skal være det samme som `OVERSAETTER_TOKEN` i backenden. Tokenet logges aldrig.
+
 ## Hvis noget går galt
 
 - Mislykkes en oversættelse, prøves den igen ved næste runde. Går det galt igen, markeres den som "fejlet" og prøves ikke igen automatisk.
@@ -342,6 +362,7 @@ Loggen viser, hvad der blev slettet. Passer titlen på flere rækker, slettes in
 - (lingarr) Efterbehandlingen af ét emne må højst tage `POSTPROCESS_TIMEOUT_MINUTES` (standard 30) minutter. Derefter gemmes filen med de rettelser, der er nået, og loggen skriver en advarsel. Kreditlinjen sættes altid ind, og filen gemmes altid.
 - Rammer hovedløkken en uventet fejl, logges hele fejlen, emnet markeres som "forsoeg_igen", og løkken fortsætter med næste runde.
 - Ved opstart genoptages emner, der stod som "i_gang" (fx efter genstart), og loggen skriver hvilke.
+- `Feed: kunne ikke sende ...` – appen har ikke fået linjen til RSS-widgeten (se "Trin B7"). Oversættelsen er ikke påvirket. Ved `HTTP 401` er tokenet i `/opt/oversaetter/secrets/feed_token.txt` forkert eller tomt.
 - (BATCH_API) Stoppede programmet, mens det ventede på en batch, hentes svarene fra den gemte batch i første runde efter opstart - der sendes ikke en ny (se "Trin B6").
 
 ## For udviklere

@@ -22,6 +22,7 @@ log = logging.getLogger("oversaetter")
 
 SYNC_TIMEOUT = 600.0  # højst så mange sekunder på hele synken (kaldet og ventetiden på jobbet)
 FAILED = ("failed", "error")
+HI_NOTE = "Bazarr har registreret den danske tekst som HI"  # kort tekst til feedet (trin B7)
 
 
 def danish_subtitle(bazarr: Bazarr, cand: Candidate) -> dict | None:
@@ -43,8 +44,13 @@ def _job_ids(jobs: list[dict] | None) -> set[int]:
     return {int(j["job_id"]) for j in jobs or [] if j.get("job_id") is not None}
 
 
-def sync_after_upload(cfg: Config, bazarr: Bazarr, cand: Candidate, sleep, clock) -> bool | None:
-    """True = synkroniseret, False = fejlede eller timeout (advarsel), None = slået fra (SYNC_AFTER_UPLOAD=false)."""
+def sync_after_upload(
+    cfg: Config, bazarr: Bazarr, cand: Candidate, sleep, clock, warnings: list[str] | None = None
+) -> bool | None:
+    """True = synkroniseret, False = fejlede eller timeout (advarsel), None = slået fra (SYNC_AFTER_UPLOAD=false).
+
+    warnings: får en kort tekst tilføjet, hvis Bazarr har registreret den danske tekst som HI (til feedet, trin B7).
+    """
     if not cfg.sync_after_upload:
         log.info("Synk efter upload er slået fra (SYNC_AFTER_UPLOAD=false) - %s synkroniseres ikke", cand.title)
         return None
@@ -61,6 +67,8 @@ def sync_after_upload(cfg: Config, bazarr: Bazarr, cand: Candidate, sleep, clock
             cand.title,
             path,
         )
+        if warnings is not None:
+            warnings.append(HI_NOTE)
     before = bazarr.jobs()
     try:
         bazarr.sync_subtitle(cand.media_type, cand.media_id, path, max(1.0, deadline - clock()))

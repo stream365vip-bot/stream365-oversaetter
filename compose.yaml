@@ -15,6 +15,8 @@ services:
       TMDB_API_KEY_FILE: ${TMDB_API_KEY_FILE:-/run/secrets/tmdb_api_key}
       # Valgfrit Plex-token: beder Plex scanne mappen efter upload til Bazarr. Tom fil = trinnet springes over.
       PLEX_TOKEN_FILE: ${PLEX_TOKEN_FILE:-/run/secrets/plex_token}
+      # Valgfrit token til appens backend (trin B7, FEED_URL). Tom fil = intet sendes (WARNING pr. titel).
+      FEED_TOKEN_FILE: ${FEED_TOKEN_FILE:-/run/secrets/feed_token}
     networks:
       - saltbox
     labels:
@@ -27,6 +29,7 @@ services:
       - /opt/oversaetter/secrets/gemini_api_key.txt:/run/secrets/gemini_api_key:ro
       - /opt/oversaetter/secrets/tmdb_api_key.txt:/run/secrets/tmdb_api_key:ro
       - /opt/oversaetter/secrets/plex_token.txt:/run/secrets/plex_token:ro
+      - /opt/oversaetter/secrets/feed_token.txt:/run/secrets/feed_token:ro
 
 networks:
   saltbox:

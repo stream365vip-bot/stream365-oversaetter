@@ -23,7 +23,7 @@ Hvert kvarter gør programmet dette:
 
 Med `TRANSLATE_MODE=lingarr` kører det gamle flow: Bazarr oversætter med Lingarr og Claude Haiku, og programmet laver bagefter kontrol, korrektur med korrekturmodellen (`PROOFREAD_*`) og kreditlinje. Det er beholdt, så vi kan rulle tilbage.
 
-Programmet ændrer ingen indstillinger i Bazarr, Lingarr, Radarr, Sonarr eller Seerr, sletter aldrig filer og rører kun den nye danske undertekstfil. Ud over at aflevere den danske tekst beder det kun Bazarr om tre ting: at søge efter dansk (eller engelsk, når der hverken er dansk eller engelsk) til et bestemt emne, at synkronisere med Radarr/Sonarr, når der er kommet noget nyt med mærket **oversaet**, som Bazarr ikke kender endnu (højst én gang pr. runde), og at scanne disken for ét emne, hvis uploaden fejlede.
+Programmet ændrer ingen indstillinger i Bazarr, Lingarr, Radarr, Sonarr eller Seerr, sletter aldrig filer og rører kun den nye danske undertekstfil. Ud over at aflevere den danske tekst beder det kun Bazarr om tre ting: at søge efter dansk (eller engelsk, når der hverken er dansk eller engelsk) til et bestemt emne, at synkronisere med Radarr/Sonarr, når der er kommet noget nyt med mærket **oversaet**, som Bazarr ikke kender endnu (højst én gang pr. runde), og at scanne disken for ét emne (hvis uploaden fejlede, hvis Bazarr mærkede vores tekst som HI, eller én gang, når der ingen engelsk kilde er – trin B8). Ved et HI-mærke omdøbes vores egen danske fil fra `.da.hi.srt` til `.da.srt`.
 
 Udgifterne til Claude har et loft (`MONTHLY_BUDGET_USD`, standard 5 dollars om måneden). I direct-tilstand betales hele oversættelsen herfra: når loftet er nået, startes der ingen nye oversættelser, før der er budget igen (en oversættelse, der er i gang, gøres færdig). I lingarr-tilstand gemmes Haikus oversættelse uden korrektur, når loftet er nået.
 
@@ -105,7 +105,7 @@ Tryk `Ctrl+C` for at stoppe visningen (programmet kører videre). Hver linje er 
 2026-10-17 20:15:40 INFO Eksempel: Anden film - gyldig søgning fandt dansk - intet at gøre
 2026-10-17 20:15:40 INFO Eksempel: Tredje film - venter: OpenSubtitles er sat på pause til ca. kl. 22:30
 2026-10-17 20:15:40 INFO Eksempel: Serie 1x02 - ikke Seerr-ønske og mangler mærket oversaet
-2026-10-17 20:15:40 INFO Runde: 6 mangler dansk, 1 oversættes, 1 søgt nu, 1 venter, 1 fandt dansk ved søgning, 1 ikke valgt, ...
+2026-10-17 20:15:40 INFO Runde: 6 mangler dansk, 1 oversættes, 1 søgt nu, 1 venter, 1 fandt dansk ved søgning, 1 ikke valgt, ..., 0 fejl ved opslag, 0 ukendt i Bazarr
 2026-10-17 20:15:40 INFO Gyldig søgning fandt ikke dansk - oversætter Filmnavn selv (Seerr) med claude-opus-5-5 (effort medium): 1412 replikker fra ekstern engelsk: Filmnavn.en.srt
 2026-10-17 20:18:31 INFO Rettelsesrunde: 19 af 23 flagede replikker rettet
 2026-10-17 20:18:33 INFO Uploadet til Bazarr: Filmnavn.da.srt (Bazarr registrerer teksten)
@@ -201,10 +201,18 @@ Skriv nøglen i filen med `sudo nano` (kun nøglen, én linje). Mangler en nøgl
 
 `glem` sletter filmens række i databasen (med dens gemte ordliste), så næste runde behandler den, som om den var ny (trin B4f). Bazarr og filerne røres ikke – en dansk fil, der allerede ligger ved filmen, bliver liggende, og så ser næste runde blot, at der er dansk. Slet den danske fil i Bazarr først, hvis filmen skal oversættes igen.
 
+Hvilke titler `glem` må slette (trin B8):
+
+| Status | glem |
+|---|---|
+| `fejlet`, `sprunget_over`, `ikke_muligt` | slettes uden flag |
+| alle andre (`faerdig`, `forsoeg_igen`, `i_gang`, `soeger`, `soegt`, `mangler_engelsk`) | kun med `--alle` – ellers afvises det med en forklaring, så fx en færdig titel ikke slettes ved en fejl og oversættes igen for penge |
+
 ```bash
 sudo docker exec oversaetter python -m oversaetter glem "Idiots"
 sudo docker exec oversaetter python -m oversaetter glem 12345      # TMDB-id (slås op i Radarr)
 sudo docker exec oversaetter python -m oversaetter glem movie:12   # nøglen fra loggen
+sudo docker exec oversaetter python -m oversaetter glem "Idiots" --alle   # uanset status, også færdig
 ```
 
 Loggen viser, hvad der blev slettet. Passer titlen på flere rækker, slettes intet, og nøglerne vises.
@@ -220,7 +228,7 @@ Loggen viser, hvad der blev slettet. Passer titlen på flere rækker, slettes in
   Har en tjeneste været sat på pause i over 24 timer i træk, skrives en advarsel i hver runde. Der oversættes stadig ikke. `SEERR_DELAY_MINUTES`, `TAG_DELAY_HOURS` og `FIRST_SEEN_DELAY_HOURS` bruges ikke længere. Står de i `.env`, ignoreres de (med én INFO-linje ved start).
 - **Ingen engelsk tekst** (besluttet af Jesper 17.10.2026):
   1. Som før: først en gyldig søgning efter dansk. Finder den dansk, er emnet færdigt.
-  2. Finder den ikke dansk, og der er ingen brugbar engelsk tekstkilde (ekstern .srt eller indlejret tekstspor), beder programmet Bazarr søge efter **engelsk** (samme kald, `language=en`) med de samme regler om tjenester på pause før og efter søgningen.
+  2. Finder den ikke dansk, og der er ingen brugbar engelsk tekstkilde (ekstern .srt eller indlejret tekstspor), beder programmet først Bazarr om "Scan Disk" for emnet (én gang pr. titel, trin B8) og tjekker igen. Er der stadig ingen, beder programmet Bazarr søge efter **engelsk** (samme kald, `language=en`) med de samme regler om tjenester på pause før og efter søgningen.
   3. Findes der engelsk efter søgningen, oversættes der straks.
   4. Findes der stadig ikke engelsk, springes emnet over. Programmet tjekker dog hver runde (uden ny søgning), om der er dukket en engelsk tekst op, fx fordi Bazarr selv har hentet en, eller du har hentet en manuelt. Gør der det, oversættes der straks. En ny søgning efter engelsk startes tidligst 24 timer efter den forrige.
 
@@ -349,9 +357,32 @@ Loggen viser, hvad der blev slettet. Passer titlen på flere rækker, slettes in
   - Kun den endelige status sendes: `forsoeg_igen` (første fejl), `ikke_muligt` (fx billedbaseret tekst) og prøvetilstand sender intet. `oversaet-test` sender aldrig.
   - **Må aldrig skade oversættelsen**: sendingen sker til sidst (efter synk og Plex), hvert forsøg har en hård grænse på 10 sekunder, og ved netværksfejl, timeout eller serverfejl (5xx) prøves der én gang mere. Lykkes det, logges `Feed: sendt <titel>`. Fejler det, logges en WARNING (`Feed: kunne ikke sende <titel> (HTTP 500)`), og titlen er stadig færdig. HTTP 401/403 prøves ikke igen; advarslen siger, at tokenet i `feed_token.txt` skal være det samme som `OVERSAETTER_TOKEN` i backenden. Tokenet logges aldrig.
 
+- **Trin B8: fem rettelser efter driften** (31.10.2026):
+  1. **Pause ved udgiftsgrænse og nøglefejl.** Svarer Anthropic "usage limits", "insufficient credit"/"credit balance" eller HTTP 401/403 (ugyldig nøgle) – i ordlisten, en bid, batchen (hele batchen afvist, eller de direkte genforsøg efter batchen) eller rettelsesrunden – så sker dette:
+     - titlen afbrydes med det samme. Status sættes tilbage til, hvad den var (typisk `soegt`), og intet forsøg bruges
+     - der uploades intet, og ingen replik "beholder den engelske tekst"
+     - loggen får én ERROR med årsagen, fx `Anthropic melder, at udgiftsgrænsen er nået (usage limits) - Film er afbrudt uden upload, og status er uændret (soegt). Pause i 30 minutter, prøver igen kl. 17:30`
+     - i pausen (`ACCOUNT_PAUSE_MINUTES`, standard 30) gør runderne intet andet end at skrive én linje: `Pause pga. udgiftsgrænse, prøver igen kl. 17:30` (eller `Pause pga. nøglefejl ...`)
+     - efter pausen prøves igen. Virker det stadig ikke, holdes en ny pause.
+
+     En betalt batch beholder sit id (`items.batch_id`), så svarene hentes efter pausen i stedet for at blive sendt igen. Netværksfejl, 5xx/overbelastning og timeout håndteres som før (genforsøg, halvering, `forsoeg_igen`).
+  2. **95 %-reglen.** En titel uploades kun, hvis mindst 95 % af replikkerne faktisk er oversat. Ellers logges en ERROR (`kun 8 af 10 replikker (80 %) blev oversat - under 95 %, intet uploadet`), og titlen fejler som en almindelig fejl (`forsoeg_igen`, derefter `fejlet`). "Beholder den engelske tekst" er kun i orden for enkelte replikker.
+  3. **Mærket læses hver runde.** Mærkelisten fra Radarr/Sonarr hentes forfra i hver runde (det gjorde den allerede – nu er det dækket af en test), så et nyt mærke virker uden genstart.
+  4. **Runde-linjen går op.** `Runde:` slutter nu med `N fejl ved opslag, M ukendt i Bazarr`. Fejl ved opslag tæller opslag i Radarr/Sonarr, der fejlede, plus Bazarr-kald, der fejlede under søgningen (start eller opslag bagefter).
+  5. **`glem`** sletter uden flag kun `fejlet`, `sprunget_over` og `ikke_muligt`; alle andre statusser (også `faerdig`) kræver `--alle` (se "Kør en film forfra: glem").
+  6. **HI-mærke efter upload.** Bazarr gemmer af og til vores danske tekst som `.da.hi.srt` (set på Gold Rush 15x2), selv om uploaden er `hi=false`. Efter synken (trin B6b) og før Plex tjekkes det:
+     - registrerer Bazarr teksten som HI, gemmes først en kopi af filen i `/opt/oversaetter/data/hi-fund/` (`/data/hi-fund/` i containeren, højst 10 filer, navngivet `<nøgle>-<filnavn>`), så vi kan finde mønstret senere
+     - filen omdøbes fra `.da.hi.srt` til `.da.srt` (kun hvis `.da.srt` ikke findes)
+     - Bazarr bedes scanne filmen/serien igen (samme kald som "Scan Disk"), og der tjekkes igen (højst 1 minut)
+     - loggen viser `HI-mærke: omdøbt ...` og `HI-mærke rettet: ...`, eller `ADVARSEL: Bazarr ser stadig ikke ... som almindelig`
+     - feedet (trin B7) får stadig noten om HI.
+  7. **Scan disk før "ingen engelsk tekstkilde".** Finder programmet ingen engelsk kilde i Bazarrs liste, beder det først Bazarr om "Scan Disk" for filmen/serien (samme kald som knappen) og læser listen igen, før det giver op og søger efter engelsk. Det sker én gang pr. titel (tidspunktet gemmes i `items.disk_scan_at`; `glem` nulstiller det). Årsag: Bazarr havde ikke indekseret Gold Rush sæson 17, selv om filerne havde et indlejret engelsk SDH-spor. Loggen viser `Ingen engelsk tekstkilde til X i Bazarr - beder Bazarr scanne disken og tjekker igen` og derefter `Efter scan disk har Bazarr en engelsk kilde til X: ...` eller `Heller ingen engelsk tekstkilde til X efter scan disk`. I prøvetilstand scannes der ikke.
+
 ## Hvis noget går galt
 
 - Mislykkes en oversættelse, prøves den igen ved næste runde. Går det galt igen, markeres den som "fejlet" og prøves ikke igen automatisk.
+- `Pause pga. udgiftsgrænse, prøver igen kl. ...` – Anthropic-kontoen har nået sin udgiftsgrænse eller mangler credits. Hæv grænsen eller køb credits i Anthropic Console. Programmet prøver selv igen efter pausen, og ingen titler har mistet et forsøg (se "Trin B8"). `Pause pga. nøglefejl` betyder, at nøglen i `/opt/lingarr/secrets/anthropic_api_key.txt` er forkert.
+- Titler, der fejlede pga. udgiftsgrænsen før trin B8 (status `fejlet`), kan sættes i gang igen med `glem`.
 - Billedbaserede undertekster (PGS/VobSub) kan ikke oversættes og springes over. Mangler ffmpeg, eller fejler udtrækningen, prøves emnet igen i næste runde.
 - Når en replik ender med at beholde den engelske tekst (afvist af begge modeller eller ugyldigt svar), står det som `ERROR ... beholder den engelske tekst` og `ADVARSEL: N af M replikker ... beholder den engelske tekst` i loggen.
 - Fejler uploaden til Bazarr, står der `ADVARSEL: Upload til Bazarr fejlede` i loggen; filen er så skrevet ved siden af videoen, og Bazarr er bedt om at scanne disken.

@@ -26,13 +26,14 @@ from .direct import (
     english_cues,
     english_source,
 )
+from .konto import AccountBlocked
 from .plex import refresh_folder
 from .postprocess import make_client, postprocess
 from .proofread import DbBudget
 from .search import PAUSE_WARN, nice_name, paused_providers, search_jobs, unfinished, wait_for_jobs, waiting_text
 from .selection import Candidate, Selector, Stats, choose_source
 from .srt import read_file, write_file_atomic
-from .synk import sync_after_upload
+from .synk import fix_hi_after_upload, sync_after_upload
 from .translate import request_translation
 
 log = logging.getLogger("oversaetter")
@@ -71,9 +72,15 @@ class Runner:
         self.stopping = False
         self.searches_left = max(0, cfg.max_searches_per_round)
         self.current: tuple[str, str] | None = None  # (key, titel) på emnet, der behandles lige nu
+        # Trin B8: pause efter udgiftsgrænse/nøglefejl hos Anthropic (efter clock) og hvornår den slutter (klokken)
+        self.pause_until: float | None = None
+        self.pause_kind = ""
+        self.pause_at: datetime | None = None
 
     # --- én runde -----------------------------------------------------------------
     def run_once(self) -> list[Candidate]:
+        if self.in_pause(log_line=True):
+            return []
         try:
             seerr_index = SeerrIndex(self.seerr.requests())
         except Exception as e:
@@ -95,7 +102,7 @@ class Runner:
         self._log_round(stats)
         log.info(
             "Runde: %d mangler dansk, %d oversættes, %d søgt nu, %d venter, %d fandt dansk ved søgning, "
-            "%d ikke valgt, %d allerede behandlet, %d sprunget over",
+            "%d ikke valgt, %d allerede behandlet, %d sprunget over, %d fejl ved opslag, %d ukendt i Bazarr",
             stats.wanted,
             len(candidates),
             stats.searched,
@@ -104,12 +111,34 @@ class Runner:
             stats.not_selected,
             stats.done_before,
             len(stats.skipped),
+            stats.lookup_errors,
+            stats.unknown,
         )
         for cand in candidates:
-            if self.stopping:
+            if self.stopping or self.in_pause():
                 break
             self.process(cand)
         return candidates
+
+    # --- pause ved udgiftsgrænse/nøglefejl (trin B8) ------------------------------------------------
+    def in_pause(self, log_line: bool = False) -> bool:
+        """Holdes der pause? log_line: skriv rundens ene linje om pausen (eller at den er slut)."""
+        if self.pause_until is None:
+            return False
+        if self.clock() < self.pause_until:
+            if log_line:
+                log.info("Pause pga. %s, prøver igen kl. %s", self.pause_kind, f"{self.pause_at:%H:%M}")
+            return True
+        if log_line:
+            log.info("Pausen pga. %s er slut - prøver at oversætte igen", self.pause_kind)
+        self.pause_until = None
+        return False
+
+    def _start_pause(self, e: AccountBlocked) -> None:
+        minutes = max(0.0, self.cfg.account_pause_minutes)
+        self.pause_until = self.clock() + minutes * 60
+        self.pause_kind = e.kind
+        self.pause_at = datetime.now().astimezone() + timedelta(minutes=minutes)
 
     # --- nye mærker: bed Bazarr synkronisere -----------------------------------------------
     def sync_new_tags(self, selector: Selector) -> None:
@@ -267,6 +296,7 @@ class Runner:
                 log.info("Søger nu efter %s til %s (%s)", lang, cand.title, why)
                 jobs = self._start_search(cand, language)
                 if jobs is None:
+                    stats.lookup_errors += 1
                     stats.example("fejl", cand.title, "Bazarr kunne ikke starte søgningen")
                     continue
                 stats.searched += 1
@@ -322,6 +352,7 @@ class Runner:
                 item = self.bazarr.item(cand.media_type, cand.media_id)
             except ApiError as e:
                 log.warning("Kunne ikke spørge Bazarr om %s efter søgningen: %s", cand.title, e)
+                stats.lookup_errors += 1
                 continue
             out = selector.after_search(cand, item, stats)
             if out:
@@ -436,6 +467,12 @@ class Runner:
         self.current = (cand.key, cand.title)
         row = self.db.get(cand.key)
         attempts = (row["attempts"] if row else 0) + 1
+        # Trin B8: sådan stod titlen før - gendannes, hvis Anthropic afviser kontoen undervejs.
+        before = {
+            "status": row["status"] if row else "soegt",
+            "attempts": row["attempts"] if row else 0,
+            "reason": row["reason"] if row else None,
+        }
         self.db.upsert(
             cand.key,
             media_type=cand.media_type,
@@ -451,10 +488,26 @@ class Runner:
             series_id=cand.series_id,
         )
         try:
+            self._translate_direct(cand, cfg, budget, attempts)
+        except AccountBlocked as e:
+            # Trin B8: intet forsøg brugt, status uændret, intet uploadet - pause, og titlen tages op igen bagefter.
+            self.db.upsert(cand.key, **before)
+            self._start_pause(e)
+            log.error(
+                "%s - %s er afbrudt uden upload, og status er uændret (%s). Pause i %g minutter, prøver igen kl. %s",
+                e.reason,
+                cand.title,
+                before["status"],
+                cfg.account_pause_minutes,
+                f"{self.pause_at:%H:%M}",
+            )
+        self.current = None
+
+    def _translate_direct(self, cand: Candidate, cfg: Config, budget: DbBudget, attempts: int) -> None:
+        try:
             en, desc, label, by_name = english_source(cand, self.run_cmd)
         except NoEnglish as e:
             self._failed(cand.key, cand.title, attempts, str(e), e.permanent)
-            self.current = None
             return
         direct = DirectTranslator(
             cfg,
@@ -475,7 +528,6 @@ class Runner:
         if not out.ok:
             self.db.upsert(cand.key, cost_usd=out.cost)
             self._failed(cand.key, cand.title, attempts, out.reason, cues=out.lines, seconds=out.seconds)
-            self.current = None
             return
         self.db.upsert(
             cand.key,
@@ -491,9 +543,11 @@ class Runner:
         if out.delivery == UPLOADED:
             # Bazarrs automatiske synk kører heller ikke ved upload: bed om den først, så Plex ser den synkroniserede
             # fil (trin B6b). Fejler den, får Plex besked alligevel.
-            synced = sync_after_upload(cfg, self.bazarr, cand, self.sleep, self.clock, warnings)
+            synced = sync_after_upload(cfg, self.bazarr, cand, self.sleep, self.clock)
             if synced is not None:
                 self.db.upsert(cand.key, bazarr_sync=int(synced))
+            # Trin B8: mærker Bazarr alligevel teksten som HI, omdøbes filen, og Bazarr scanner igen (før Plex).
+            fix_hi_after_upload(cfg, self.bazarr, cand, self.sleep, self.clock, warnings)
             # Bazarrs egen Plex-opdatering kører kun ved download, ikke ved upload (trin B4g).
             refreshed = refresh_folder(cfg, self.http, cand.video_path)
             if refreshed is not None:
@@ -501,7 +555,6 @@ class Runner:
         # Trin B7: til sidst, så en HI-advarsel fra synken kommer med. Fejler aldrig.
         note = "; ".join(warnings) or f"{out.flags_before} flag"
         self._feed(cand.title, cand.media_type, "done", out.lines, out.seconds, out.cost, note)
-        self.current = None
 
     def context_for(self, cand: Candidate) -> str | None:
         """CONTEXT=on: filmkonteksten fra Radarr/Sonarr (og TMDB, hvis der er en nøgle). Fejler aldrig."""

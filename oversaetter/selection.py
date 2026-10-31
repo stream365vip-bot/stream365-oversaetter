@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 
 from .clients import ApiError, Bazarr, Radarr, SeerrIndex, Sonarr, parse_date
 from .config import Config
-from .db import Database
+from .db import Database, iso
 from .hi import hi_filename
 
 log = logging.getLogger("oversaetter")
@@ -54,6 +54,8 @@ class Stats:
     searched: int = 0
     found_danish: int = 0
     done_before: int = 0
+    lookup_errors: int = 0  # trin B8: fejl ved opslag i Radarr/Sonarr/Bazarr (egne tal i Runde-linjen)
+    unknown: int = 0  # trin B8: Bazarr kender ikke emnet
     skipped: list[str] = field(default_factory=list)
     # Bazarrs rå tal (hele wanted-listen) og hvor mange af dem der mangler dansk.
     bazarr_movies: int = 0
@@ -281,10 +283,39 @@ class Selector:
         if not self.cfg.dry_run:
             self.db.upsert(cand.key, status="mangler_engelsk", reason=full)
 
+    def scan_for_english(self, cand: Candidate, subtitles: list[dict]) -> list[dict]:
+        """Trin B8: ingen engelsk kilde i Bazarrs liste - bed én gang pr. titel om "Scan Disk", og læs listen igen.
+
+        Bazarr havde ikke indekseret Gold Rush sæson 17, selv om filerne havde et indlejret engelsk SDH-spor.
+        Returnerer den (evt. nye) liste over tekster. Fejl giver en advarsel og den gamle liste.
+        """
+        row = self.db.get(cand.key)
+        if self.cfg.dry_run or (row is not None and row["disk_scan_at"]):
+            return subtitles
+        log.info("Ingen engelsk tekstkilde til %s i Bazarr - beder Bazarr scanne disken og tjekker igen", cand.title)
+        if row is not None:
+            self.db.upsert(cand.key, disk_scan_at=iso())
+        try:
+            self.bazarr.scan_disk(cand.media_type, cand.media_id, cand.series_id)
+            item = self.bazarr.item(cand.media_type, cand.media_id)
+        except ApiError as e:
+            log.warning("Scan disk for %s fejlede: %s", cand.title, e)
+            return subtitles
+        if not item:
+            return subtitles
+        fresh = item.get("subtitles") or []
+        path, sub_id, desc = choose_source(fresh)
+        if path or sub_id is not None:
+            log.info("Efter scan disk har Bazarr en engelsk kilde til %s: %s", cand.title, desc)
+        else:
+            log.info("Heller ingen engelsk tekstkilde til %s efter scan disk", cand.title)
+        return fresh
+
     def after_search(self, cand: Candidate, item: dict | None, stats: Stats) -> Candidate | None:
         """Efter en gyldig søgning: mangler emnet stadig dansk, og er der en engelsk kilde?"""
         if not item:
             log.warning("Bazarr kender ikke %s", cand.title)
+            stats.unknown += 1
             stats.example("fejl", cand.title, "Bazarr kender den ikke")
             return None
         cand.video_path = item.get("path") or cand.video_path
@@ -294,6 +325,9 @@ class Selector:
             self.found_danish(cand, stats)
             return None
         path, sub_id, desc = choose_source(subtitles)
+        if not path and sub_id is None:
+            subtitles = self.scan_for_english(cand, subtitles)
+            path, sub_id, desc = choose_source(subtitles)
         if not path and sub_id is None:
             self.no_english(cand, no_source_reason(subtitles), stats)
             return None
@@ -343,6 +377,7 @@ class Selector:
                 if msg not in stats.errors:
                     log.warning("Kunne ikke slå %s op i Radarr/Sonarr: %s", title, msg)
                 stats.errors[msg] = stats.errors.get(msg, 0) + 1
+                stats.lookup_errors += 1
                 stats.example("fejl", title, f"fejl ved opslag: {msg}")
                 continue
             if reason is None:
@@ -353,6 +388,7 @@ class Selector:
             item = self.bazarr.item(media_type, media_id)
             if not item:
                 log.warning("Bazarr kender ikke %s", title)
+                stats.unknown += 1
                 stats.example("fejl", title, "Bazarr kender den ikke")
                 continue
             cand.video_path = item.get("path") or ""

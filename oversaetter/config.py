@@ -103,6 +103,8 @@ class Config:
     feed_url: str = ""
     feed_token_file: str = "/run/secrets/feed_token"
     usd_to_dkk: float = 6.7  # cost_dkk = cost_usd × USD_TO_DKK
+    # Trin B8: Anthropic afviser kontoen (udgiftsgrænse, ingen credits, ugyldig nøgle) - så længe holdes der pause.
+    account_pause_minutes: float = 30.0
 
     poll_minutes: float = 15.0
     translate_tag: str = "oversaet"

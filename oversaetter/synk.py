@@ -5,12 +5,17 @@ som Sync-knappen på filmens/afsnittets side (PATCH /api/subtitles, action=sync)
 hi=False som uploaden, og stien som Bazarr selv har registreret den danske fil under. Nyere Bazarr lægger synken i
 jobkøen; så ventes der på jobbet, højst SYNC_TIMEOUT i alt. Fejl eller timeout bliver til en tydelig advarsel - emnet
 fejler aldrig af den grund, og Plex får besked bagefter alligevel (runneren).
+
+Trin B8: registrerer Bazarr alligevel vores danske tekst som HI (fil .da.hi.srt), omdøbes filen til .da.srt (kun hvis
+den ikke findes), Bazarr bedes scanne disken for emnet, og der tjekkes igen. En kopi af filen gemmes i
+<DATA_DIR>/hi-fund/ (højst HI_FIND_MAX filer), så mønstret kan findes senere.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import shutil
 
 from .clients import ApiError, Bazarr
 from .config import Config
@@ -23,6 +28,9 @@ log = logging.getLogger("oversaetter")
 SYNC_TIMEOUT = 600.0  # højst så mange sekunder på hele synken (kaldet og ventetiden på jobbet)
 FAILED = ("failed", "error")
 HI_NOTE = "Bazarr har registreret den danske tekst som HI"  # kort tekst til feedet (trin B7)
+HI_FIND_DIR = "hi-fund"  # under DATA_DIR (/data/hi-fund)
+HI_FIND_MAX = 10
+HI_RECHECK = 60.0  # så længe ventes der højst på, at Bazarr har scannet disken igen (sekunder)
 
 
 def danish_subtitle(bazarr: Bazarr, cand: Candidate) -> dict | None:
@@ -44,13 +52,12 @@ def _job_ids(jobs: list[dict] | None) -> set[int]:
     return {int(j["job_id"]) for j in jobs or [] if j.get("job_id") is not None}
 
 
-def sync_after_upload(
-    cfg: Config, bazarr: Bazarr, cand: Candidate, sleep, clock, warnings: list[str] | None = None
-) -> bool | None:
-    """True = synkroniseret, False = fejlede eller timeout (advarsel), None = slået fra (SYNC_AFTER_UPLOAD=false).
+def is_hi(sub: dict | None) -> bool:
+    return bool(sub) and (bool(sub.get("hi")) or hi_filename(str(sub.get("path") or "")))
 
-    warnings: får en kort tekst tilføjet, hvis Bazarr har registreret den danske tekst som HI (til feedet, trin B7).
-    """
+
+def sync_after_upload(cfg: Config, bazarr: Bazarr, cand: Candidate, sleep, clock) -> bool | None:
+    """True = synkroniseret, False = fejlede eller timeout (advarsel), None = slået fra (SYNC_AFTER_UPLOAD=false)."""
     if not cfg.sync_after_upload:
         log.info("Synk efter upload er slået fra (SYNC_AFTER_UPLOAD=false) - %s synkroniseres ikke", cand.title)
         return None
@@ -60,15 +67,6 @@ def sync_after_upload(
     except ApiError:
         sub = None
     path = str(sub["path"]) if sub else cand.da_path
-    if sub and (sub.get("hi") or hi_filename(path)):
-        log.warning(
-            "ADVARSEL: Bazarr har registreret den danske tekst til %s som HI (%s), selv om den blev uploadet med "
-            "hi=false - tjek filen i Bazarr",
-            cand.title,
-            path,
-        )
-        if warnings is not None:
-            warnings.append(HI_NOTE)
     before = bazarr.jobs()
     try:
         bazarr.sync_subtitle(cand.media_type, cand.media_id, path, max(1.0, deadline - clock()))
@@ -115,3 +113,86 @@ def sync_after_upload(
         after = bazarr.jobs()
     log.info("Bazarr har synkroniseret den danske tekst til %s mod lyden (%s)", cand.title, path)
     return True
+
+
+def _save_hi_find(cfg: Config, cand: Candidate, path: str) -> str | None:
+    """Gem en kopi af den danske fil, som Bazarr mærkede HI, i <DATA_DIR>/hi-fund/ (højst HI_FIND_MAX filer)."""
+    folder = os.path.join(cfg.data_dir, HI_FIND_DIR)
+    try:
+        os.makedirs(folder, exist_ok=True)
+        if len(os.listdir(folder)) >= HI_FIND_MAX:
+            log.info("HI-fund: %s har allerede %d filer - gemmer ikke en kopi af %s", folder, HI_FIND_MAX, cand.title)
+            return None
+        target = os.path.join(folder, f"{cand.key.replace(':', '-')}-{os.path.basename(path)}")
+        shutil.copyfile(path, target)
+    except OSError as e:
+        log.warning("HI-fund: kunne ikke gemme en kopi af %s (%s)", path, e.strerror or type(e).__name__)
+        return None
+    log.info("HI-fund: kopi af den danske fil gemt som %s", target)
+    return target
+
+
+def fix_hi_after_upload(
+    cfg: Config, bazarr: Bazarr, cand: Candidate, sleep, clock, warnings: list[str] | None = None
+) -> bool | None:
+    """Trin B8: efter synken - har Bazarr registreret vores danske tekst som HI, så ret det.
+
+    None = ikke HI (intet gjort), True = rettet (Bazarr ser nu teksten som almindelig), False = stadig HI.
+    warnings: får HI_NOTE tilføjet, hvis teksten var registreret som HI (til feedet, trin B7).
+    """
+    try:
+        sub = danish_subtitle(bazarr, cand)
+    except ApiError:
+        return None
+    if not is_hi(sub):
+        return None
+    path = str(sub["path"])
+    log.warning(
+        "ADVARSEL: Bazarr har registreret den danske tekst til %s som HI (%s), selv om den blev uploadet med "
+        "hi=false - retter det",
+        cand.title,
+        path,
+    )
+    if warnings is not None:
+        warnings.append(HI_NOTE)
+    if os.path.isfile(path):
+        _save_hi_find(cfg, cand, path)
+    target = cand.da_path
+    if hi_filename(path) and os.path.abspath(path) != os.path.abspath(target):
+        if os.path.exists(target):
+            log.warning("HI-mærke: %s findes allerede - %s er ikke omdøbt", target, path)
+        elif not os.path.isfile(path):
+            log.warning("HI-mærke: %s findes ikke på disken - kan ikke omdøbe den", path)
+        else:
+            try:
+                os.rename(path, target)
+                log.info("HI-mærke: omdøbt %s til %s", os.path.basename(path), os.path.basename(target))
+            except OSError as e:
+                log.warning("HI-mærke: kunne ikke omdøbe %s (%s)", path, e.strerror or type(e).__name__)
+    try:
+        bazarr.scan_disk(cand.media_type, cand.media_id, cand.series_id)
+    except ApiError as e:
+        log.warning("HI-mærke: kunne ikke bede Bazarr scanne disken for %s: %s", cand.title, e)
+        return False
+    deadline = clock() + HI_RECHECK
+    while True:
+        try:
+            sub = danish_subtitle(bazarr, cand)
+        except ApiError:
+            sub = None
+        if sub is not None and not is_hi(sub):
+            log.info(
+                "HI-mærke rettet: Bazarr ser nu den danske tekst til %s som almindelig (%s)", cand.title, sub["path"]
+            )
+            return True
+        if clock() >= deadline:
+            break
+        sleep(POLL_SECONDS)
+    shown = sub["path"] if sub else "ingen dansk tekst registreret"
+    log.warning(
+        "ADVARSEL: Bazarr ser stadig ikke den danske tekst til %s som almindelig efter ny scanning (%s) - tjek "
+        "filen i Bazarr",
+        cand.title,
+        shown,
+    )
+    return False

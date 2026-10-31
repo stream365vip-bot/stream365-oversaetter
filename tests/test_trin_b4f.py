@@ -160,14 +160,17 @@ def _db(tmp_path):
 def test_forget_by_title_removes_row(tmp_path, caplog):
     db = _db(tmp_path)
     with caplog.at_level(logging.INFO, logger="oversaetter"):
-        assert forget(make_cfg(tmp_path), "idiots", db=db) == 0
+        assert forget(make_cfg(tmp_path), "idiots", db=db, all_statuses=True) == 0
     assert db.get("movie:7") is None and db.get("movie:8") is not None
     assert "Glemt: Idiots (movie:7, status faerdig, forsøg 0, med ordliste)" in caplog.text
 
 
 def test_forget_by_tmdb_id(tmp_path):
     db = _db(tmp_path)
-    assert forget(make_cfg(tmp_path), "4242", db=db, radarr=FakeRadarr([{"id": 7, "tmdbId": 4242}])) == 0
+    assert (
+        forget(make_cfg(tmp_path), "4242", db=db, radarr=FakeRadarr([{"id": 7, "tmdbId": 4242}]), all_statuses=True)
+        == 0
+    )
     assert db.get("movie:7") is None and db.get("movie:8") is not None
 
 

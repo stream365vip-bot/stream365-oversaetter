@@ -28,6 +28,7 @@ from .clients import ApiError, Bazarr
 from .config import BATCH_FACTOR, Config, model_price
 from .credit import apply_credit
 from .deadline import call_with_timeout
+from .konto import account_problem
 from .ordliste import Wordlist, merge_previous
 from .oversaet import (
     BatchApi,
@@ -55,6 +56,7 @@ FIX_CONTEXT = 2
 FIX_MAX_TOKENS = 16000
 BATCH = 50
 BATCH_LOG_EVERY = 120  # BATCH_API: en INFO-linje med batchens status så ofte (sekunder)
+MIN_TRANSLATED = 0.95  # trin B8: en titel uploades kun, hvis mindst så stor en andel af replikkerne er oversat
 UPLOADED = "uploadet til Bazarr"  # deliver() efter en vellykket upload (så beder runneren Plex scanne, trin B4g)
 
 # Tekstbaserede undertekstformater, som ffmpeg kan lave om til srt. Alt andet (PGS, VobSub, DVB ...) springes over.
@@ -291,6 +293,9 @@ def fix_flagged(
         log.error("Rettelsesrunden fik intet svar inden for %g sekunder (timeout) - ingen rettelser", timeout)
         return {}
     except Exception as e:  # netværk, API-fejl osv.
+        blocked = account_problem(e)
+        if blocked is not None:  # trin B8: udgiftsgrænse/nøglefejl - hele titlen stoppes, intet uploades
+            raise blocked from e
         log.error("Rettelsesrunden fejlede (%s: %s) - ingen rettelser", type(e).__name__, str(e)[:200])
         return {}
     usage = getattr(response, "usage", None)
@@ -509,6 +514,16 @@ class DirectTranslator:
         if len(res.fallback) == len(en_cues):
             outcome.cost, outcome.seconds = spent["cost"], self.clock() - started
             outcome.reason = "ingen replikker blev oversat (se fejlene ovenfor)"
+            return outcome
+        translated = len(en_cues) - len(res.fallback)
+        if translated < MIN_TRANSLATED * len(en_cues):
+            # Trin B8: "beholder engelsk tekst" er kun i orden for enkelte replikker, ikke for hele bidder.
+            outcome.cost, outcome.seconds = spent["cost"], self.clock() - started
+            outcome.reason = (
+                f"kun {translated} af {len(en_cues)} replikker ({100 * translated / len(en_cues):.0f} %) blev "
+                f"oversat - under {100 * MIN_TRANSLATED:.0f} %, intet uploadet"
+            )
+            log.error("%s: %s (se fejlene ovenfor)", cand.title, outcome.reason)
             return outcome
         if res.fallback:
             log.error(

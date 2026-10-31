@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS items (
     en_hi INTEGER,                 -- 1 = oversat fra en engelsk HI/SDH-kilde, 0 = almindelig (NULL = ikke vurderet)
     plex_refresh INTEGER,          -- 1 = Plex bedt om at scanne mappen, 0 = fejlede (NULL = ikke forsøgt)
     bazarr_sync INTEGER,           -- 1 = Bazarr har synkroniseret den danske tekst, 0 = fejlede (NULL = ikke forsøgt)
-    batch_id TEXT                  -- Anthropic Message Batch, der er sendt, men hvis svar ikke er hentet (BATCH_API)
+    batch_id TEXT,                 -- Anthropic Message Batch, der er sendt, men hvis svar ikke er hentet (BATCH_API)
+    disk_scan_at TEXT              -- Bazarr er bedt om "Scan Disk", fordi der ikke var nogen engelsk kilde (trin B8)
 );
 CREATE TABLE IF NOT EXISTS spend (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,6 +65,7 @@ NEW_COLUMNS = {
         "plex_refresh": "INTEGER",
         "bazarr_sync": "INTEGER",
         "batch_id": "TEXT",
+        "disk_scan_at": "TEXT",
     }
 }
 

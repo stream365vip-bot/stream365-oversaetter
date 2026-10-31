@@ -17,6 +17,10 @@ from .postprocess import make_client, postprocess
 from .proofread import DbBudget
 from .srt import read_file, write_file_atomic
 
+# Trin B8: glem sletter uden flag kun titler, der ikke bliver oversat af sig selv. Alle andre statusser (faerdig,
+# forsoeg_igen, i_gang ...) kræver --alle - en færdig titel ville ellers blive oversat igen for penge ved en fejl.
+FORGET_FREELY = ("fejlet", "sprunget_over", "ikke_muligt")
+
 
 class OneLineFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
@@ -90,10 +94,11 @@ def run_test(cfg: Config, en: str, da: str, out: str, client=None, budget=None) 
     return 0
 
 
-def forget(cfg: Config, what: str, db: Database | None = None, radarr=None) -> int:
+def forget(cfg: Config, what: str, db: Database | None = None, radarr=None, all_statuses: bool = False) -> int:
     """Slet filmens række i items (og dermed dens ordliste), så næste runde behandler den forfra (trin B4f).
 
     what: titlen, TMDB-id'et (kun tal, slås op i Radarr) eller nøglen ("movie:12"). Rører ikke Bazarr eller filer.
+    all_statuses (--alle): må slette en titel med enhver status, også faerdig (trin B8). Uden: kun FORGET_FREELY.
     """
     log = logging.getLogger("oversaetter")
     db = db or Database(os.path.join(cfg.data_dir, "oversaetter.db"))
@@ -127,6 +132,23 @@ def forget(cfg: Config, what: str, db: Database | None = None, radarr=None) -> i
         )
         return 1
     row = rows[0]
+    status = row["status"]
+    if status not in FORGET_FREELY and not all_statuses:
+        why = (
+            "Den ville blive oversat igen (for penge), hvis den danske fil forsvinder"
+            if status == "faerdig"
+            else "Titlen behandles stadig automatisk"
+        )
+        log.error(
+            "%s (%s) har status %s - glem afvist. %s. Uden --alle sletter glem kun status %s; er det meningen, "
+            "så kør igen med --alle",
+            row["title"],
+            row["key"],
+            status,
+            why,
+            ", ".join(FORGET_FREELY),
+        )
+        return 1
     db.delete(row["key"])
     log.info(
         "Glemt: %s (%s, status %s, forsøg %d%s) - behandles forfra i næste runde",
@@ -168,12 +190,15 @@ def main(argv: list[str] | None = None) -> int:
     o.add_argument("--batch-id", help="hent svarene fra en eksisterende batch i stedet for at sende en ny")
     g = sub.add_parser("glem", help="slet en films række i databasen, så den behandles forfra")
     g.add_argument("what", help='titel, TMDB-id eller nøgle, fx "Idiots", 12345 eller movie:12')
+    g.add_argument(
+        "--alle", action="store_true", help="slet titlen uanset status, også faerdig (den oversættes så igen)"
+    )
     args = parser.parse_args(argv)
 
     cfg = Config.from_env()
     setup_logging(cfg.log_level)
     if args.cmd == "glem":
-        return forget(cfg, args.what)
+        return forget(cfg, args.what, all_statuses=args.alle)
     if args.cmd == "test":
         return run_test(cfg, args.en, args.da, args.out)
     if args.cmd == "oversaet-test":

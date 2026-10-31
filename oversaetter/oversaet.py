@@ -32,6 +32,7 @@ from .checks import (
 )
 from .config import BATCH_FACTOR, Config, model_price, read_key
 from .deadline import call_with_timeout
+from .konto import AccountBlocked, account_problem
 from .srt import Cue, read_file, write_file_atomic
 
 log = logging.getLogger("oversaetter")
@@ -319,6 +320,9 @@ class BatchApi:
         try:
             batch = self._call("retrieve", batch_id)
         except Exception as e:  # timeout, netværk, API-fejl: løkken prøver igen
+            blocked = account_problem(e)
+            if blocked is not None:  # trin B8: batchens id bliver stående, så svarene hentes efter pausen
+                raise blocked from e
             if getattr(e, "status_code", None) == 404:
                 raise BatchGone(f"batchen findes ikke ({type(e).__name__})") from None
             log.warning(
@@ -363,6 +367,9 @@ class BatchApi:
         try:
             batch = self.client.messages.batches.create(requests=requests)
         except Exception as e:  # netværk, API-fejl osv.: alle bidder oversættes direkte
+            blocked = account_problem(e)
+            if blocked is not None:  # trin B8: hele batchen afvist pga. kontoen - ingen direkte kald
+                raise blocked from e
             why = f"batchen kunne ikke sendes ({type(e).__name__})"
             log.error("Batchen kunne ikke sendes (%s: %s) - oversætter direkte", type(e).__name__, str(e)[:200])
             outcome = BatchOutcome(problems={r["custom_id"]: why for r in requests})
@@ -440,6 +447,9 @@ class BatchApi:
         try:
             items = call_with_timeout(read, self.results_timeout)
         except Exception as e:  # alle bidder oversættes direkte
+            blocked = account_problem(e)
+            if blocked is not None:  # trin B8: id'et bliver stående, svarene hentes efter pausen
+                raise blocked from e
             log.error("Kunne ikke hente svarene fra batch %s (%s: %s)", batch_id, type(e).__name__, str(e)[:200])
             return
         for item in items:
@@ -694,14 +704,24 @@ def make_glossary(
     speakers/notes: talernavne fra en HI-kilde (trin B4), så tiltalen (address) bliver bedre.
     """
 
+    blocked: list[AccountBlocked] = []
+
     def ask(system: str, user: str, schema: dict) -> Reply:
-        return call_with_timeout(ask_model, timeout, provider, client, model, effort, system, user, schema)
+        try:
+            return call_with_timeout(ask_model, timeout, provider, client, model, effort, system, user, schema)
+        except Exception as e:
+            problem = account_problem(e)
+            if problem is not None:
+                blocked.append(problem)
+            raise
 
     def usage(inp: int, out: int) -> None:
         if on_usage is not None:
             on_usage(model, inp, out, 0, 0)
 
     wl = ordliste.build(ask, en, context, previous, usage, speakers, notes)
+    if blocked:  # trin B8: kontoen er afvist - stop titlen i stedet for at oversætte uden ordliste
+        raise blocked[0]
     if wl is not None:
         wl.cost = model_price(model, wl.input_tokens, wl.output_tokens)
     return wl
@@ -785,6 +805,9 @@ def translate_all(
         except TimeoutError:
             return {}, [f"intet svar inden for {timeout:g} sekunder (timeout)"], False
         except Exception as e:  # netværk, API-fejl osv.
+            blocked = account_problem(e)
+            if blocked is not None:  # trin B8: udgiftsgrænse/nøglefejl - stop hele titlen, ingen engelsk fallback
+                raise blocked from e
             return {}, [f"fejl fra {PROVIDER_NAMES[provider]}: {type(e).__name__}: {str(e)[:200]}"], False
         with lock:
             result.input_tokens += reply.input_tokens
@@ -891,7 +914,8 @@ def translate_all(
     size = max(1, batch)
     starts = list(range(0, n, size))
     result.batches = len(starts)
-    stop = threading.Event()  # tidsgrænsen er nået: start ingen nye bidder
+    stop = threading.Event()  # tidsgrænsen er nået (eller kontoen er afvist): start ingen nye bidder
+    blocked: list[AccountBlocked] = []  # trin B8: Anthropic afviser kontoen - hele titlen stoppes bagefter
 
     def one_batch(k: int, start: int) -> None:
         end = min(n, start + size)
@@ -906,6 +930,11 @@ def translate_all(
         log.info("Oversætter bid %s (replik %d-%d) med %s", label, start + 1, end, model)
         try:
             run(start, end, label)
+        except AccountBlocked as e:
+            with lock:
+                blocked.append(e)
+            stop.set()
+            return
         except Exception:  # aldrig lade én bid stoppe resten
             log.exception("Uventet fejl i bid %s - replikkerne beholder den engelske tekst", label)
         with lock:
@@ -991,6 +1020,8 @@ def translate_all(
         with ThreadPoolExecutor(max_workers=parallel, thread_name_prefix="bid") as pool:
             for future in [pool.submit(one_batch, k, start) for k, start in todo]:
                 future.result()
+    if blocked:
+        raise blocked[0]
     for p in range(n):
         if da[p] is None:
             da[p] = en[p]
@@ -1105,30 +1136,44 @@ def run_translate_test(
     if context:
         ctx_text = _test_context(cfg, tmdb_id, http)
     wordlist = None
-    if glossary:
-        wordlist = make_glossary(
-            provider, client, model, effort, en, ctx_text, None, call_timeout, None, hi_result.speakers, hi_result.notes
+    try:
+        if glossary:
+            wordlist = make_glossary(
+                provider,
+                client,
+                model,
+                effort,
+                en,
+                ctx_text,
+                None,
+                call_timeout,
+                None,
+                hi_result.speakers,
+                hi_result.notes,
+            )
+        system = build_system(prompt, provider, ctx_text, wordlist)
+        res = translate_all(
+            en,
+            provider,
+            client,
+            model,
+            effort,
+            batch,
+            call_timeout,
+            system=system,
+            parallel=parallel,
+            empty_ok=filler_positions(en, prompt),
+            cache=cache,
+            notes=notes,
+            batch_api=(
+                BatchApi(client, batch_timeout, sleep=sleep, clock=clock, batch_id=batch_id)
+                if batch_api or batch_id
+                else None
+            ),
         )
-    system = build_system(prompt, provider, ctx_text, wordlist)
-    res = translate_all(
-        en,
-        provider,
-        client,
-        model,
-        effort,
-        batch,
-        call_timeout,
-        system=system,
-        parallel=parallel,
-        empty_ok=filler_positions(en, prompt),
-        cache=cache,
-        notes=notes,
-        batch_api=(
-            BatchApi(client, batch_timeout, sleep=sleep, clock=clock, batch_id=batch_id)
-            if batch_api or batch_id
-            else None
-        ),
-    )
+    except AccountBlocked as e:  # trin B8: ingen fil med engelsk tekst
+        log.error("%s - oversaet-test er stoppet, og %s er ikke skrevet", e.reason, out)
+        return 2
     kept, fallback = drop_empty(res.da, res.fallback)
     da_cues: list[Cue] = [replace(en_cues[p], text=res.da[p]) for p in kept]
     write_file_atomic(out, da_cues)  # ingen kreditlinje i testfilen

@@ -18,7 +18,7 @@ PROOFREAD_KEYS = (
 TRANSLATE_MODES = ("direct", "lingarr")
 PROMPT_VERSIONS = ("v3", "v4")
 # Felter hvor en tom værdi i .env betyder "slået fra" i stedet for "brug standard".
-EMPTY_ALLOWED = ("credit_text",)
+EMPTY_ALLOWED = ("credit_text", "feed_url")
 
 # Priser i USD pr. million tokens (ind, ud) til testtilstanden oversaet-test. Ukendt model = "pris ukendt".
 MODEL_PRICES: dict[str, tuple[float, float]] = {
@@ -99,6 +99,10 @@ class Config:
     plex_path_map: str = ""  # "fra=til": byt et sti-præfiks ud, hvis Plex ser mapperne et andet sted
     # Trin B6b: bed Bazarr synkronisere den danske tekst mod lyden efter upload (før Plex-scanningen).
     sync_after_upload: bool = True
+    # Trin B7: send hver færdig eller fejlet oversættelse til appens backend (RSS-widget). Tom FEED_URL = slået fra.
+    feed_url: str = ""
+    feed_token_file: str = "/run/secrets/feed_token"
+    usd_to_dkk: float = 6.7  # cost_dkk = cost_usd × USD_TO_DKK
 
     poll_minutes: float = 15.0
     translate_tag: str = "oversaet"
@@ -172,6 +176,7 @@ class Config:
             setattr(cfg, field, value)
         for name in ("bazarr_url", "radarr_url", "sonarr_url", "seerr_url", "plex_url"):
             setattr(cfg, name, getattr(cfg, name).rstrip("/"))
+        cfg.feed_url = cfg.feed_url.strip()
         cfg.translate_mode = cfg.translate_mode.strip().lower()
         if cfg.translate_mode not in TRANSLATE_MODES:
             raise ValueError(f"TRANSLATE_MODE={cfg.translate_mode!r} i .env er ukendt - brug direct eller lingarr")

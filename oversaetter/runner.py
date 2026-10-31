@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx2 as httpx
 
-from . import kontekst
+from . import feed, kontekst
 from .clients import GET_TIMEOUT, ApiError, Bazarr, Radarr, Seerr, SeerrIndex, Sonarr, parse_date
 from .config import Config
 from .credit import apply_credit
@@ -392,7 +392,9 @@ class Runner:
         )
         outcome = self.translate(self.bazarr, cand, self.cfg.translate_timeout_minutes)
         if not outcome.ok:
-            self._failed(cand.key, cand.title, attempts, outcome.reason, outcome.permanent)
+            self._failed(
+                cand.key, cand.title, attempts, outcome.reason, outcome.permanent, seconds=self._since(cand.key)
+            )
             self.current = None
             return
         log.info("Bazarr har skrevet %s", cand.da_path)
@@ -472,7 +474,7 @@ class Runner:
             self.db.upsert(cand.key, glossary=out.glossary.to_json())
         if not out.ok:
             self.db.upsert(cand.key, cost_usd=out.cost)
-            self._failed(cand.key, cand.title, attempts, out.reason)
+            self._failed(cand.key, cand.title, attempts, out.reason, cues=out.lines, seconds=out.seconds)
             self.current = None
             return
         self.db.upsert(
@@ -485,16 +487,20 @@ class Runner:
             fixes=out.fixes,
         )
         log.info("Færdig: %s - %s", cand.title, out.summary())
+        warnings: list[str] = []
         if out.delivery == UPLOADED:
             # Bazarrs automatiske synk kører heller ikke ved upload: bed om den først, så Plex ser den synkroniserede
             # fil (trin B6b). Fejler den, får Plex besked alligevel.
-            synced = sync_after_upload(cfg, self.bazarr, cand, self.sleep, self.clock)
+            synced = sync_after_upload(cfg, self.bazarr, cand, self.sleep, self.clock, warnings)
             if synced is not None:
                 self.db.upsert(cand.key, bazarr_sync=int(synced))
             # Bazarrs egen Plex-opdatering kører kun ved download, ikke ved upload (trin B4g).
             refreshed = refresh_folder(cfg, self.http, cand.video_path)
             if refreshed is not None:
                 self.db.upsert(cand.key, plex_refresh=int(refreshed))
+        # Trin B7: til sidst, så en HI-advarsel fra synken kommer med. Fejler aldrig.
+        note = "; ".join(warnings) or f"{out.flags_before} flag"
+        self._feed(cand.title, cand.media_type, "done", out.lines, out.seconds, out.cost, note)
         self.current = None
 
     def context_for(self, cand: Candidate) -> str | None:
@@ -509,7 +515,32 @@ class Runner:
             return []
         return self.db.series_glossaries(cand.series_id, cand.key)
 
-    def _failed(self, key: str, title: str, attempts: int, reason: str, permanent: bool = False) -> None:
+    def _feed(self, title: str, media_type: str, status: str, cues: int, seconds: float, cost: float, note: str):
+        """Trin B7: send titlen til appens backend (FEED_URL). Må aldrig blokere eller fejle oversættelsen."""
+        if not self.cfg.feed_url:
+            return
+        try:
+            payload = feed.build_payload(self.cfg, title, media_type, status, cues, seconds, cost, note)
+            feed.send(self.cfg, self.http, payload, self.sleep)
+        except Exception as e:  # sikkerhedsnet - feed.send fanger selv sine fejl
+            log.warning("Feed: kunne ikke sende %s (%s: %s)", title, type(e).__name__, e)
+
+    def _since(self, key: str) -> float:
+        """Sekunder siden emnet blev startet (started_at i databasen), 0 hvis ukendt."""
+        row = self.db.get(key)
+        started = parse_date(row["started_at"]) if row is not None else None
+        return max(0.0, (datetime.now(UTC) - started).total_seconds()) if started else 0.0
+
+    def _failed(
+        self,
+        key: str,
+        title: str,
+        attempts: int,
+        reason: str,
+        permanent: bool = False,
+        cues: int = 0,
+        seconds: float | None = None,
+    ) -> None:
         if permanent:
             status = "ikke_muligt"
             log.warning("Springer over: %s - %s", title, reason)
@@ -520,6 +551,13 @@ class Runner:
             status = "forsoeg_igen"
             log.warning("Oversættelse mislykkedes for %s - %s. Prøves igen i næste runde", title, reason)
         self.db.upsert(key, status=status, reason=reason)
+        if status == "fejlet":
+            row = self.db.get(key)
+            cost = float(row["cost_usd"] or 0.0) if row is not None else 0.0
+            media_type = row["media_type"] if row is not None else key.split(":", 1)[0]
+            self._feed(
+                title, media_type, "failed", cues, self._since(key) if seconds is None else seconds, cost, reason
+            )
 
     # --- efterbehandling ------------------------------------------------------------
     def _english_path(self, media_type: str, media_id: int, video_path: str, source_path: str | None) -> str | None:
@@ -562,6 +600,8 @@ class Runner:
             fixes=result.fixes,
         )
         log.info("Færdig: %s - %s", title, result.summary())
+        cues = len(result.cues)
+        self._feed(title, media_type, "done", cues, self._since(key), result.cost, f"{result.flags_before} flag")
 
     def _credit_only(self, title: str, da, da_path: str) -> None:
         """Nødløsning: gem Bazarrs danske tekst med kreditlinjen, når efterbehandlingen fejlede."""
@@ -689,6 +729,10 @@ class Runner:
                 log.info(
                     "%s i .env bruges ikke i TRANSLATE_MODE=direct og ignoreres", ", ".join(self.cfg.proofread_keys)
                 )
+        if self.cfg.feed_url:
+            log.info("Feed: færdige og fejlede oversættelser sendes til %s", self.cfg.feed_url)
+        else:
+            log.info("Feed: FEED_URL er tom - færdige og fejlede oversættelser sendes ikke til appen")
         if self.cfg.dry_run:
             log.info("DRY_RUN er slået til: der søges, synkroniseres og oversættes ikke, og der skrives ingen filer")
         if self.claude is None:

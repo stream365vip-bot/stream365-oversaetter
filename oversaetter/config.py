@@ -127,6 +127,12 @@ class Config:
     # Trin C2 (8.11.2026): intern adresse til Fangarr (kun på Docker-netværket). 0 = slået fra. Kræver API_TOKEN.
     api_port: int = 0
     api_token: str = ""
+    # Trin C3 (8.11.2026): nye filer vises først i Plex, når de har dansk tale eller dansk tekst (eller efter
+    # REVEAL_SAFETY_HOURS som sikkerhedsnet). Kræver, at Autoscans import-hændelser er slået fra i Sonarr/Radarr.
+    reveal: bool = False
+    reveal_interval_seconds: float = 90.0  # så ofte tjekkes de skjulte filer
+    reveal_safety_hours: float = 24.0  # vises senest efter så mange timer, også uden dansk
+    reveal_lookback_hours: float = 48.0  # så langt tilbage i historikken ledes der efter nye importer
 
     poll_minutes: float = 15.0
     translate_tag: str = "oversaet"

@@ -58,6 +58,21 @@ CREATE TABLE IF NOT EXISTS providers (
     name TEXT PRIMARY KEY,         -- Bazarrs navn på tjenesten, fx "opensubtitlescom"
     paused_since TEXT NOT NULL     -- første gang vi så den sat på pause (i træk)
 );
+CREATE TABLE IF NOT EXISTS reveal (    -- trin C3: nye filer, der først vises i Plex, når de har dansk tekst/tale
+    key TEXT NOT NULL,             -- "movie:12" / "episode:345"
+    import_at TEXT NOT NULL,       -- tidspunktet for importen i Radarr/Sonarr (en opgradering er en ny række)
+    media_type TEXT,
+    media_id INTEGER,
+    title TEXT,
+    path TEXT,                     -- videofilen
+    folder TEXT,                   -- mappen, Plex bedes scanne
+    status TEXT NOT NULL,          -- venter, vist, erstattet
+    reason TEXT,                   -- hvorfor den venter / blev vist
+    danish TEXT,                   -- gemt analyse af filen: "lyd", "tekst", "" (intet dansk) eller NULL (ikke set)
+    shown_at TEXT,
+    shown_by TEXT,                 -- klar, sikkerhedsnet
+    PRIMARY KEY (key, import_at)
+);
 """
 
 # Kolonner tilføjet efter første version. Ældre databaser får dem automatisk, uden at miste rækker.

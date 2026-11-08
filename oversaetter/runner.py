@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx2 as httpx
 
-from . import api, feed, kontekst, nyt, status
+from . import api, feed, kontekst, nyt, status, udgiv
 from .clients import GET_TIMEOUT, ApiError, Bazarr, Radarr, Seerr, SeerrIndex, Sonarr, parse_date
 from .config import Config
 from .credit import apply_credit
@@ -82,6 +82,7 @@ class Runner:
         self.batch_since: float | None = None
         self.new_warning: str | None = None  # trin C1: seneste advarsel om sprogprofiler (logges kun ved ændring)
         self.last_round: datetime | None = None  # trin C2: hvornår seneste runde startede (vises i Fangarr)
+        self.revealer = None  # trin C3: udgivelsen (udgiv.Revealer), når REVEAL=true
         self.wake = None  # trin C2: threading.Event, der vækker løkken før tid (sættes af api.start)
 
     # --- én runde -----------------------------------------------------------------
@@ -599,13 +600,32 @@ class Runner:
                 self.db.upsert(cand.key, bazarr_sync=int(synced))
             # Trin B8: mærker Bazarr alligevel teksten som HI, omdøbes filen, og Bazarr scanner igen (før Plex).
             fix_hi_after_upload(cfg, self.bazarr, cand, self.sleep, self.clock, warnings)
-            # Bazarrs egen Plex-opdatering kører kun ved download, ikke ved upload (trin B4g).
-            refreshed = refresh_folder(cfg, self.http, cand.video_path)
-            if refreshed is not None:
-                self.db.upsert(cand.key, plex_refresh=int(refreshed))
+            if self._reveal_pending(cand):
+                # Trin C3: filen (eller en anden i mappen) er skjult for kunderne. Udgivelsen beder selv Plex scanne,
+                # når hele mappen er klar - væk den, så det sker med det samme.
+                self.revealer.wake.set()
+            else:
+                # Bazarrs egen Plex-opdatering kører kun ved download, ikke ved upload (trin B4g).
+                refreshed = refresh_folder(cfg, self.http, cand.video_path)
+                if refreshed is not None:
+                    self.db.upsert(cand.key, plex_refresh=int(refreshed))
         # Trin B7: til sidst, så en HI-advarsel fra synken kommer med. Fejler aldrig.
         note = "; ".join(warnings) or f"{out.flags_before} flag"
         self._feed(cand.title, cand.media_type, "done", out.lines, out.seconds, out.cost, note)
+
+    def _reveal_pending(self, cand: Candidate) -> bool:
+        """Trin C3: skal udgivelsen vise filen (i stedet for at Plex bedes scanne mappen med det samme)?
+
+        Ældre titler (fx med mærket oversaet) og filer, der allerede er vist, får Plex-scanningen som før, så den nye
+        danske tekst kommer frem. Fejl her betyder "nej" (så teksten i værste fald vises som før trin C3).
+        """
+        if not self.cfg.reveal or self.revealer is None:
+            return False
+        try:
+            return udgiv.pending_in(self.db, cand.key, os.path.dirname(cand.video_path))
+        except Exception as e:
+            log.warning("Udgivelse: kunne ikke slå %s op (%s) - beder Plex scanne som før", cand.title, e)
+            return False
 
     def _batch_saved(self, batch_id: str | None) -> None:
         if batch_id is None:
@@ -886,5 +906,6 @@ def main(cfg: Config) -> None:
     client = make_client(cfg, CALL_TIMEOUT / 60 if cfg.direct else None)
     runner = Runner(cfg, db, claude=client)
     status.start(cfg, runner)  # trin B11: egen tråd, påvirker aldrig driften
+    udgiv.start(cfg, runner)  # trin C3: nye filer vises først i Plex med dansk tale/tekst (egen tråd)
     api.start(cfg, runner)  # trin C2: intern adresse til Fangarr, egen tråd, påvirker aldrig driften
     runner.loop()

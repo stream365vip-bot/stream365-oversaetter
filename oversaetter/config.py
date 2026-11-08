@@ -119,6 +119,14 @@ class Config:
     provider_wait: bool = True
     provider_wait_days_movies: float = 7.0
     provider_wait_days_series: float = 3.0
+    # Trin C1 (8.11.2026): alt nyt oversættes. Film/afsnit importeret efter datoen (fx 2026-11-10) er med uden
+    # Seerr-ønske eller mærke. Tom = slået fra (kun Seerr og mærket som før).
+    translate_all_since: str = ""
+    new_lookback_days: float = 14.0  # så langt tilbage i Radarr/Sonarr-historikken ledes der efter nye importer
+    bazarr_profile: str = "Dansk"  # sprogprofilen i Bazarr, som nye titler uden profil får
+    # Trin C2 (8.11.2026): intern adresse til Fangarr (kun på Docker-netværket). 0 = slået fra. Kræver API_TOKEN.
+    api_port: int = 0
+    api_token: str = ""
 
     poll_minutes: float = 15.0
     translate_tag: str = "oversaet"
@@ -201,7 +209,25 @@ class Config:
         if cfg.prompt_version not in PROMPT_VERSIONS:
             raise ValueError(f"PROMPT_VERSION={cfg.prompt_version!r} i .env er ukendt - brug v3 eller v4")
         cfg.parallel = max(1, cfg.parallel)
+        cfg.translate_all_since = cfg.translate_all_since.strip()
+        if cfg.translate_all_since and cfg.all_since() is None:
+            raise ValueError(
+                f"TRANSLATE_ALL_SINCE={cfg.translate_all_since!r} i .env er ikke en dato - skriv fx 2026-11-10"
+            )
+        cfg.api_token = cfg.api_token.strip()
         return cfg
+
+    def all_since(self):
+        """TRANSLATE_ALL_SINCE som tidspunkt (UTC), eller None hvis den er tom eller ugyldig."""
+        from datetime import UTC, datetime
+
+        if not self.translate_all_since:
+            return None
+        try:
+            dt = datetime.fromisoformat(self.translate_all_since)
+        except ValueError:
+            return None
+        return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
     @property
     def direct(self) -> bool:

@@ -1,9 +1,9 @@
 """Små klienter til Bazarr, Radarr, Sonarr og Seerr.
 
 Kun læsning - bortset fra disse kald til Bazarr: translate (lingarr-tilstand), upload, synk mod lyden og
-"scan disk" for den danske tekst til ét emne (direct-tilstand), søg efter dansk til ét emne og synkronisér med
-Radarr/Sonarr.
-Ingen af dem ændrer indstillinger.
+"scan disk" for den danske tekst til ét emne (direct-tilstand), søg efter dansk til ét emne, synkronisér med
+Radarr/Sonarr og (trin C1) giv en ny titel uden sprogprofil profilen BAZARR_PROFILE.
+Ingen af dem ændrer Bazarrs indstillinger.
 """
 
 from __future__ import annotations
@@ -131,6 +131,34 @@ class Bazarr(_Api):
     def providers(self) -> list[dict]:
         """Status for Bazarrs aktiverede undertekst-tjenester: name, status ("Good" eller grunden) og retry."""
         return self.get("/api/providers").get("data", [])
+
+    # --- trin C1: sprogprofil til nye titler ---------------------------------------------------
+    def profiles(self) -> list[dict]:
+        """Bazarrs sprogprofiler (profileId, name, ...)."""
+        data = self.get("/api/system/languages/profiles")
+        return data if isinstance(data, list) else data.get("data", [])
+
+    def wanted_search_hours(self) -> tuple[int | None, int | None]:
+        """Hvor ofte Bazarr selv søger efter manglende tekster (serier, film) i timer. 876000 = "Manually".
+
+        Indstillingerne indeholder nøgler - kun de to tal læses, og intet logges.
+        """
+        general = (self.get("/api/system/settings") or {}).get("general") or {}
+
+        def num(name):
+            try:
+                return int(general.get(name))
+            except (TypeError, ValueError):
+                return None
+
+        return num("wanted_search_frequency"), num("wanted_search_frequency_movie")
+
+    def set_series_profile(self, series_id: int, profile_id: int) -> None:
+        """Giv en serie en sprogprofil (samme kald som profilvalget i Bazarr). Bazarr regner straks manglerne ud."""
+        self._request("POST", "/api/series", {"seriesid": series_id, "profileid": profile_id}, GET_TIMEOUT)
+
+    def set_movie_profile(self, radarr_id: int, profile_id: int) -> None:
+        self._request("POST", "/api/movies", {"radarrid": radarr_id, "profileid": profile_id}, GET_TIMEOUT)
 
     def search(
         self,
@@ -261,6 +289,13 @@ class Radarr(_Api):
     def tags(self) -> list[dict]:
         return self.get("/api/v3/tag")
 
+    def imports_since(self, since: datetime) -> list[dict]:
+        """Importerede filer siden tidspunktet (historik, downloadFolderImported)."""
+        return self.get(
+            "/api/v3/history/since",
+            {"date": since.strftime("%Y-%m-%dT%H:%M:%SZ"), "eventType": "downloadFolderImported"},
+        )
+
 
 class Sonarr(_Api):
     name = "Sonarr"
@@ -282,6 +317,13 @@ class Sonarr(_Api):
 
     def tags(self) -> list[dict]:
         return self.get("/api/v3/tag")
+
+    def imports_since(self, since: datetime) -> list[dict]:
+        """Importerede afsnit siden tidspunktet (historik, downloadFolderImported)."""
+        return self.get(
+            "/api/v3/history/since",
+            {"date": since.strftime("%Y-%m-%dT%H:%M:%SZ"), "eventType": "downloadFolderImported"},
+        )
 
 
 class Seerr(_Api):

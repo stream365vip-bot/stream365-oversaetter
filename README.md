@@ -9,7 +9,8 @@ Hvert kvarter gør programmet dette:
 1. Spørger Bazarr, hvilke film og afsnit der mangler danske undertekster.
 2. Vælger kun:
    - film og serier/sæsoner, som nogen har ønsket via **Seerr** (programmet spørger Seerr direkte), og
-   - film med mærket **oversaet** i Radarr og afsnit af serier med mærket **oversaet** i Sonarr.
+   - film med mærket **oversaet** i Radarr og afsnit af serier med mærket **oversaet** i Sonarr, og
+   - alt, der er importeret efter `TRANSLATE_ALL_SINCE` (trin C1 – nye titler uden sprogprofil får profilen i Bazarr).
 3. Springer over, hvis der allerede findes danske undertekster (som fil eller inde i videoen).
 4. Springer over, hvis titlen har **dansk lyd** (dansk originalsprog eller et dansk lydspor i filen) – der skal ingen tekst til (trin B9).
 5. Sørger for en **gyldig søgning**: beder Bazarr søge efter dansk til netop det emne og tjekker, at ingen af Bazarrs undertekst-tjenester var sat på pause lige før eller lige efter. Fandt søgningen dansk, er der intet at gøre.
@@ -421,6 +422,14 @@ Loggen viser, hvad der blev slettet. Passer titlen på flere rækker, slettes in
   - **qBittorrent**: `QBITTORRENT_URL` (Web UI-adressen på Docker-netværket, fx `http://qbittorrent:8080`) og `bruger:kode` i `/opt/oversaetter/secrets/qbittorrent.txt` (kun det første `:` deler). Mangler en af dem, udelades `download_speed_mbps` med én INFO-linje. Login og kode logges aldrig.
   - **Backenden**: ingen genforsøg (næste besked kommer om 5 minutter). Svarer backenden med fejl (fx HTTP 500) eller ikke inden for 10 sekunder, logges én WARNING (`Status: POST udelades - backenden svarede med HTTP 500`) – og først igen, hvis årsagen ændrer sig. Virker det igen: `Status: sendt igen til ...`. Driften er upåvirket.
   - `.env`: `STATUS_URL` (standard tom = slået fra, én INFO-linje ved opstart), `STATUS_CONTAINERS`, `STATUS_DOCKER` (standard tom), `STATUS_DISK_PATH`, `STATUS_UNIONFS_PATH`, `STATUS_MOUNT_FILE`, `STATUS_PLEX` (standard `false`), `QBITTORRENT_URL` og `QBITTORRENT_FILE` (se `.env.example`).
+
+- **Trin C1: alt nyt oversættes** (besluttet af Jesper 8.11.2026, del af planen "intet på Plex uden danske tekster"):
+  1. **Hvad er nyt**: film og afsnit, der står som importeret (`downloadFolderImported`) i Radarr/Sonarr-historikken efter `TRANSLATE_ALL_SINCE` (højst `NEW_LOOKBACK_DAYS`, standard 14, dage tilbage). De er med i udvælgelsen med grunden `nyt` uden Seerr-ønske eller mærket `oversaet`. Det gamle bibliotek følger de gamle regler (Seerr og mærket), så der ikke kommer en regning for tusindvis af gamle afsnit. Tom `TRANSLATE_ALL_SINCE` = slået fra.
+  2. **Sprogprofil**: Bazarr kan kun søge og modtage en upload for en titel med en sprogprofil (uden profil fejler begge kald inde i Bazarr). Nye serier/film uden profil får derfor `BAZARR_PROFILE` (standard `Dansk`) med samme kald som profilvalget i Bazarr (`POST /api/series` / `/api/movies`). Loggen skriver `Nyt: <titel> fik sprogprofilen Dansk i Bazarr`.
+  3. **Sikring**: en serie med profil får alle sine gamle afsnit på Bazarrs wanted-liste. Profilen sættes derfor kun, når Bazarrs egen søgning efter manglende tekster står på **Manually** for både serier og film (`wanted_search_frequency` = 876000, læst fra `/api/system/settings` – kun de to tal læses, intet logges). Ellers skrives én advarsel (`Nyt: Bazarr søger selv efter manglende tekster ...`), og der sættes ingen profiler. Titler, der allerede har en profil, oversættes stadig. De gamle afsnit på wanted-listen bliver "ikke valgt" som før.
+  4. **Ny fil**: kommer der en ny import (fx en opgradering) efter sidste behandling af en titel (færdig, fejlet, ikke muligt, sprunget over), behandles den forfra: `Ny fil til episode:5 efter sidste behandling (status faerdig) - behandles igen`.
+  5. Fejl i historikken eller i Bazarr stopper aldrig runden; så behandles kun Seerr og mærket den runde.
+- **Trin C2: intern adresse til Fangarr** (8.11.2026): en lille webserver i sin egen tråd på `API_PORT` (0 = slået fra). Den nås kun fra Docker-netværket `saltbox` (`http://oversaetter:8090`) – ingen Traefik, ingen DNS, ingen åben port på serveren. Alle kald undtagen `/api/health` kræver headeren `X-Api-Token` = `API_TOKEN`. Kun læsning: databasen åbnes skrivebeskyttet for hvert kald, så webserveren aldrig skriver i den eller blokerer oversættelsen. `GET /api/status` (tilstand, titel, kø, pause, forbrug, loft, seneste runde, advarsel fra C1), `GET /api/items?status=faerdig,fejlet&limit=100&days=30` (titler uden fuld sti – kun filnavnet), `GET /api/spend?days=30` (pr. dag og type; test uden titel tæller ikke), `GET /api/config` (indstillinger uden nøgler). Knapper (POST) kommer i en senere fase.
 
 ## Hvis noget går galt
 

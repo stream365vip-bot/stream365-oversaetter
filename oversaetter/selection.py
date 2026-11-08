@@ -13,6 +13,7 @@ from .config import Config
 from .db import Database, iso
 from .hi import hi_filename
 from .kontekst import Tmdb
+from .nyt import NewImports
 from .tjenester import Lookups, arr_language
 
 log = logging.getLogger("oversaetter")
@@ -34,7 +35,7 @@ class Candidate:
     media_type: str  # "movie" eller "episode"
     media_id: int  # radarrId eller sonarrEpisodeId
     title: str
-    reason: str  # "Seerr" eller "mærke"
+    reason: str  # "Seerr", "mærke" eller "nyt" (trin C1)
     video_path: str = ""
     series_id: int | None = None  # sonarrSeriesId (kun afsnit)
     hi: bool = False  # Bazarr mangler den danske tekst som HI
@@ -172,8 +173,10 @@ class Selector:
         seerr: SeerrIndex,
         db: Database,
         run_cmd=None,
+        new_imports: NewImports | None = None,
     ):
         self.cfg, self.bazarr, self.radarr, self.sonarr, self.seerr, self.db = cfg, bazarr, radarr, sonarr, seerr, db
+        self.new = new_imports or NewImports()  # trin C1: importeret efter TRANSLATE_ALL_SINCE
         # Trin B9: TMDB (originalsprog og tjenester) og ffprobe (lydspor). run_cmd None = lydsporene tjekkes ikke.
         key = cfg.tmdb_key()
         tmdb = Tmdb(cfg.tmdb_url, key, bazarr.http) if key else None
@@ -215,6 +218,23 @@ class Selector:
         row = self.db.get(key)
         if row is None:
             return False
+        imported = self.new.get(key)
+        if imported is not None and row["status"] in ("faerdig", "fejlet", "ikke_muligt", "sprunget_over"):
+            updated = parse_date(row["updated_at"])
+            if updated is None or imported > updated:
+                # Trin C1: en ny fil (fx en opgradering) efter sidste behandling - behandles forfra.
+                log.info("Ny fil til %s efter sidste behandling (status %s) - behandles igen", key, row["status"])
+                self.db.upsert(
+                    key,
+                    status="soeger",
+                    reason="ny fil",
+                    attempts=0,
+                    search_at=None,
+                    en_search_at=None,
+                    disk_scan_at=None,
+                    wait_started_at=None,
+                )
+                return False
         if row["status"] in ("faerdig", "fejlet", "i_gang", "ikke_muligt"):
             stats.done_before += 1
             return True
@@ -520,7 +540,9 @@ class Selector:
                 stats.example("allerede behandlet", title, f"allerede behandlet (status {row['status']})")
                 continue
             try:
-                if media_type == "movie":
+                if cand.key in self.new:
+                    reason, why = "nyt", ""
+                elif media_type == "movie":
                     reason, why = self.eligibility_movie(entry)
                 else:
                     reason, why = self.eligibility_episode(entry)

@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx2 as httpx
 
-from . import feed, kontekst, status
+from . import api, feed, kontekst, nyt, status
 from .clients import GET_TIMEOUT, ApiError, Bazarr, Radarr, Seerr, SeerrIndex, Sonarr, parse_date
 from .config import Config
 from .credit import apply_credit
@@ -80,6 +80,9 @@ class Runner:
         # (time.time) den igangværende titels Message Batch blev sendt (None = venter ikke på en batch).
         self.queue = 0
         self.batch_since: float | None = None
+        self.new_warning: str | None = None  # trin C1: seneste advarsel om sprogprofiler (logges kun ved ændring)
+        self.last_round: datetime | None = None  # trin C2: hvornår seneste runde startede (vises i Fangarr)
+        self.wake = None  # trin C2: threading.Event, der vækker løkken før tid (sættes af api.start)
 
     # --- én runde -----------------------------------------------------------------
     def run_once(self) -> list[Candidate]:
@@ -90,7 +93,11 @@ class Runner:
         except Exception as e:
             log.warning("Kunne ikke hente ønsker fra Seerr: %s - kun mærkede serier behandles i denne runde", e)
             seerr_index = SeerrIndex([])
-        selector = Selector(self.cfg, self.bazarr, self.radarr, self.sonarr, seerr_index, self.db, self.run_cmd)
+        self.last_round = datetime.now(UTC)
+        new = self.new_imports()
+        selector = Selector(
+            self.cfg, self.bazarr, self.radarr, self.sonarr, seerr_index, self.db, self.run_cmd, new_imports=new
+        )
         try:
             self.sync_new_tags(selector)
         except Exception as e:
@@ -127,6 +134,38 @@ class Runner:
             self.process(cand)
             self.queue = max(0, self.queue - 1)
         return candidates
+
+    # --- trin C1: alt nyt -----------------------------------------------------------------------
+    def new_imports(self) -> nyt.NewImports:
+        """Importer efter TRANSLATE_ALL_SINCE + sprogprofil i Bazarr til nye titler uden. Fejler aldrig runden."""
+        if not self.cfg.translate_all_since:
+            return nyt.NewImports()
+        try:
+            new = nyt.collect(self.cfg, self.sonarr, self.radarr)
+        except Exception as e:
+            msg = str(e) if isinstance(e, ApiError) else f"{type(e).__name__}: {e}"
+            log.warning("Kunne ikke hente nye importer fra Radarr/Sonarr: %s - kun Seerr og mærket i denne runde", msg)
+            return nyt.NewImports()
+        try:
+            series, movies, warning = nyt.ensure_profiles(self.cfg, self.bazarr, new)
+        except Exception as e:
+            msg = str(e) if isinstance(e, ApiError) else f"{type(e).__name__}: {e}"
+            series, movies, warning = 0, 0, f"kunne ikke tjekke sprogprofiler i Bazarr: {msg}"
+        if warning != self.new_warning:
+            if warning:
+                log.warning("Nyt: %s", warning)
+            elif self.new_warning:
+                log.info("Nyt: sprogprofilerne kan sættes igen")
+            self.new_warning = warning
+        if series or movies:
+            log.info("Nyt: %d serier og %d film fik sprogprofil i Bazarr", series, movies)
+        log.info(
+            "Nyt: %d film/afsnit importeret siden %s (seneste %g dage)",
+            len(new),
+            self.cfg.translate_all_since,
+            self.cfg.new_lookback_days,
+        )
+        return new
 
     # --- pause ved udgiftsgrænse/nøglefejl (trin B8) ------------------------------------------------
     def in_pause(self, log_line: bool = False) -> bool:
@@ -756,6 +795,9 @@ class Runner:
                 self._unexpected(e)
             deadline = time.monotonic() + self.cfg.poll_minutes * 60
             while not self.stopping and time.monotonic() < deadline:
+                if self.wake is not None and self.wake.is_set():
+                    self.wake.clear()
+                    break
                 time.sleep(1)
         log.info("Oversætter stoppet")
 
@@ -801,6 +843,15 @@ class Runner:
                 log.info(
                     "%s i .env bruges ikke i TRANSLATE_MODE=direct og ignoreres", ", ".join(self.cfg.proofread_keys)
                 )
+        if self.cfg.translate_all_since:
+            log.info(
+                "TRANSLATE_ALL_SINCE=%s: alt importeret efter datoen oversættes (uden Seerr-ønske eller mærke); "
+                "nye titler uden sprogprofil får %s i Bazarr",
+                self.cfg.translate_all_since,
+                self.cfg.bazarr_profile,
+            )
+        else:
+            log.info("TRANSLATE_ALL_SINCE er tom: kun Seerr-ønsker og mærket %s oversættes", self.cfg.translate_tag)
         if not self.cfg.provider_wait:
             log.info("PROVIDER_WAIT=false: titler på danske streamingtjenester oversættes uden at vente")
         elif not self.cfg.tmdb_key():
@@ -835,4 +886,5 @@ def main(cfg: Config) -> None:
     client = make_client(cfg, CALL_TIMEOUT / 60 if cfg.direct else None)
     runner = Runner(cfg, db, claude=client)
     status.start(cfg, runner)  # trin B11: egen tråd, påvirker aldrig driften
+    api.start(cfg, runner)  # trin C2: intern adresse til Fangarr, egen tråd, påvirker aldrig driften
     runner.loop()

@@ -128,6 +128,10 @@ class Bazarr(_Api):
             out += self.get("/api/series", {"seriesid[]": series_ids[i : i + 50]}).get("data", [])
         return out
 
+    def series_episodes(self, series_id: int) -> list[dict]:
+        """Trin C4: alle afsnit i en serie med tekster og lydsprog (sonarrEpisodeId, subtitles, audio_language)."""
+        return self.get("/api/episodes", {"seriesid[]": [series_id]}).get("data", [])
+
     def providers(self) -> list[dict]:
         """Status for Bazarrs aktiverede undertekst-tjenester: name, status ("Good" eller grunden) og retry."""
         return self.get("/api/providers").get("data", [])
@@ -311,6 +315,10 @@ class Sonarr(_Api):
 
     def series(self, series_id: int) -> dict:
         return self.get(f"/api/v3/series/{series_id}")
+
+    def episodes(self, series_id: int) -> list[dict]:
+        """Trin C4: alle afsnit i serien (id, seasonNumber, episodeNumber, hasFile)."""
+        return self.get("/api/v3/episode", {"seriesId": series_id})
 
     def all_series(self) -> list[dict]:
         return self.get("/api/v3/series")

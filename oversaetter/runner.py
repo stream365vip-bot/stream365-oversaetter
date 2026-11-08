@@ -139,14 +139,24 @@ class Runner:
     # --- trin C1: alt nyt -----------------------------------------------------------------------
     def new_imports(self) -> nyt.NewImports:
         """Importer efter TRANSLATE_ALL_SINCE + sprogprofil i Bazarr til nye titler uden. Fejler aldrig runden."""
-        if not self.cfg.translate_all_since:
-            return nyt.NewImports()
+        new = nyt.NewImports()
+        if self.cfg.translate_all_since:
+            try:
+                new = nyt.collect(self.cfg, self.sonarr, self.radarr)
+            except Exception as e:
+                msg = str(e) if isinstance(e, ApiError) else f"{type(e).__name__}: {e}"
+                log.warning(
+                    "Kunne ikke hente nye importer fra Radarr/Sonarr: %s - kun Seerr og mærket i denne runde", msg
+                )
+                new = nyt.NewImports()
+        imported = len(new)
         try:
-            new = nyt.collect(self.cfg, self.sonarr, self.radarr)
+            manual = nyt.add_manual(self.db, new)  # trin C4: valgt med en knap i Fangarr
         except Exception as e:
-            msg = str(e) if isinstance(e, ApiError) else f"{type(e).__name__}: {e}"
-            log.warning("Kunne ikke hente nye importer fra Radarr/Sonarr: %s - kun Seerr og mærket i denne runde", msg)
-            return nyt.NewImports()
+            log.warning("Kunne ikke læse titler valgt i Fangarr: %s: %s", type(e).__name__, e)
+            manual = 0
+        if not len(new):
+            return new
         try:
             series, movies, warning = nyt.ensure_profiles(self.cfg, self.bazarr, new)
         except Exception as e:
@@ -160,12 +170,15 @@ class Runner:
             self.new_warning = warning
         if series or movies:
             log.info("Nyt: %d serier og %d film fik sprogprofil i Bazarr", series, movies)
-        log.info(
-            "Nyt: %d film/afsnit importeret siden %s (seneste %g dage)",
-            len(new),
-            self.cfg.translate_all_since,
-            self.cfg.new_lookback_days,
-        )
+        if self.cfg.translate_all_since:
+            log.info(
+                "Nyt: %d film/afsnit importeret siden %s (seneste %g dage)",
+                imported,
+                self.cfg.translate_all_since,
+                self.cfg.new_lookback_days,
+            )
+        if manual:
+            log.info("Knap: %d film/afsnit valgt i Fangarr venter på oversættelse", manual)
         return new
 
     # --- pause ved udgiftsgrænse/nøglefejl (trin B8) ------------------------------------------------

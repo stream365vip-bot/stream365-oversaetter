@@ -34,6 +34,7 @@ class NewImports:
     series_ids: set[int] = field(default_factory=set)
     movie_ids: set[int] = field(default_factory=set)
     titles: dict[str, str] = field(default_factory=dict)
+    manual: set[str] = field(default_factory=set)  # trin C4: valgt med en knap i Fangarr
 
     def __contains__(self, key: str) -> bool:
         return key in self.at
@@ -135,3 +136,33 @@ def ensure_profiles(cfg: Config, bazarr: Bazarr, new: NewImports) -> tuple[int, 
         except ApiError as e:
             log.warning("Kunne ikke give %s sprogprofilen %s i Bazarr: %s", name, profile.get("name"), e)
     return done_s, done_m, None
+
+
+MANUAL_DAYS = 30  # så længe gælder et valg med knappen (bagefter ryddes det op)
+
+
+def add_manual(db, new: NewImports, now: datetime | None = None) -> int:
+    """Trin C4: læg film/afsnit valgt med "Oversæt nu" eller "Prøv igen" i Fangarr oven i de nye importer.
+
+    De behandles som nye (sprogprofil i Bazarr, valgt uden Seerr-ønske/mærke, og en tidligere fejl nulstilles,
+    når knappen er trykket efter sidste behandling). Valg ældre end MANUAL_DAYS slettes.
+    """
+    now = now or datetime.now(UTC)
+    db.conn.execute("DELETE FROM manual WHERE added_at < ?", ((now - timedelta(days=MANUAL_DAYS)).isoformat(),))
+    db.conn.commit()
+    count = 0
+    for row in db.conn.execute("SELECT * FROM manual").fetchall():
+        when = parse_date(row["added_at"])
+        key = row["key"]
+        if when is None:
+            continue
+        if key not in new.at or when > new.at[key]:
+            new.at[key] = when
+        new.manual.add(key)
+        new.titles.setdefault(key, row["title"] or key)
+        if row["media_type"] == "movie":
+            new.movie_ids.add(int(row["media_id"]))
+        elif row["series_id"]:
+            new.series_ids.add(int(row["series_id"]))
+        count += 1
+    return count

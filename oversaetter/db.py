@@ -73,6 +73,15 @@ CREATE TABLE IF NOT EXISTS reveal (    -- trin C3: nye filer, der først vises i
     shown_by TEXT,                 -- klar, sikkerhedsnet
     PRIMARY KEY (key, import_at)
 );
+CREATE TABLE IF NOT EXISTS manual (    -- trin C4: valgt med knappen "Oversæt nu" eller "Prøv igen" i Fangarr
+    key TEXT PRIMARY KEY,          -- "movie:12" / "episode:345"
+    media_type TEXT,
+    media_id INTEGER,
+    series_id INTEGER,
+    title TEXT,
+    added_at TEXT NOT NULL,
+    source TEXT                    -- "oversaet-nu" eller "proev-igen"
+);
 """
 
 # Kolonner tilføjet efter første version. Ældre databaser får dem automatisk, uden at miste rækker.

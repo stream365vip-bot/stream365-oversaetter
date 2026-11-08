@@ -12,6 +12,7 @@ skriver i den og aldrig blokerer oversættelsen. Knapper (POST) kommer i en sene
 - GET /api/items   -> titler fra databasen (?status=faerdig,fejlet&limit=100&days=30)
 - GET /api/spend   -> forbrug pr. dag og type (?days=30) + månedens forbrug og loft
 - GET /api/config  -> indstillinger uden hemmeligheder
+- GET /api/reveal  -> trin C3: filer skjult for kunderne (venter) og de senest viste (?days=7)
 """
 
 from __future__ import annotations
@@ -176,7 +177,65 @@ class Api:
             "plex_refresh": bool(c.plex_url),
             "sync_after_upload": c.sync_after_upload,
             "max_searches_per_round": c.max_searches_per_round,
+            "reveal": c.reveal,
+            "reveal_safety_hours": c.reveal_safety_hours,
         }
+
+    def reveal(self, query: dict[str, str]) -> dict:
+        days = _int(query.get("days"), 7, 1, 30)
+        now = self.clock()
+        safety = self.cfg.reveal_safety_hours
+        r = getattr(self.runner, "revealer", None) if self.runner is not None else None
+        last = getattr(r, "last_run", None)
+        out = {
+            "enabled": self.cfg.reveal,
+            "safety_hours": safety,
+            "interval_seconds": self.cfg.reveal_interval_seconds,
+            "last_run": last.isoformat(timespec="seconds") if last else None,
+            "last_error": getattr(r, "last_error", None),
+            "waiting": [],
+            "shown": [],
+        }
+        conn = self._db()
+        if conn is None:
+            return out
+        try:
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='reveal'").fetchone():
+                return out
+            fields = "key, import_at, media_type, media_id, title, path, status, reason, danish, shown_at, shown_by"
+            waiting = conn.execute(f"SELECT {fields} FROM reveal WHERE status = 'venter' ORDER BY import_at").fetchall()
+            since = (now - timedelta(days=days)).isoformat(timespec="seconds")
+            shown = conn.execute(
+                f"SELECT {fields} FROM reveal WHERE status = 'vist' AND shown_at >= ? ORDER BY shown_at DESC LIMIT 500",
+                (since,),
+            ).fetchall()
+            states = {
+                row["key"]: (row["status"], row["reason"])
+                for row in conn.execute(
+                    f"SELECT key, status, reason FROM items WHERE key IN ({', '.join('?' for _ in waiting) or 'NULL'})",
+                    [w["key"] for w in waiting],
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+
+        def clean(row) -> dict:
+            d = dict(row)
+            d["file"] = os.path.basename(d.pop("path") or "")
+            return d
+
+        for w in waiting:
+            d = clean(w)
+            try:
+                at = datetime.fromisoformat(w["import_at"])
+                d["age_hours"] = round((now - at).total_seconds() / 3600, 2)
+                d["reveal_by"] = (at + timedelta(hours=safety)).isoformat(timespec="seconds")
+            except (TypeError, ValueError):
+                d["age_hours"], d["reveal_by"] = None, None
+            d["translation"], d["translation_reason"] = states.get(w["key"], (None, None))
+            out["waiting"].append(d)
+        out["shown"] = [clean(x) for x in shown]
+        return out
 
     def handle(self, path: str, query: dict[str, str]) -> tuple[int, dict]:
         routes = {
@@ -184,6 +243,7 @@ class Api:
             "/api/items": lambda: self.items(query),
             "/api/spend": lambda: self.spend(query),
             "/api/config": lambda: self.config(),
+            "/api/reveal": lambda: self.reveal(query),
         }
         if path not in routes:
             return 404, {"error": "findes ikke"}

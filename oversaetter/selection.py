@@ -35,7 +35,7 @@ class Candidate:
     media_type: str  # "movie" eller "episode"
     media_id: int  # radarrId eller sonarrEpisodeId
     title: str
-    reason: str  # "Seerr", "mærke" eller "nyt" (trin C1)
+    reason: str  # "Seerr", "mærke", "nyt" (trin C1) eller "knap" (trin C4)
     video_path: str = ""
     series_id: int | None = None  # sonarrSeriesId (kun afsnit)
     hi: bool = False  # Bazarr mangler den danske tekst som HI
@@ -219,7 +219,7 @@ class Selector:
         if row is None:
             return False
         imported = self.new.get(key)
-        if imported is not None and row["status"] in ("faerdig", "fejlet", "ikke_muligt", "sprunget_over"):
+        if imported is not None and row["status"] in ("faerdig", "fejlet", "ikke_muligt", "sprunget_over", "opgivet"):
             updated = parse_date(row["updated_at"])
             if updated is None or imported > updated:
                 # Trin C1: en ny fil (fx en opgradering) efter sidste behandling - behandles forfra.
@@ -235,7 +235,7 @@ class Selector:
                     wait_started_at=None,
                 )
                 return False
-        if row["status"] in ("faerdig", "fejlet", "i_gang", "ikke_muligt"):
+        if row["status"] in ("faerdig", "fejlet", "i_gang", "ikke_muligt", "opgivet"):  # opgivet: trin C4
             stats.done_before += 1
             return True
         if row["status"] == "sprunget_over":
@@ -541,7 +541,7 @@ class Selector:
                 continue
             try:
                 if cand.key in self.new:
-                    reason, why = "nyt", ""
+                    reason, why = ("knap" if cand.key in self.new.manual else "nyt"), ""
                 elif media_type == "movie":
                     reason, why = self.eligibility_movie(entry)
                 else:

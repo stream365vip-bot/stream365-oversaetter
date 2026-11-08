@@ -125,6 +125,16 @@ class FakeArr:
             return self.bazarr(req, path, q)
         if host == "radarr":
             return self.radarr(path)
+        if host == "sonarr" and path == "/api/v3/episode":  # trin C4: alle afsnit i en serie
+            sid = int(q["seriesId"][0])
+            return httpx2.Response(
+                200,
+                json=[
+                    {"id": i, "seasonNumber": e["season"], "episodeNumber": i, "hasFile": e.get("has_file", True)}
+                    for i, e in self.episodes.items()
+                    if e["seriesId"] == sid
+                ],
+            )
         if host == "sonarr":
             return self.sonarr(path)
         if host == "tmdb":
@@ -171,11 +181,25 @@ class FakeArr:
                     "title": m["title"],
                     "path": m["path"],
                     "subtitles": m["subtitles"],
+                    "audio_language": [{"name": n, "code2": n[:2].lower()} for n in m.get("audio", ["English"])],
                     "missing_subtitles": self.missing(m),
                     "profileId": None if f"movie:{i}" in self.no_profile else 1,
                 }
                 for i, m in ((int(x), self.movies.get(int(x))) for x in q.get("radarrid[]", []))
                 if m is not None and f"movie:{i}" not in self.bazarr_unknown
+            ]
+            return httpx2.Response(200, json={"data": data})
+        if path == "/api/episodes" and "seriesid[]" in q:  # trin C4: hele serien
+            sid = int(q["seriesid[]"][0])
+            data = [
+                {
+                    "sonarrEpisodeId": i,
+                    "season": e["season"],
+                    "subtitles": e["subtitles"],
+                    "audio_language": [{"name": n, "code2": n[:2].lower()} for n in e.get("audio", ["English"])],
+                }
+                for i, e in self.episodes.items()
+                if e["seriesId"] == sid
             ]
             return httpx2.Response(200, json={"data": data})
         if path == "/api/episodes":

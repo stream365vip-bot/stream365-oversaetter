@@ -13,6 +13,12 @@ skriver i den og aldrig blokerer oversættelsen. Knapper (POST) kommer i en sene
 - GET /api/spend   -> forbrug pr. dag og type (?days=30) + månedens forbrug og loft
 - GET /api/config  -> indstillinger uden hemmeligheder
 - GET /api/reveal  -> trin C3: filer skjult for kunderne (venter) og de senest viste (?days=7)
+
+Trin C4 (knapperne i Fangarr) - de eneste kald, der ændrer noget, og kun i Oversætterens egen database:
+- GET  /api/estimate?series_id=12 | ?movie_id=7 -> afsnit pr. sæson (dansk / i gang / mangler) og ca. pris
+- POST /api/translate   {"series_id": 12, "seasons": [1, 2]} | {"movie_id": 7}  -> "Oversæt nu"
+- POST /api/items/retry {"key": "episode:345"}  -> "Prøv igen"
+- POST /api/items/skip  {"key": "episode:345"}  -> "Opgiv"
 """
 
 from __future__ import annotations
@@ -27,8 +33,10 @@ from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+from . import knap
+from .clients import ApiError, Bazarr, Radarr, Sonarr
 from .config import Config
-from .db import month_key
+from .db import Database, month_key
 
 log = logging.getLogger("oversaetter")
 
@@ -56,6 +64,7 @@ ITEM_FIELDS = (
     "video_path",
 )
 MAX_LIMIT = 1000
+MAX_BODY = 64 * 1024
 MAX_DAYS = 400
 
 
@@ -67,6 +76,8 @@ class Api:
         self.runner = runner
         self.clock = clock or (lambda: datetime.now(UTC))
         self._status_job = None
+        self._clients = None
+        self._write_lock = threading.Lock()  # knapperne skriver én ad gangen
 
     # --- database ---------------------------------------------------------------------------
     def _db(self) -> sqlite3.Connection | None:
@@ -237,7 +248,78 @@ class Api:
         out["shown"] = [clean(x) for x in shown]
         return out
 
+    # --- trin C4: knapperne ------------------------------------------------------------------------
+    def clients(self):
+        if self._clients is None:
+            import httpx2 as httpx
+
+            from .clients import GET_TIMEOUT
+
+            http = httpx.Client(timeout=httpx.Timeout(GET_TIMEOUT))
+            self._clients = (Sonarr(self.cfg, http), Radarr(self.cfg, http), Bazarr(self.cfg, http))
+        return self._clients
+
+    def _rw(self) -> Database:
+        return Database(os.path.join(self.cfg.data_dir, "oversaetter.db"))
+
+    def estimate(self, query: dict[str, str]) -> tuple[int, dict]:
+        sonarr, radarr, bazarr = self.clients()
+        db = self._rw()
+        try:
+            if query.get("series_id", "").isdigit():
+                return 200, knap.series_overview(self.cfg, db, sonarr, bazarr, int(query["series_id"]))
+            if query.get("movie_id", "").isdigit():
+                return 200, knap.movie_overview(self.cfg, db, radarr, bazarr, int(query["movie_id"]))
+            return 400, {"error": "angiv series_id eller movie_id"}
+        finally:
+            db.conn.close()
+
+    def _wake(self) -> None:
+        wake = getattr(self.runner, "wake", None) if self.runner is not None else None
+        if wake is not None:
+            wake.set()
+
+    def handle_post(self, path: str, body: dict) -> tuple[int, dict]:
+        if path not in ("/api/translate", "/api/items/retry", "/api/items/skip"):
+            return 404, {"error": "findes ikke"}
+        sonarr, radarr, bazarr = self.clients()
+        with self._write_lock:
+            db = self._rw()
+            try:
+                if path == "/api/translate":
+                    if isinstance(body.get("movie_id"), int):
+                        out = knap.translate_movie(db, radarr, bazarr, body["movie_id"])
+                    elif isinstance(body.get("series_id"), int) and isinstance(body.get("seasons"), list):
+                        seasons = [int(x) for x in body["seasons"] if isinstance(x, int)]
+                        if not seasons:
+                            return 400, {"error": "vælg mindst én sæson"}
+                        out = knap.translate_series(db, sonarr, bazarr, body["series_id"], seasons)
+                    else:
+                        return 400, {"error": "angiv movie_id eller series_id og seasons"}
+                    log.info("Knap: Oversæt nu - %s: %d film/afsnit lagt i kø", out["title"], out["added"])
+                else:
+                    key = str(body.get("key") or "")
+                    if path == "/api/items/retry":
+                        out = knap.retry(db, key)
+                        log.info("Knap: Prøv igen - %s (%s) behandles forfra i næste runde", out["title"], key)
+                    else:
+                        out = knap.give_up(db, key)
+                        log.info("Knap: Opgiv - %s (%s) vælges ikke igen", out["title"], key)
+            except knap.Conflict as e:
+                return 409, {"error": str(e)}
+            except ValueError as e:
+                return 400, {"error": str(e)}
+            finally:
+                db.conn.close()
+        self._wake()
+        return 200, out
+
     def handle(self, path: str, query: dict[str, str]) -> tuple[int, dict]:
+        if path == "/api/estimate":
+            try:
+                return self.estimate(query)
+            except ApiError as e:
+                return 502, {"error": str(e)}
         routes = {
             "/api/status": lambda: self.status(),
             "/api/items": lambda: self.items(query),
@@ -287,6 +369,32 @@ def make_handler(api: Api, token: str):
                 log.warning("API: fejl ved %s (%s: %s)", url.path, type(e).__name__, e)
                 code, body = 500, {"error": f"{type(e).__name__}"}
             self._send(code, body)
+
+        def do_POST(self) -> None:  # noqa: N802
+            url = urlparse(self.path)
+            given = self.headers.get("X-Api-Token", "")
+            if not hmac.compare_digest(given.encode(), token.encode()):
+                return self._send(401, {"error": "forkert eller manglende X-Api-Token"})
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > MAX_BODY:
+                return self._send(413, {"error": "for stort kald"})
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError
+            except ValueError:
+                return self._send(400, {"error": "ugyldig JSON"})
+            try:
+                code, out = api.handle_post(url.path, body)
+            except ApiError as e:
+                code, out = 502, {"error": str(e)}
+            except Exception as e:
+                log.warning("API: fejl ved %s (%s: %s)", url.path, type(e).__name__, e)
+                code, out = 500, {"error": f"{type(e).__name__}"}
+            self._send(code, out)
 
     return Handler
 

@@ -101,7 +101,14 @@ NEW_COLUMNS = {
         "dk_providers": "TEXT",
         "providers_checked_at": "TEXT",
         "wait_started_at": "TEXT",
-    }
+    },
+    # Trin C5: kontrol af, at Plex faktisk fik filen efter scanningen.
+    "reveal": {
+        "plex_state": "TEXT",  # tjekkes, ok, mangler (efter ca. en time), opgivet (efter et døgn), væk (skiftet ud)
+        "plex_tries": "INTEGER",  # antal kontroller, hvor filen ikke var i Plex (= antal ekstra scanninger)
+        "plex_next": "TEXT",  # næste kontrol
+        "plex_ok_at": "TEXT",  # hvornår Plex bekræftede filen
+    },
 }
 
 

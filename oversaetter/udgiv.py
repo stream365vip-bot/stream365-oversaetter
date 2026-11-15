@@ -15,6 +15,12 @@ sender en Telegram-besked om hver af dem.
 
 En fil, der er væk igen (opgraderet eller slettet), markeres som "erstattet". Den nye fil er en ny import og får
 sin egen række. Fejl her må aldrig stoppe oversættelsen: alt fanges og skrives som advarsel.
+
+Trin C5 (15.11.2026): Plex blev kun bedt om at scanne én gang. Kunne Plex' server endnu ikke se den nye mappe
+(den henter medierne over nettet og opdager nye mapper med lidt forsinkelse), fandt scanningen ingenting, og
+filmen kom aldrig i Plex. Nu tjekkes det bagefter, at filen faktisk er i Plex (VERIFY_MINUTES efter scanningen).
+Mangler den, bedes Plex scanne mappen igen. Efter den sidste af de faste kontroller står den som "mangler"
+(Fangarr sender en besked), og der prøves hver time, indtil der er gået VERIFY_GIVE_UP_HOURS.
 """
 
 from __future__ import annotations
@@ -33,7 +39,7 @@ import httpx2 as httpx
 from .clients import GET_TIMEOUT, ApiError, Radarr, Sonarr, parse_date
 from .config import Config
 from .db import Database, iso
-from .plex import refresh_folder
+from .plex import library, map_path, refresh_folder
 from .selection import danish_on_disk
 from .tjenester import DANISH_AUDIO, PROBE_TIMEOUT, audio_languages
 
@@ -41,6 +47,10 @@ log = logging.getLogger("oversaetter")
 
 STARTED_KEY = "reveal_started"
 KEEP_DAYS = 30  # viste og erstattede rækker slettes efter så mange dage
+VERIFY_MINUTES = (2, 5, 15, 60)  # trin C5: ventetid før 1., 2., 3. og 4. kontrol af, at filen er i Plex
+VERIFY_HOURLY_MINUTES = 60  # derefter så ofte
+VERIFY_GIVE_UP_HOURS = 24  # og ikke længere end så mange timer efter, at filen blev vist
+VERIFY_RETRY_MINUTES = 5  # svarer Plex ikke, prøves kontrollen igen efter så mange minutter
 REASONS = {
     "original": "dansk originalsprog",
     "lyd": "dansk tale",
@@ -247,12 +257,16 @@ class Revealer:
             if not done:
                 return 0  # Plex svarede ikke - prøv igen næste gang (refresh_folder har skrevet advarslen)
         stamp = iso(self.now())
+        check = {}
+        if path and self.cfg.reveal_verify:  # trin C5: tjek om lidt, at Plex faktisk fik filerne
+            first = iso(self.now() + timedelta(minutes=VERIFY_MINUTES[0]))
+            check = {"plex_state": "tjekkes", "plex_tries": 0, "plex_next": first}
         for r, why, late in rows:
             by = "sikkerhedsnet" if late else "klar"
             reason = REASONS[why] if why else f"intet dansk efter {self.cfg.reveal_safety_hours:g} timer"
             if late and not why and not self._overdue(r):
                 reason = "vist sammen med en ældre fil i samme mappe (sikkerhedsnet)"
-            self._set(r, status="vist", reason=reason, shown_at=stamp, shown_by=by)
+            self._set(r, status="vist", reason=reason, shown_at=stamp, shown_by=by, **(check if r["path"] else {}))
             if late:
                 log.warning(
                     "Udgivelse: %s vises UDEN dansk tekst (sikkerhedsnet efter %g timer)",
@@ -262,6 +276,78 @@ class Revealer:
             else:
                 log.info("Udgivelse: %s vises nu i Plex (%s)", r["title"], reason)
         return len(rows)
+
+    # --- 5: kom filen faktisk i Plex? (trin C5) -------------------------------------------------------------
+    def verify(self) -> int:
+        """Tjek de viste filer, der er klar til kontrol. Returnerer antal mapper, Plex blev bedt om at scanne igen."""
+        if not self.cfg.reveal_verify or self.cfg.dry_run:
+            return 0
+        now = self.now()
+        due = self.db.conn.execute(
+            "SELECT * FROM reveal WHERE status = 'vist' AND plex_state IN ('tjekkes', 'mangler') "
+            "AND plex_next IS NOT NULL AND plex_next <= ? ORDER BY plex_next",
+            (iso(now),),
+        ).fetchall()
+        if not due:
+            return 0
+        lookup = library(self.cfg, self.http)
+        if lookup is None:
+            return 0
+        rescanned: set[str] = set()
+        for i, row in enumerate(due):
+            path = row["path"]
+            if not os.path.exists(path):
+                if os.path.isdir(row["folder"]):  # filen er skiftet ud eller slettet - den nye fil har sin egen række
+                    self._set(row, plex_state="væk", plex_next=None)
+                continue  # mappen mangler: drevet er måske nede - prøv igen næste gang
+            try:
+                found = lookup.has(map_path(path, self.cfg.plex_path_map))
+            except Exception as e:
+                why = f"kunne ikke forbinde ({type(e).__name__})" if isinstance(e, httpx.HTTPError) else str(e)
+                log.warning(
+                    "Plex: kunne ikke tjekke, om nye filer er kommet i Plex (%s) - prøver igen om %d min",
+                    why,
+                    VERIFY_RETRY_MINUTES,
+                )
+                later = iso(now + timedelta(minutes=VERIFY_RETRY_MINUTES))
+                for rest in due[i:]:
+                    self._set(rest, plex_next=later)
+                break
+            tries = int(row["plex_tries"] or 0)
+            if found:
+                self._set(row, plex_state="ok", plex_next=None, plex_ok_at=iso(now))
+                if tries:
+                    log.info("Plex: %s er nu i Plex (efter %d ekstra scanning(er))", row["title"], tries)
+                continue
+            tries += 1
+            shown = parse_date(row["shown_at"]) or now
+            if now - shown >= timedelta(hours=VERIFY_GIVE_UP_HOURS):
+                self._set(row, plex_state="opgivet", plex_tries=tries, plex_next=None)
+                log.warning(
+                    "Plex: %s er stadig ikke i Plex efter %d timer - opgiver (tjek mappen %s)",
+                    row["title"],
+                    VERIFY_GIVE_UP_HOURS,
+                    row["folder"],
+                )
+                continue
+            if row["folder"] not in rescanned:
+                rescanned.add(row["folder"])
+                refresh_folder(self.cfg, self.http, path)
+            fixed = tries < len(VERIFY_MINUTES)
+            wait = VERIFY_MINUTES[tries] if fixed else VERIFY_HOURLY_MINUTES
+            self._set(
+                row,
+                plex_state="tjekkes" if fixed else "mangler",
+                plex_tries=tries,
+                plex_next=iso(now + timedelta(minutes=wait)),
+            )
+            log.warning(
+                "Plex: %s er ikke kommet i Plex - bad om en ny scanning (%d. gang), tjekker igen om %d min",
+                row["title"],
+                tries,
+                wait,
+            )
+        return len(rescanned)
 
     def _overdue(self, row) -> bool:
         at = parse_date(row["import_at"])
@@ -283,6 +369,7 @@ class Revealer:
     def run_once(self) -> int:
         self.collect()
         shown = self.reveal()
+        self.verify()
         self.cleanup()
         self.last_run = self.now()
         return shown

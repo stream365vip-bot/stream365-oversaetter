@@ -133,6 +133,8 @@ class Config:
     reveal_interval_seconds: float = 90.0  # så ofte tjekkes de skjulte filer
     reveal_safety_hours: float = 24.0  # vises senest efter så mange timer, også uden dansk
     reveal_lookback_hours: float = 48.0  # så langt tilbage i historikken ledes der efter nye importer
+    # Trin C5 (15.11.2026): tjek bagefter, at filen faktisk kom i Plex, og bed om en ny scanning, hvis ikke.
+    reveal_verify: bool = True
 
     poll_minutes: float = 15.0
     translate_tag: str = "oversaet"

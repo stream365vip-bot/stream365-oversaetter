@@ -37,6 +37,7 @@ from . import knap
 from .clients import ApiError, Bazarr, Radarr, Sonarr
 from .config import Config
 from .db import Database, month_key
+from .udgiv import VERIFY_MINUTES
 
 log = logging.getLogger("oversaetter")
 
@@ -190,6 +191,7 @@ class Api:
             "max_searches_per_round": c.max_searches_per_round,
             "reveal": c.reveal,
             "reveal_safety_hours": c.reveal_safety_hours,
+            "reveal_verify": c.reveal_verify,
         }
 
     def reveal(self, query: dict[str, str]) -> dict:
@@ -206,6 +208,9 @@ class Api:
             "last_error": getattr(r, "last_error", None),
             "waiting": [],
             "shown": [],
+            # Trin C5: vist, men stadig ikke fundet i Plex efter ca. en time / fundet efter at have manglet.
+            "plex_missing": [],
+            "plex_fixed": [],
         }
         conn = self._db()
         if conn is None:
@@ -214,12 +219,26 @@ class Api:
             if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='reveal'").fetchone():
                 return out
             fields = "key, import_at, media_type, media_id, title, path, status, reason, danish, shown_at, shown_by"
+            has_plex = "plex_state" in {row[1] for row in conn.execute("PRAGMA table_info(reveal)")}
+            if has_plex:
+                fields += ", plex_state AS plex, plex_tries, plex_ok_at"
             waiting = conn.execute(f"SELECT {fields} FROM reveal WHERE status = 'venter' ORDER BY import_at").fetchall()
             since = (now - timedelta(days=days)).isoformat(timespec="seconds")
             shown = conn.execute(
                 f"SELECT {fields} FROM reveal WHERE status = 'vist' AND shown_at >= ? ORDER BY shown_at DESC LIMIT 500",
                 (since,),
             ).fetchall()
+            missing, fixed = [], []
+            if has_plex:
+                missing = conn.execute(
+                    f"SELECT {fields} FROM reveal WHERE status = 'vist' AND plex_state IN ('mangler', 'opgivet') "
+                    "ORDER BY shown_at DESC LIMIT 200"
+                ).fetchall()
+                fixed = conn.execute(
+                    f"SELECT {fields} FROM reveal WHERE status = 'vist' AND plex_state = 'ok' AND plex_tries >= ? "
+                    "AND plex_ok_at >= ? ORDER BY plex_ok_at DESC LIMIT 200",
+                    (len(VERIFY_MINUTES), since),
+                ).fetchall()
             states = {
                 row["key"]: (row["status"], row["reason"])
                 for row in conn.execute(
@@ -246,6 +265,8 @@ class Api:
             d["translation"], d["translation_reason"] = states.get(w["key"], (None, None))
             out["waiting"].append(d)
         out["shown"] = [clean(x) for x in shown]
+        out["plex_missing"] = [clean(x) for x in missing]
+        out["plex_fixed"] = [clean(x) for x in fixed]
         return out
 
     # --- trin C4: knapperne ------------------------------------------------------------------------
